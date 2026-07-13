@@ -1,0 +1,27 @@
+[package]
+name = "deadcat-rt-study"
+description = "Non-production comparison harness for Deadcat RT blinding schedules."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+deadcat-contracts.workspace = true
+elements.workspace = true
+hex.workspace = true
+rand.workspace = true
+sha2.workspace = true
+smplx-sdk.workspace = true
+smplx-std.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+bitcoincore-rpc = "0.19"
+deadcat-client.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smplx-regtest.workspace = true
+tempfile.workspace = true

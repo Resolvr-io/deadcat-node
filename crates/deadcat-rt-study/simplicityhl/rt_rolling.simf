@@ -1,0 +1,114 @@
+// Isolated form of Deadcat's current rolling-ABF continuation rule.
+
+fn verify_rt_commitment(
+    asset_commitment: (u1, u256),
+    value_commitment: (u1, u256),
+    expected_rt: u256,
+    abf: u256,
+    cbf: u256,
+) {
+    let asset_h: Ge = jet::hash_to_curve(expected_rt);
+    let asset_generator: Gej = jet::gej_ge_add(jet::generate(abf), asset_h);
+    let (asset_x, asset_y): (u256, u256) = unwrap(jet::gej_normalize(asset_generator));
+    let (stored_asset_parity, stored_asset_x): (u1, u256) = asset_commitment;
+    assert!(jet::eq_256(asset_x, stored_asset_x));
+    assert!(jet::eq_1(
+        <bool>::into(is_none::<u256>(jet::fe_square_root(asset_y))),
+        stored_asset_parity,
+    ));
+
+    let value_generator: Gej = jet::gej_ge_add(jet::generate(cbf), asset_h);
+    let (value_x, value_y): (u256, u256) = unwrap(jet::gej_normalize(value_generator));
+    let (stored_value_parity, stored_value_x): (u1, u256) = value_commitment;
+    assert!(jet::eq_256(value_x, stored_value_x));
+    assert!(jet::eq_1(
+        <bool>::into(is_none::<u256>(jet::fe_square_root(value_y))),
+        stored_value_parity,
+    ));
+}
+
+fn little_endian_u32(value: u32) -> u32 {
+    let (b0, b1, b2, b3): (u8, u8, u8, u8) = <u32>::into(value);
+    <(u8, u8, u8, u8)>::into((b3, b2, b1, b0))
+}
+
+fn rt_abf_domain() -> u256 {
+    0x69dfe8386bc167a102c60d19ca7d562d802c7c658ef49b31010aa0b396e01cbe
+}
+
+fn deterministic_output_abf(input_index: u32) -> u256 {
+    let (txid, vout): (u256, u32) = unwrap(jet::input_prev_outpoint(input_index));
+    let ctx: Ctx8 = jet::sha_256_ctx_8_init();
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, rt_abf_domain());
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, rt_abf_domain());
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, txid);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_4(ctx, little_endian_u32(vout));
+    jet::sha_256_ctx_8_finalize(ctx)
+}
+
+fn get_input_confidential(index: u32) -> ((u1, u256), (u1, u256)) {
+    let (asset, amount): (Asset1, Amount1) = unwrap(jet::input_amount(index));
+    (unwrap_left::<u256>(asset), unwrap_left::<u64>(amount))
+}
+
+fn get_output_confidential(index: u32) -> ((u1, u256), (u1, u256)) {
+    let (asset, amount): (Asset1, Amount1) = unwrap(jet::output_amount(index));
+    (unwrap_left::<u256>(asset), unwrap_left::<u64>(amount))
+}
+
+fn ensure_no_issuance(index: u32) {
+    let asset_amount: Option<Amount1> = unwrap(jet::issuance_asset_amount(index));
+    let token_amount: Option<Amount1> = unwrap(jet::issuance_token_amount(index));
+    let entropy: Option<u256> = unwrap(jet::issuance_entropy(index));
+    assert!(is_none::<Amount1>(asset_amount));
+    assert!(is_none::<Amount1>(token_amount));
+    assert!(is_none::<u256>(entropy));
+}
+
+fn ensure_same_script(input_index: u32, output_index: u32) {
+    let input_hash: u256 = unwrap(jet::input_script_hash(input_index));
+    let output_hash: u256 = unwrap(jet::output_script_hash(output_index));
+    assert!(jet::eq_256(input_hash, output_hash));
+}
+
+fn ensure_burn_script(output_index: u32) {
+    // SHA256(0x6a), where 0x6a is the complete bare OP_RETURN script.
+    let burn_script_hash: u256 =
+        0x189f40034be7a199f1fa9891668ee3ab6049f82d38c68be70f596eab2e1857b7;
+    let output_hash: u256 = unwrap(jet::output_script_hash(output_index));
+    assert!(jet::eq_256(output_hash, burn_script_hash));
+}
+
+fn main() {
+    let input_index: u32 = jet::current_index();
+    let output_index: u32 = witness::OUTPUT_INDEX;
+    let input_abf: u256 = witness::INPUT_ABF;
+    let input_cbf: u256 = witness::INPUT_CBF;
+    match witness::TERMINAL {
+        true => {
+            ensure_no_issuance(input_index);
+            ensure_burn_script(output_index)
+        },
+        false => ensure_same_script(input_index, output_index),
+    };
+
+    let (input_asset, input_value): ((u1, u256), (u1, u256)) =
+        get_input_confidential(input_index);
+    verify_rt_commitment(
+        input_asset,
+        input_value,
+        param::RT_ASSET_ID,
+        input_abf,
+        input_cbf,
+    );
+
+    let (output_asset, output_value): ((u1, u256), (u1, u256)) =
+        get_output_confidential(output_index);
+    verify_rt_commitment(
+        output_asset,
+        output_value,
+        param::RT_ASSET_ID,
+        deterministic_output_abf(input_index),
+        input_cbf,
+    );
+}
