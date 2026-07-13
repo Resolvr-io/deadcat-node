@@ -5,7 +5,7 @@
 - Decision record: [ADR 0005](../adr/0005-rt-blinding-schedule.md)
 - Protocol specification: [Deadcat protocol v1](../protocol-v1.md)
 - Hardened rolling baseline: `ed6de4c4c8a177b4a4ba92c2bac17f55b324781f`
-- Candidate implementation commit: `<PENDING_IMPLEMENTATION_COMMIT>`
+- Candidate implementation commit: `7ed20b8b81306eaf81ee49b80b4ea65b49804871`
 
 This packet is the acceptance boundary for replacing the experimental rolling
 reissuance-token (RT) blinding schedule with fixed complementary A/B blinders
@@ -240,7 +240,7 @@ not a substitute for the focused human review above.
 
 | Role | Name | Date | Commit | Decision |
 |---|---|---|---|---|
-| Implementation owner | Codex candidate | 2026-07-13 | `<PENDING>` | Engineering-complete |
+| Implementation owner | Codex candidate | 2026-07-13 | `7ed20b8b81306eaf81ee49b80b4ea65b49804871` | Engineering-complete |
 | External reviewer | `<PENDING>` | `<PENDING>` | `<PENDING>` | `<PENDING>` |
 | Protocol owner | `<PENDING>` | `<PENDING>` | `<PENDING>` | `<PENDING>` |
 

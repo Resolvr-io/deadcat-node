@@ -3,6 +3,7 @@
   "recorded_date": "2026-07-13",
   "rolling_baseline_commit": "ed6de4c4c8a177b4a4ba92c2bac17f55b324781f",
   "candidate_base_commit": "25ad4092293e86d71108cf6d10f490ed4d65dc4b",
+  "candidate_implementation_commit": "7ed20b8b81306eaf81ee49b80b4ea65b49804871",
   "toolchain": {
     "flake_lock_sha256": "39cb5ac107c5930e0184e9d01a43f7ee7ae3229a230e0f6e37b3cf6cebe3d0d7",
     "nixpkgs_revision": "50ab793786d9de88ee30ec4e4c24fb4236fc2674",

@@ -300,11 +300,12 @@ Adversarial cases reject same-side output/burn, mixed live sides,
 wrong-role CBF/value commitments, wrong input-side reissuance nonces, malformed
 creation side, sibling substitution, and designated-output tampering.
 
-The production-shaped live harness additionally mined three markets through 16
-transactions. It covers canonical creation, A→B and B→A issuance, confidential
-wallet composition, partial/full cancellation, return to Dormant, B-side
-Dormant reissuance, YES/NO resolution, active expiry, both terminal flip
-directions, and partial/full redemption. Every valid stage passed
+The production-shaped live harness additionally mined three markets through 15
+market transactions plus one shared setup-funding transaction. It covers
+canonical creation, A→B and B→A issuance, confidential wallet composition,
+partial/full cancellation, return to Dormant, B-side Dormant reissuance, YES/NO
+resolution, active expiry, both terminal flip directions, and partial/full
+redemption. Every valid stage passed
 `testmempoolaccept`, broadcast, mining, and confirmation; missing and corrupted
 surjection proofs were rejected.
 
