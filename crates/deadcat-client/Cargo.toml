@@ -19,3 +19,9 @@ rand.workspace = true
 sha2.workspace = true
 smplx-std.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+bitcoincore-rpc = "0.19"
+serde.workspace = true
+serde_json.workspace = true
+smplx-regtest.workspace = true

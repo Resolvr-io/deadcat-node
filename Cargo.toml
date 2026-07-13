@@ -8,7 +8,6 @@ members = [
     "crates/deadcat-iroh",
     "crates/deadcat-node",
     "crates/deadcat-cli",
-    "crates/deadcat-rt-study",
 ]
 
 [workspace.package]

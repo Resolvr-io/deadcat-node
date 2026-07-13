@@ -9,4 +9,4 @@ change after covenant CMRs or public wire formats exist.
 | [0002](0002-v1-contract-scope.md) | V1 contains the binary market and maker order; LMSR is deferred |
 | [0003](0003-order-economics.md) | Orders use exact integer prices and one minimum active amount |
 | [0004](0004-chain-state-and-reorgs.md) | Chain transactions apply atomically; confirmed-tip state rolls back two blocks |
-| [0005](0005-rt-blinding-schedule.md) | **Proposed:** prefer A/B RT blinders with complementary constant CBFs, pending live evidence and approval |
+| [0005](0005-rt-blinding-schedule.md) | **Proposed:** complementary A/B RT engineering evidence is complete; external review and protocol-owner approval remain |

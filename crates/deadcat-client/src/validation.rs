@@ -17,7 +17,7 @@ use deadcat_contracts::interpret::{
     interpret_binary_market_spend, interpret_maker_order_spend,
 };
 use deadcat_contracts::maker_order::{CompiledMakerOrder, fill, validate_against_market};
-use deadcat_contracts::rt::{commitments, creation_factors};
+use deadcat_contracts::rt::{RtLeg, RtSide, commitments, factors};
 use deadcat_rpc::{
     ContractHistoryPage, ContractParametersView, ContractStateView, ContractView, HistoryEntry,
     LiveOutpoint, MarketSnapshot, OrderBookLevel, OrderBookSnapshot, RouteLeg, RouteSuggestion,
@@ -639,11 +639,13 @@ fn replay_market(
             "YES and NO use the same defining issuance",
         ));
     }
-    let yes_factors = creation_factors(creation.transaction.input[yes_input].previous_output);
-    let no_factors = creation_factors(creation.transaction.input[no_input].previous_output);
-    let yes_commitments = commitments(params.yes_reissuance_token_id, yes_factors)
-        .map_err(|error| ValidationError::CreationMismatchOwned(error.to_string()))?;
-    let no_commitments = commitments(params.no_reissuance_token_id, no_factors)
+    // Re-derive canonical side-A creation independently of the node's view.
+    let yes_commitments = commitments(
+        params.yes_reissuance_token_id,
+        factors(RtLeg::Yes, RtSide::A),
+    )
+    .map_err(|error| ValidationError::CreationMismatchOwned(error.to_string()))?;
+    let no_commitments = commitments(params.no_reissuance_token_id, factors(RtLeg::No, RtSide::A))
         .map_err(|error| ValidationError::CreationMismatchOwned(error.to_string()))?;
     let yes = unique_market_output(
         &creation.transaction,
@@ -1342,20 +1344,23 @@ pub enum ValidationError {
 mod tests {
     use deadcat_contracts::binary_market::{BinaryMarketAction, CompiledBinaryMarket};
     use deadcat_contracts::market_crypto::derive_issuance_assets;
-    use deadcat_contracts::rt::{RtFactors, commitments, subtract_mod_order};
+    use deadcat_contracts::recovery::{MarketCollateral, MarketRecoveryHint};
+    use deadcat_contracts::rt::{RtLeg, RtSide, commitments, factors};
     use deadcat_rpc::{ContractParametersView, ContractStateView};
     use deadcat_types::DeadcatOutPoint;
     use elements::confidential::{Asset, Nonce, Value};
     use elements::hashes::Hash as _;
     use elements::pset::{Input as PsetInput, Output as PsetOutput};
-    use elements::secp256k1_zkp::{Keypair, Secp256k1};
+    use elements::secp256k1_zkp::{Keypair, Secp256k1, Tweak};
     use elements::{
         AssetId, AssetIssuance, LockTime, Script, Sequence, Transaction, TxIn, TxOut, Txid,
     };
     use sha2::{Digest as _, Sha256};
 
     use super::*;
-    use crate::market_builder::{BinaryMarketLiveInputs, MarketRtInput};
+    use crate::market_builder::{
+        BinaryMarketCreationPlan, BinaryMarketLiveInputs, MarketCreationContext, MarketRtInput,
+    };
 
     fn asset(byte: u8) -> AssetId {
         AssetId::from_slice(&[byte; 32]).expect("asset")
@@ -1824,12 +1829,12 @@ mod tests {
             output: vec![
                 rt_output(
                     params.yes_reissuance_token_id,
-                    creation_factors(yes_defining),
+                    factors(RtLeg::Yes, RtSide::A),
                     BinaryMarketSlot::DormantYesRt,
                 ),
                 rt_output(
                     params.no_reissuance_token_id,
-                    creation_factors(no_defining),
+                    factors(RtLeg::No, RtSide::A),
                     BinaryMarketSlot::DormantNoRt,
                 ),
             ],
@@ -1892,22 +1897,290 @@ mod tests {
             |pos, hash| pos == position(4, 0) && hash == tip.hash,
         )
         .expect("market creation replay");
+
+        let mut bad_evidence = evidence;
+        let (asset, value) = commitments(
+            params.yes_reissuance_token_id,
+            factors(RtLeg::Yes, RtSide::B),
+        )
+        .expect("side-B YES commitments");
+        bad_evidence.transaction.output[0].asset = asset;
+        bad_evidence.transaction.output[0].value = value;
+        let bad_txid = bad_evidence.transaction.txid();
+        let bad_id = compiled.contract_id(bad_txid);
+        bad_evidence.txid = bad_txid;
+        bad_evidence.affected_contract_ids = vec![bad_id];
+
+        let mut bad_expected = expected;
+        bad_expected.contract_id = bad_id;
+        bad_expected.creation_txid = bad_txid;
+        bad_expected.live_outpoints[0].outpoint = DeadcatOutPoint::new(bad_txid, 0);
+        bad_expected.live_outpoints[1].outpoint = DeadcatOutPoint::new(bad_txid, 1);
+        let mut bad_history = history;
+        bad_history.contract_id = bad_id;
+
+        assert!(matches!(
+            replay_contract_history(
+                &bad_expected,
+                None,
+                &bad_history,
+                &bad_evidence,
+                &[],
+                tip,
+                |pos, hash| pos == position(4, 0) && hash == tip.hash,
+            ),
+            Err(ValidationError::CreationMismatchOwned(message)) if message.contains("found 0")
+        ));
     }
 
-    fn scalar(byte: u8) -> [u8; 32] {
-        let mut scalar = [0; 32];
-        scalar[31] = byte;
-        scalar
-    }
+    #[test]
+    fn market_transition_replay_rejects_side_nonce_and_history_tampering() {
+        let policy_asset = asset(0x70);
+        let yes_defining = OutPoint::new(txid(0x61), 3);
+        let no_defining = OutPoint::new(txid(0x62), 4);
+        let assets = derive_issuance_assets(yes_defining, no_defining);
+        let params = BinaryMarketParams {
+            oracle_public_key: key(0x31),
+            collateral_asset_id: policy_asset,
+            yes_token_asset_id: assets.yes_token,
+            no_token_asset_id: assets.no_token,
+            yes_reissuance_token_id: assets.yes_reissuance_token,
+            no_reissuance_token_id: assets.no_reissuance_token,
+            base_payout: 100,
+            expiry_height: 500,
+        };
+        let creation_plan = BinaryMarketCreationPlan::new(
+            MarketCreationContext {
+                policy_asset,
+                liquid_mainnet_usdt: None,
+            },
+            params,
+            MarketRecoveryHint {
+                oracle_public_key: params.oracle_public_key,
+                collateral: MarketCollateral::PolicyAsset,
+                base_payout: params.base_payout,
+                expiry_height: params.expiry_height,
+            },
+            yes_defining,
+            no_defining,
+        )
+        .expect("creation plan");
+        let funding = explicit_output(policy_asset, 10_000, Script::from(vec![0x51]));
+        let mut yes_funding = PsetInput::from_prevout(yes_defining);
+        yes_funding.witness_utxo = Some(funding.clone());
+        let mut no_funding = PsetInput::from_prevout(no_defining);
+        no_funding.witness_utxo = Some(funding);
+        let mut creation_pset = creation_plan
+            .build_pset(yes_funding, no_funding)
+            .expect("creation PSET");
+        creation_plan
+            .finalize_rt_proofs(&mut creation_pset)
+            .expect("creation RT proofs");
+        let creation_tx = creation_pset.extract_tx().expect("creation transaction");
 
-    fn factors(abf: u8, cbf: u8) -> RtFactors {
-        let abf = scalar(abf);
-        let cbf = scalar(cbf);
-        RtFactors {
-            abf,
-            vbf: subtract_mod_order(cbf, abf),
-            cbf,
+        let pairs = 2;
+        let live = BinaryMarketLiveInputs {
+            yes_rt: Some(MarketRtInput {
+                outpoint: OutPoint::new(creation_tx.txid(), 0),
+                txout: creation_tx.output[0].clone(),
+            }),
+            no_rt: Some(MarketRtInput {
+                outpoint: OutPoint::new(creation_tx.txid(), 1),
+                txout: creation_tx.output[1].clone(),
+            }),
+            collateral: None,
+        };
+        let issuance_plan = BinaryMarketTransitionPlan::new(
+            params,
+            BinaryMarketState::Trading {
+                outstanding_pairs: 0,
+            },
+            BinaryMarketAction::Issue { pairs },
+            live,
+            None,
+        )
+        .expect("initial issuance plan");
+        let mut issuance_pset = PartiallySignedTransaction::new_v2();
+        for vout in 0..2_u32 {
+            let mut input = PsetInput::from_prevout(OutPoint::new(creation_tx.txid(), vout));
+            input.witness_utxo =
+                Some(creation_tx.output[usize::try_from(vout).expect("vout")].clone());
+            issuance_pset.add_input(input);
         }
+        for (_, output) in issuance_plan
+            .mandatory_outputs(0)
+            .expect("mandatory outputs")
+        {
+            issuance_pset.add_output(PsetOutput::from_txout(output));
+        }
+        issuance_plan
+            .configure_reissuance_inputs(&mut issuance_pset, 0, creation_plan.entropies())
+            .expect("reissuance inputs");
+        issuance_plan
+            .finalize(
+                &mut issuance_pset,
+                0,
+                0,
+                &SimplicityNetwork::ElementsRegtest { policy_asset },
+            )
+            .expect("official A-to-B issuance");
+        let issuance_tx = issuance_pset.extract_tx().expect("issuance transaction");
+
+        let compiled = CompiledBinaryMarket::new(params).expect("compile market");
+        let contract_id = compiled.contract_id(creation_tx.txid());
+        let creation_position = position(1, 0);
+        let issuance_position = position(2, 0);
+        let creation_block = block(0x81);
+        let tip = anchor(2, 0x82);
+        let expected = ContractView {
+            contract_id,
+            kind: ContractKind::BinaryMarketV1,
+            sync_state: ContractSyncState::Ready {
+                synced_through: tip,
+            },
+            creation_txid: creation_tx.txid(),
+            creation_position,
+            parameters: ContractParametersView::BinaryMarket { params },
+            state: ContractStateView::BinaryMarket {
+                state: BinaryMarketState::Trading {
+                    outstanding_pairs: pairs,
+                },
+            },
+            parent_market: None,
+            outcome_side: None,
+            live_outpoints: vec![
+                LiveOutpoint {
+                    role: BinaryMarketSlot::UnresolvedYesRt as u8,
+                    outpoint: DeadcatOutPoint::new(issuance_tx.txid(), 0),
+                },
+                LiveOutpoint {
+                    role: BinaryMarketSlot::UnresolvedNoRt as u8,
+                    outpoint: DeadcatOutPoint::new(issuance_tx.txid(), 1),
+                },
+                LiveOutpoint {
+                    role: BinaryMarketSlot::UnresolvedCollateral as u8,
+                    outpoint: DeadcatOutPoint::new(issuance_tx.txid(), 2),
+                },
+            ],
+        };
+        let creation = TransactionEvidence {
+            position: creation_position,
+            block_hash: creation_block,
+            txid: creation_tx.txid(),
+            transaction: creation_tx,
+            affected_contract_ids: vec![contract_id],
+        };
+        let issuance = TransactionEvidence {
+            position: issuance_position,
+            block_hash: tip.hash,
+            txid: issuance_tx.txid(),
+            transaction: issuance_tx,
+            affected_contract_ids: vec![contract_id],
+        };
+        let collateral_locked = BinaryMarketEconomics::new(params.base_payout)
+            .expect("economics")
+            .collateral_for_pairs(pairs)
+            .expect("collateral amount");
+        let (transition_kind, transition_payload) = encode_market_transition(
+            BinaryMarketPath::InitialIssuance,
+            BinaryMarketTransition::Issued {
+                pairs,
+                collateral_locked,
+            },
+        );
+        let history = ContractHistoryPage {
+            snapshot: SnapshotMetadata {
+                as_of: tip,
+                event_high_watermark: deadcat_types::EventCursor {
+                    epoch: [0x91; 16],
+                    sequence: 2,
+                },
+            },
+            contract_id,
+            entries: vec![HistoryEntry {
+                position: issuance_position,
+                txid: issuance.txid,
+                transition_kind,
+                transition_payload,
+            }],
+            next: None,
+        };
+        let canonical = |position, hash| {
+            (position == creation_position && hash == creation_block)
+                || (position == issuance_position && hash == tip.hash)
+        };
+
+        let replay = replay_contract_history(
+            &expected,
+            None,
+            &history,
+            &creation,
+            std::slice::from_ref(&issuance),
+            tip,
+            canonical,
+        )
+        .expect("creation plus A-to-B replay");
+        assert_eq!(replay.transition_count(), 1);
+
+        let mut wrong_side = issuance.clone();
+        let (asset, value) = commitments(
+            params.yes_reissuance_token_id,
+            factors(RtLeg::Yes, RtSide::A),
+        )
+        .expect("same-side commitments");
+        wrong_side.transaction.output[0].asset = asset;
+        wrong_side.transaction.output[0].value = value;
+        wrong_side.txid = wrong_side.transaction.txid();
+        let mut wrong_side_history = history.clone();
+        wrong_side_history.entries[0].txid = wrong_side.txid;
+        assert!(matches!(
+            replay_contract_history(
+                &expected,
+                None,
+                &wrong_side_history,
+                &creation,
+                &[wrong_side],
+                tip,
+                canonical,
+            ),
+            Err(ValidationError::Interpretation(_))
+        ));
+
+        let mut wrong_nonce = issuance.clone();
+        wrong_nonce.transaction.input[0]
+            .asset_issuance
+            .asset_blinding_nonce =
+            Tweak::from_inner(RtSide::B.abf()).expect("opposite public ABF");
+        wrong_nonce.txid = wrong_nonce.transaction.txid();
+        let mut wrong_nonce_history = history.clone();
+        wrong_nonce_history.entries[0].txid = wrong_nonce.txid;
+        assert!(matches!(
+            replay_contract_history(
+                &expected,
+                None,
+                &wrong_nonce_history,
+                &creation,
+                &[wrong_nonce],
+                tip,
+                canonical,
+            ),
+            Err(ValidationError::Interpretation(_))
+        ));
+
+        let mut wrong_history = history;
+        wrong_history.entries[0].transition_payload[0] = BinaryMarketPath::SubsequentIssuance as u8;
+        assert!(matches!(
+            replay_contract_history(
+                &expected,
+                None,
+                &wrong_history,
+                &creation,
+                &[issuance],
+                tip,
+                canonical,
+            ),
+            Err(ValidationError::TransitionRecordMismatch { .. })
+        ));
     }
 
     #[test]
@@ -1946,14 +2219,32 @@ mod tests {
 
         let params = base_market_params();
         let compiled = CompiledBinaryMarket::new(params).expect("compile market");
-        let yes = MarketRtInput {
-            outpoint: OutPoint::new(txid(0x90), 0),
-            factors: factors(1, 3),
+        let rt_input = |outpoint, asset_id, leg, slot| {
+            let (asset, value) =
+                commitments(asset_id, factors(leg, RtSide::A)).expect("commitments");
+            MarketRtInput {
+                outpoint,
+                txout: TxOut {
+                    asset,
+                    value,
+                    nonce: Nonce::Null,
+                    script_pubkey: compiled.slot(slot).script_pubkey().clone(),
+                    witness: TxOutWitness::default(),
+                },
+            }
         };
-        let no = MarketRtInput {
-            outpoint: OutPoint::new(txid(0x90), 1),
-            factors: factors(2, 5),
-        };
+        let yes = rt_input(
+            OutPoint::new(txid(0x90), 0),
+            params.yes_reissuance_token_id,
+            RtLeg::Yes,
+            BinaryMarketSlot::DormantYesRt,
+        );
+        let no = rt_input(
+            OutPoint::new(txid(0x90), 1),
+            params.no_reissuance_token_id,
+            RtLeg::No,
+            BinaryMarketSlot::DormantNoRt,
+        );
         let market_plan = BinaryMarketTransitionPlan::new(
             params,
             BinaryMarketState::Trading {
@@ -1961,35 +2252,17 @@ mod tests {
             },
             BinaryMarketAction::Expire,
             BinaryMarketLiveInputs {
-                yes_rt: Some(yes),
-                no_rt: Some(no),
+                yes_rt: Some(yes.clone()),
+                no_rt: Some(no.clone()),
                 collateral: None,
             },
             None,
         )
         .expect("market plan");
         let mut market_pset = PartiallySignedTransaction::new_v2();
-        for (input, asset_id, slot) in [
-            (
-                yes,
-                params.yes_reissuance_token_id,
-                BinaryMarketSlot::DormantYesRt,
-            ),
-            (
-                no,
-                params.no_reissuance_token_id,
-                BinaryMarketSlot::DormantNoRt,
-            ),
-        ] {
-            let (asset, value) = commitments(asset_id, input.factors).expect("commitment");
+        for input in [&yes, &no] {
             let mut pset_input = PsetInput::from_prevout(input.outpoint);
-            pset_input.witness_utxo = Some(TxOut {
-                asset,
-                value,
-                nonce: Nonce::Null,
-                script_pubkey: compiled.slot(slot).script_pubkey().clone(),
-                witness: TxOutWitness::default(),
-            });
+            pset_input.witness_utxo = Some(input.txout.clone());
             market_pset.add_input(pset_input);
         }
         for (_, output) in market_plan.mandatory_outputs(0).expect("outputs") {

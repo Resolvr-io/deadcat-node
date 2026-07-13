@@ -25,14 +25,15 @@ CI through Nix. CI fails if the CLI and Rust smplx pins differ.
 ## Phase 1: Binary market covenant
 
 - Implement the fresh `.simf` contract and build-generated Rust binding.
-- Implement typed parameters, slot scripts, oracle messages, deterministic RT
-  construction, interpreter, and local PSET builders.
+- Implement typed parameters, slot scripts, oracle messages, fixed A/B RT
+  construction with raw-`TxOut` side inference, interpreter, and local PSET
+  builders.
 - Commit fixed CMR, script/address, recovery-hint, issuance, and oracle vectors.
 
 Gate: every issuance, cancellation, resolution, redemption, expiry, and dormant
 terminal path passes pure, interpreter, BitMachine, and serial regtest tests.
 Negative tests cover sibling substitution, wrong assets, collateral mismatch,
-parasitic issuance, oracle domain/outcome, RT burns, deterministic blinding,
+parasitic issuance, oracle domain/outcome, RT burns, side flips and nonces,
 overflow, and output-window aliasing.
 
 ## Phase 2: Maker limit-order covenant

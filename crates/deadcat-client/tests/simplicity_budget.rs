@@ -9,17 +9,21 @@ use deadcat_contracts::binary_market::{
     CompiledBinaryMarket,
 };
 use deadcat_contracts::interpret::strip_taproot_annex;
+use deadcat_contracts::interpret::{
+    BinaryMarketLiveOutputs, TrackedContractOutput, interpret_binary_market_spend,
+};
 use deadcat_contracts::maker_order::CompiledMakerOrder;
 use deadcat_contracts::market_crypto::{
     BinaryOutcome as OracleOutcome, derive_issuance_assets, oracle_message,
 };
-use deadcat_contracts::rt::{RtFactors, commitments, subtract_mod_order};
+use deadcat_contracts::rt::{RtLeg, RtSide, commitments, factors};
 use deadcat_types::{BinaryMarketParams, BinaryMarketState, MakerOrderParams, OrderDirection};
 use elements::confidential::{Asset, Nonce, Value};
 use elements::hashes::Hash as _;
 use elements::pset::{Input as PsetInput, Output as PsetOutput, PartiallySignedTransaction};
-use elements::secp256k1_zkp::{Keypair, Message, Secp256k1};
+use elements::secp256k1_zkp::{Keypair, Message, Secp256k1, Tweak};
 use elements::{AssetId, OutPoint, Script, TxOut, TxOutWitness, Txid};
+use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use simplex::simplicityhl::simplicity::jet::Elements;
 use simplex::simplicityhl::simplicity::{BitIter, RedeemNode};
@@ -30,6 +34,37 @@ struct Underbudget {
     milliweight: String,
     stack_bytes: usize,
     required_annex_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct CovenantMetrics {
+    cost_milliweight: u64,
+    program_bytes: usize,
+    witness_bytes: usize,
+    stack_bytes: usize,
+    padding_bytes: usize,
+}
+
+impl CovenantMetrics {
+    fn add_assign(&mut self, other: Self) {
+        self.cost_milliweight += other.cost_milliweight;
+        self.program_bytes += other.program_bytes;
+        self.witness_bytes += other.witness_bytes;
+        self.stack_bytes += other.stack_bytes;
+        self.padding_bytes += other.padding_bytes;
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct MarketMetrics<'a> {
+    stage: &'a str,
+    rt_input_side: &'a str,
+    covenant: CovenantMetrics,
+    tx_bytes: usize,
+    tx_weight: usize,
+    tx_vsize: usize,
+    tx_discount_weight: usize,
+    tx_discount_vsize: usize,
 }
 
 impl std::fmt::Display for Underbudget {
@@ -50,9 +85,13 @@ fn failure_report(failures: &[Underbudget]) -> String {
         .join("\n")
 }
 
-fn record_budget(label: impl Into<String>, stack: &[Vec<u8>], failures: &mut Vec<Underbudget>) {
+fn record_budget(
+    label: impl Into<String>,
+    stack: &[Vec<u8>],
+    failures: &mut Vec<Underbudget>,
+) -> CovenantMetrics {
     let stack = stack.to_vec();
-    let (core_stack, _) = strip_taproot_annex(&stack);
+    let (core_stack, annex) = strip_taproot_annex(&stack);
     assert_eq!(
         core_stack.len(),
         4,
@@ -71,6 +110,16 @@ fn record_budget(label: impl Into<String>, stack: &[Vec<u8>], failures: &mut Vec
             stack_bytes: elements::encode::serialize(&stack).len(),
             required_annex_bytes: cost.get_padding(&stack).map_or(0, |annex| annex.len()),
         });
+    }
+    CovenantMetrics {
+        cost_milliweight: cost
+            .to_string()
+            .parse()
+            .expect("Simplicity cost is an integer milliweight"),
+        program_bytes: core_stack[1].len(),
+        witness_bytes: core_stack[0].len(),
+        stack_bytes: elements::encode::serialize(&stack).len(),
+        padding_bytes: annex.map_or(0, <[u8]>::len),
     }
 }
 
@@ -94,24 +143,13 @@ fn pset_input(outpoint: OutPoint, witness_utxo: TxOut) -> PsetInput {
     input
 }
 
-fn scalar(byte: u8) -> [u8; 32] {
-    let mut scalar = [0; 32];
-    scalar[31] = byte;
-    scalar
-}
-
-fn factors(abf: u8, cbf: u8) -> RtFactors {
-    let abf = scalar(abf);
-    let cbf = scalar(cbf);
-    RtFactors {
-        abf,
-        vbf: subtract_mod_order(cbf, abf),
-        cbf,
-    }
-}
-
-fn confidential_rt_txout(asset_id: AssetId, factors: RtFactors, script_pubkey: Script) -> TxOut {
-    let (asset, value) = commitments(asset_id, factors).expect("RT commitments");
+fn confidential_rt_txout(
+    leg: RtLeg,
+    side: RtSide,
+    asset_id: AssetId,
+    script_pubkey: Script,
+) -> TxOut {
+    let (asset, value) = commitments(asset_id, factors(leg, side)).expect("RT commitments");
     TxOut {
         asset,
         value,
@@ -165,29 +203,66 @@ fn sign_attestation(params: BinaryMarketParams, outcome: BinaryOutcome) -> Oracl
     }
 }
 
-fn live_inputs(state: BinaryMarketState) -> BinaryMarketLiveInputs {
+fn live_inputs(
+    params: BinaryMarketParams,
+    state: BinaryMarketState,
+    side: RtSide,
+) -> BinaryMarketLiveInputs {
+    let compiled = CompiledBinaryMarket::new(params).expect("compile market");
     match state {
         BinaryMarketState::Trading {
             outstanding_pairs: 0,
         } => BinaryMarketLiveInputs {
             yes_rt: Some(MarketRtInput {
                 outpoint: OutPoint::new(Txid::from_byte_array([0x70; 32]), 2),
-                factors: factors(1, 3),
+                txout: confidential_rt_txout(
+                    RtLeg::Yes,
+                    side,
+                    params.yes_reissuance_token_id,
+                    compiled
+                        .slot(BinaryMarketSlot::DormantYesRt)
+                        .script_pubkey()
+                        .clone(),
+                ),
             }),
             no_rt: Some(MarketRtInput {
                 outpoint: OutPoint::new(Txid::from_byte_array([0x70; 32]), 9),
-                factors: factors(2, 5),
+                txout: confidential_rt_txout(
+                    RtLeg::No,
+                    side,
+                    params.no_reissuance_token_id,
+                    compiled
+                        .slot(BinaryMarketSlot::DormantNoRt)
+                        .script_pubkey()
+                        .clone(),
+                ),
             }),
             collateral: None,
         },
         BinaryMarketState::Trading { .. } => BinaryMarketLiveInputs {
             yes_rt: Some(MarketRtInput {
                 outpoint: OutPoint::new(Txid::from_byte_array([0x71; 32]), 4),
-                factors: factors(1, 3),
+                txout: confidential_rt_txout(
+                    RtLeg::Yes,
+                    side,
+                    params.yes_reissuance_token_id,
+                    compiled
+                        .slot(BinaryMarketSlot::UnresolvedYesRt)
+                        .script_pubkey()
+                        .clone(),
+                ),
             }),
             no_rt: Some(MarketRtInput {
                 outpoint: OutPoint::new(Txid::from_byte_array([0x71; 32]), 5),
-                factors: factors(2, 5),
+                txout: confidential_rt_txout(
+                    RtLeg::No,
+                    side,
+                    params.no_reissuance_token_id,
+                    compiled
+                        .slot(BinaryMarketSlot::UnresolvedNoRt)
+                        .script_pubkey()
+                        .clone(),
+                ),
             }),
             collateral: Some(OutPoint::new(Txid::from_byte_array([0x71; 32]), 6)),
         },
@@ -246,7 +321,7 @@ fn collateral_amount(params: BinaryMarketParams, state: BinaryMarketState) -> u6
 fn market_pset(
     params: BinaryMarketParams,
     state: BinaryMarketState,
-    live: BinaryMarketLiveInputs,
+    live: &BinaryMarketLiveInputs,
     plan: &BinaryMarketTransitionPlan,
     input_base: usize,
     output_base: usize,
@@ -262,26 +337,12 @@ fn market_pset(
     for slot in market_input_slots(state) {
         let (outpoint, txout) = match slot {
             BinaryMarketSlot::DormantYesRt | BinaryMarketSlot::UnresolvedYesRt => {
-                let rt = live.yes_rt.expect("YES RT");
-                (
-                    rt.outpoint,
-                    confidential_rt_txout(
-                        params.yes_reissuance_token_id,
-                        rt.factors,
-                        compiled.slot(slot).script_pubkey().clone(),
-                    ),
-                )
+                let rt = live.yes_rt.as_ref().expect("YES RT");
+                (rt.outpoint, rt.txout.clone())
             }
             BinaryMarketSlot::DormantNoRt | BinaryMarketSlot::UnresolvedNoRt => {
-                let rt = live.no_rt.expect("NO RT");
-                (
-                    rt.outpoint,
-                    confidential_rt_txout(
-                        params.no_reissuance_token_id,
-                        rt.factors,
-                        compiled.slot(slot).script_pubkey().clone(),
-                    ),
-                )
+                let rt = live.no_rt.as_ref().expect("NO RT");
+                (rt.outpoint, rt.txout.clone())
             }
             _ => (
                 live.collateral.expect("collateral outpoint"),
@@ -305,6 +366,47 @@ fn market_pset(
         pset.add_output(PsetOutput::from_txout(output));
     }
     pset
+}
+
+fn interpreter_live_outputs(
+    params: BinaryMarketParams,
+    state: BinaryMarketState,
+    live: &BinaryMarketLiveInputs,
+) -> BinaryMarketLiveOutputs {
+    let compiled = CompiledBinaryMarket::new(params).expect("compile market");
+    let collateral = live.collateral.map(|outpoint| {
+        let slot = market_input_slots(state)
+            .into_iter()
+            .find(|slot| {
+                !matches!(
+                    slot,
+                    BinaryMarketSlot::DormantYesRt
+                        | BinaryMarketSlot::DormantNoRt
+                        | BinaryMarketSlot::UnresolvedYesRt
+                        | BinaryMarketSlot::UnresolvedNoRt
+                )
+            })
+            .expect("collateral slot");
+        TrackedContractOutput {
+            outpoint,
+            txout: explicit_txout(
+                params.collateral_asset_id,
+                collateral_amount(params, state),
+                compiled.slot(slot).script_pubkey().clone(),
+            ),
+        }
+    });
+    BinaryMarketLiveOutputs {
+        yes_rt: live.yes_rt.as_ref().map(|rt| TrackedContractOutput {
+            outpoint: rt.outpoint,
+            txout: rt.txout.clone(),
+        }),
+        no_rt: live.no_rt.as_ref().map(|rt| TrackedContractOutput {
+            outpoint: rt.outpoint,
+            txout: rt.txout.clone(),
+        }),
+        collateral,
+    }
 }
 
 #[test]
@@ -499,36 +601,116 @@ fn every_finalized_market_stack_has_sufficient_simplicity_budget() {
         policy_asset: params.collateral_asset_id,
     };
     let mut failures = Vec::new();
-    for (label, before, action, attestation) in cases {
-        let live = live_inputs(before);
-        let plan = BinaryMarketTransitionPlan::new(params, before, action, live, attestation)
-            .unwrap_or_else(|error| panic!("{label}: plan: {error}"));
-        let input_base = 1;
-        let output_base = 1;
-        let mut pset = market_pset(params, before, live, &plan, input_base, output_base);
-        if matches!(action, BinaryMarketAction::Issue { .. }) {
-            plan.configure_reissuance_inputs(&mut pset, input_base, entropies)
-                .unwrap_or_else(|error| panic!("{label}: reissuance: {error}"));
-        }
-        if matches!(action, BinaryMarketAction::Expire) {
-            plan.prepare_expiry(&mut pset, input_base)
-                .unwrap_or_else(|error| panic!("{label}: expiry: {error}"));
-        }
-        plan.finalize(&mut pset, input_base, output_base, &network)
-            .unwrap_or_else(|error| panic!("{label}: finalize: {error}"));
-        for (offset, _) in market_input_slots(before).iter().enumerate() {
-            let input_index = input_base + offset;
-            let stack = pset.inputs()[input_index]
-                .final_script_witness
-                .as_ref()
-                .expect("final market witness");
-            record_budget(format!("{label}/input-{input_index}"), stack, &mut failures);
+    let mut measurements = Vec::new();
+    for side in [RtSide::A, RtSide::B] {
+        for &(label, before, action, attestation) in &cases {
+            let live = live_inputs(params, before, side);
+            let plan =
+                BinaryMarketTransitionPlan::new(params, before, action, live.clone(), attestation)
+                    .unwrap_or_else(|error| panic!("{label}/{side:?}: plan: {error}"));
+            let input_base = 1;
+            let output_base = 1;
+            let mut pset = market_pset(params, before, &live, &plan, input_base, output_base);
+            if matches!(action, BinaryMarketAction::Issue { .. }) {
+                plan.configure_reissuance_inputs(&mut pset, input_base, entropies)
+                    .unwrap_or_else(|error| panic!("{label}/{side:?}: reissuance: {error}"));
+            }
+            if matches!(action, BinaryMarketAction::Expire) {
+                plan.prepare_expiry(&mut pset, input_base)
+                    .unwrap_or_else(|error| panic!("{label}/{side:?}: expiry: {error}"));
+            }
+            plan.finalize(&mut pset, input_base, output_base, &network)
+                .unwrap_or_else(|error| panic!("{label}/{side:?}: finalize: {error}"));
+            let mut covenant = CovenantMetrics::default();
+            for (offset, _) in market_input_slots(before).iter().enumerate() {
+                let input_index = input_base + offset;
+                let stack = pset.inputs()[input_index]
+                    .final_script_witness
+                    .as_ref()
+                    .expect("final market witness");
+                covenant.add_assign(record_budget(
+                    format!("{label}/{side:?}/input-{input_index}"),
+                    stack,
+                    &mut failures,
+                ));
+            }
+
+            let transaction = pset.extract_tx().expect("extract finalized market tx");
+            measurements.push(MarketMetrics {
+                stage: label,
+                rt_input_side: match side {
+                    RtSide::A => "a",
+                    RtSide::B => "b",
+                },
+                covenant,
+                tx_bytes: transaction.size(),
+                tx_weight: transaction.weight(),
+                tx_vsize: transaction.vsize(),
+                tx_discount_weight: transaction.discount_weight(),
+                tx_discount_vsize: transaction.discount_vsize(),
+            });
+            let interpreted = interpret_binary_market_spend(
+                params,
+                before,
+                &interpreter_live_outputs(params, before, &live),
+                &transaction,
+            )
+            .unwrap_or_else(|error| panic!("{label}/{side:?}: interpret: {error}"));
+            assert_eq!(interpreted.action, action, "{label}/{side:?}: action");
+            assert_eq!(
+                interpreted.after,
+                plan.after(),
+                "{label}/{side:?}: resulting state"
+            );
+
+            if matches!(before, BinaryMarketState::Trading { .. }) {
+                let mut same_side_output = transaction.clone();
+                let (asset, value) =
+                    commitments(params.yes_reissuance_token_id, factors(RtLeg::Yes, side))
+                        .expect("same-side commitments");
+                same_side_output.output[output_base].asset = asset;
+                same_side_output.output[output_base].value = value;
+                assert!(
+                    interpret_binary_market_spend(
+                        params,
+                        before,
+                        &interpreter_live_outputs(params, before, &live),
+                        &same_side_output,
+                    )
+                    .is_err(),
+                    "{label}/{side:?}: same-side RT output"
+                );
+            }
+
+            if matches!(action, BinaryMarketAction::Issue { .. }) {
+                for offset in 0..2 {
+                    let mut wrong_nonce = transaction.clone();
+                    wrong_nonce.input[input_base + offset]
+                        .asset_issuance
+                        .asset_blinding_nonce =
+                        Tweak::from_inner(side.flip().abf()).expect("opposite public ABF");
+                    assert!(
+                        interpret_binary_market_spend(
+                            params,
+                            before,
+                            &interpreter_live_outputs(params, before, &live),
+                            &wrong_nonce,
+                        )
+                        .is_err(),
+                        "{label}/{side:?}: wrong reissuance nonce at sibling {offset}"
+                    );
+                }
+            }
         }
     }
     let report = failure_report(&failures);
     assert!(
         failures.is_empty(),
         "underbudget finalized market stacks:\n{report}"
+    );
+    eprintln!(
+        "DEADCAT_AB_MARKET_METRICS={}",
+        serde_json::to_string(&measurements).expect("serialize market measurements")
     );
 }
 
@@ -602,7 +784,7 @@ fn every_finalized_maker_fill_stack_has_sufficient_simplicity_budget() {
         for partial in [false, true] {
             let shape = if partial { "partial" } else { "full" };
             let stack = finalized_maker_stack(direction, partial);
-            record_budget(
+            let _ = record_budget(
                 format!("maker-{direction:?}-{shape}"),
                 &stack,
                 &mut failures,

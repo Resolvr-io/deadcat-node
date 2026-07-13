@@ -20,7 +20,7 @@ use deadcat_contracts::recovery::{
     MarketCollateral, MarketRecoveryHint, RecoveryError, recovery_txout,
 };
 use deadcat_contracts::rt::{
-    RtCommitmentError, RtFactors, commitments, continuation_factors, creation_factors, tagged_hash,
+    RtCommitmentError, RtFactors, RtLeg, RtSide, commitments, factors, infer_side, tagged_hash,
 };
 use deadcat_types::{BinaryMarketParams, BinaryMarketState};
 use elements::confidential::{Asset, AssetBlindingFactor, Nonce, Value, ValueBlindingFactor};
@@ -104,8 +104,8 @@ impl BinaryMarketCreationPlan {
             yes_defining_outpoint,
             no_defining_outpoint,
         )?;
-        let yes_factors = creation_factors(yes_defining_outpoint);
-        let no_factors = creation_factors(no_defining_outpoint);
+        let yes_factors = factors(RtLeg::Yes, RtSide::A);
+        let no_factors = factors(RtLeg::No, RtSide::A);
         let yes = confidential_rt_output_skeleton(
             params.yes_reissuance_token_id,
             yes_factors,
@@ -230,15 +230,19 @@ impl BinaryMarketCreationPlan {
     }
 }
 
-/// One live RT and the public factors needed by the covenant witness.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One live RT backed by the exact raw chain output.
+///
+/// The A/B side is deliberately not trusted as caller-provided metadata. It is
+/// inferred from `txout` whenever a transition plan is constructed and checked
+/// again against the PSET's `witness_utxo` during finalization.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarketRtInput {
     pub outpoint: OutPoint,
-    pub factors: RtFactors,
+    pub txout: TxOut,
 }
 
 /// Exact live market outpoints used by a lifecycle plan.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BinaryMarketLiveInputs {
     pub yes_rt: Option<MarketRtInput>,
     pub no_rt: Option<MarketRtInput>,
@@ -280,7 +284,7 @@ impl BinaryMarketTransitionPlan {
         let economics = BinaryMarketEconomics::new(params.base_payout)?;
         let applied = economics.apply(before, action)?;
         let path = select_path(before, action, applied)?;
-        validate_live_shape(params, before, path, live)?;
+        validate_live_shape(&compiled, params, before, path, &live)?;
         let oracle_signature = validate_attestation(params, action, attestation)?;
         let (tokens_burned, redeem_yes) = match action {
             BinaryMarketAction::Redeem { outcome, tokens } => {
@@ -293,10 +297,18 @@ impl BinaryMarketTransitionPlan {
         let mut no_output_factors = None;
         let mut output_templates = Vec::new();
         if path_consumes_rt(path) {
-            let yes = live.yes_rt.ok_or(MarketBuilderError::MissingYesRt)?;
-            let no = live.no_rt.ok_or(MarketBuilderError::MissingNoRt)?;
-            let yes_out = continuation_factors(yes.outpoint, yes.factors.cbf);
-            let no_out = continuation_factors(no.outpoint, no.factors.cbf);
+            let yes = live
+                .yes_rt
+                .as_ref()
+                .ok_or(MarketBuilderError::MissingYesRt)?;
+            let no = live.no_rt.as_ref().ok_or(MarketBuilderError::MissingNoRt)?;
+            let yes_side = infer_rt_side(yes, RtLeg::Yes, params.yes_reissuance_token_id)?;
+            let no_side = infer_rt_side(no, RtLeg::No, params.no_reissuance_token_id)?;
+            if yes_side != no_side {
+                return Err(MarketBuilderError::MismatchedRtSides);
+            }
+            let yes_out = factors(RtLeg::Yes, yes_side.flip());
+            let no_out = factors(RtLeg::No, no_side.flip());
             yes_output_factors = Some(yes_out);
             no_output_factors = Some(no_out);
             let (yes_slot, no_slot) = match path {
@@ -435,8 +447,21 @@ impl BinaryMarketTransitionPlan {
             _ => return Err(MarketBuilderError::NotIssuancePath),
         };
         validate_entropies(self.params, entropies)?;
-        let yes = self.live.yes_rt.ok_or(MarketBuilderError::MissingYesRt)?;
-        let no = self.live.no_rt.ok_or(MarketBuilderError::MissingNoRt)?;
+        let yes = self
+            .live
+            .yes_rt
+            .as_ref()
+            .ok_or(MarketBuilderError::MissingYesRt)?;
+        let no = self
+            .live
+            .no_rt
+            .as_ref()
+            .ok_or(MarketBuilderError::MissingNoRt)?;
+        let yes_side = infer_rt_side(yes, RtLeg::Yes, self.params.yes_reissuance_token_id)?;
+        let no_side = infer_rt_side(no, RtLeg::No, self.params.no_reissuance_token_id)?;
+        if yes_side != no_side {
+            return Err(MarketBuilderError::MismatchedRtSides);
+        }
         let no_index = add_index(input_base, 1)?;
         if no_index >= pset.inputs().len() {
             return Err(MarketBuilderError::InputIndexOutOfBounds);
@@ -445,13 +470,13 @@ impl BinaryMarketTransitionPlan {
             &mut pset.inputs_mut()[input_base],
             pairs,
             entropies.yes,
-            yes.factors.abf,
+            yes_side.abf(),
         )?;
         configure_reissuance(
             &mut pset.inputs_mut()[no_index],
             pairs,
             entropies.no,
-            no.factors.abf,
+            no_side.abf(),
         )?;
         Ok(())
     }
@@ -526,14 +551,31 @@ impl BinaryMarketTransitionPlan {
         }
 
         if path_consumes_rt(self.path) {
-            let yes = self.live.yes_rt.ok_or(MarketBuilderError::MissingYesRt)?;
-            let no = self.live.no_rt.ok_or(MarketBuilderError::MissingNoRt)?;
+            let yes = self
+                .live
+                .yes_rt
+                .as_ref()
+                .ok_or(MarketBuilderError::MissingYesRt)?;
+            let no = self
+                .live
+                .no_rt
+                .as_ref()
+                .ok_or(MarketBuilderError::MissingNoRt)?;
+            let yes_side = infer_rt_side(yes, RtLeg::Yes, self.params.yes_reissuance_token_id)?;
+            let no_side = infer_rt_side(no, RtLeg::No, self.params.no_reissuance_token_id)?;
+            if yes_side != no_side {
+                return Err(MarketBuilderError::MismatchedRtSides);
+            }
             let known = [
-                (input_base, self.params.yes_reissuance_token_id, yes.factors),
+                (
+                    input_base,
+                    self.params.yes_reissuance_token_id,
+                    factors(RtLeg::Yes, yes_side),
+                ),
                 (
                     add_index(input_base, 1)?,
                     self.params.no_reissuance_token_id,
-                    no.factors,
+                    factors(RtLeg::No, no_side),
                 ),
             ];
             install_rt_surjection_proof(
@@ -559,16 +601,6 @@ impl BinaryMarketTransitionPlan {
             u32::try_from(input_base).map_err(|_| MarketBuilderError::IndexOverflow)?;
         let output_base_u32 =
             u32::try_from(output_base).map_err(|_| MarketBuilderError::IndexOverflow)?;
-        let yes_input = self
-            .live
-            .yes_rt
-            .map_or(zero_factors(), |input| input.factors);
-        let no_input = self
-            .live
-            .no_rt
-            .map_or(zero_factors(), |input| input.factors);
-        let yes_burn = self.yes_output_factors.unwrap_or_else(zero_factors);
-        let no_burn = self.no_output_factors.unwrap_or_else(zero_factors);
         let input_slots = self.input_slots();
         let mut finalized = Vec::with_capacity(input_slots.len());
         for (offset, slot) in input_slots.iter().copied().enumerate() {
@@ -578,14 +610,6 @@ impl BinaryMarketTransitionPlan {
                 slot: slot as u8,
                 input_base: input_base_u32,
                 output_base: output_base_u32,
-                yes_input_abf: yes_input.abf,
-                yes_input_cbf: yes_input.cbf,
-                no_input_abf: no_input.abf,
-                no_input_cbf: no_input.cbf,
-                yes_burn_abf: yes_burn.abf,
-                yes_burn_cbf: yes_burn.cbf,
-                no_burn_abf: no_burn.abf,
-                no_burn_cbf: no_burn.cbf,
                 oracle_outcome_yes: self.redeem_yes
                     || matches!(
                         self.applied.transition,
@@ -630,12 +654,14 @@ impl BinaryMarketTransitionPlan {
                 BinaryMarketSlot::DormantYesRt | BinaryMarketSlot::UnresolvedYesRt => {
                     self.live
                         .yes_rt
+                        .as_ref()
                         .ok_or(MarketBuilderError::MissingYesRt)?
                         .outpoint
                 }
                 BinaryMarketSlot::DormantNoRt | BinaryMarketSlot::UnresolvedNoRt => {
                     self.live
                         .no_rt
+                        .as_ref()
                         .ok_or(MarketBuilderError::MissingNoRt)?
                         .outpoint
                 }
@@ -656,24 +682,26 @@ impl BinaryMarketTransitionPlan {
             }
             match slot {
                 BinaryMarketSlot::DormantYesRt | BinaryMarketSlot::UnresolvedYesRt => {
-                    verify_rt_input(
-                        utxo,
-                        self.params.yes_reissuance_token_id,
-                        self.live
-                            .yes_rt
-                            .ok_or(MarketBuilderError::MissingYesRt)?
-                            .factors,
-                    )?;
+                    let live = self
+                        .live
+                        .yes_rt
+                        .as_ref()
+                        .ok_or(MarketBuilderError::MissingYesRt)?;
+                    if utxo != &live.txout {
+                        return Err(MarketBuilderError::WrongContractInput);
+                    }
+                    infer_rt_side(live, RtLeg::Yes, self.params.yes_reissuance_token_id)?;
                 }
                 BinaryMarketSlot::DormantNoRt | BinaryMarketSlot::UnresolvedNoRt => {
-                    verify_rt_input(
-                        utxo,
-                        self.params.no_reissuance_token_id,
-                        self.live
-                            .no_rt
-                            .ok_or(MarketBuilderError::MissingNoRt)?
-                            .factors,
-                    )?;
+                    let live = self
+                        .live
+                        .no_rt
+                        .as_ref()
+                        .ok_or(MarketBuilderError::MissingNoRt)?;
+                    if utxo != &live.txout {
+                        return Err(MarketBuilderError::WrongContractInput);
+                    }
+                    infer_rt_side(live, RtLeg::No, self.params.no_reissuance_token_id)?;
                 }
                 _ => {
                     let amount = collateral_amount(self.params, self.before)?;
@@ -697,19 +725,32 @@ impl BinaryMarketTransitionPlan {
         if let BinaryMarketTransition::Issued { pairs, .. } = self.applied.transition {
             let yes = &pset.inputs()[indices[0]];
             let no = &pset.inputs()[indices[1]];
-            let yes_rt = self.live.yes_rt.ok_or(MarketBuilderError::MissingYesRt)?;
-            let no_rt = self.live.no_rt.ok_or(MarketBuilderError::MissingNoRt)?;
+            let yes_rt = self
+                .live
+                .yes_rt
+                .as_ref()
+                .ok_or(MarketBuilderError::MissingYesRt)?;
+            let no_rt = self
+                .live
+                .no_rt
+                .as_ref()
+                .ok_or(MarketBuilderError::MissingNoRt)?;
+            let yes_side = infer_rt_side(yes_rt, RtLeg::Yes, self.params.yes_reissuance_token_id)?;
+            let no_side = infer_rt_side(no_rt, RtLeg::No, self.params.no_reissuance_token_id)?;
+            if yes_side != no_side {
+                return Err(MarketBuilderError::MismatchedRtSides);
+            }
             verify_reissuance(
                 yes,
                 pairs,
-                yes_rt.factors.abf,
+                yes_side.abf(),
                 self.params.yes_token_asset_id,
                 self.params.yes_reissuance_token_id,
             )?;
             verify_reissuance(
                 no,
                 pairs,
-                no_rt.factors.abf,
+                no_side.abf(),
                 self.params.no_token_asset_id,
                 self.params.no_reissuance_token_id,
             )?;
@@ -1070,29 +1111,44 @@ fn select_path(
 }
 
 fn validate_live_shape(
+    compiled: &CompiledBinaryMarket,
     params: BinaryMarketParams,
     before: BinaryMarketState,
     path: BinaryMarketPath,
-    live: BinaryMarketLiveInputs,
+    live: &BinaryMarketLiveInputs,
 ) -> Result<(), MarketBuilderError> {
     BinaryMarketEconomics::new(params.base_payout)?.validate_state(before)?;
     match path {
         BinaryMarketPath::InitialIssuance
         | BinaryMarketPath::DormantResolution
         | BinaryMarketPath::DormantExpiry => {
-            let yes = live.yes_rt.ok_or(MarketBuilderError::MissingYesRt)?;
-            let no = live.no_rt.ok_or(MarketBuilderError::MissingNoRt)?;
+            let yes = live
+                .yes_rt
+                .as_ref()
+                .ok_or(MarketBuilderError::MissingYesRt)?;
+            let no = live.no_rt.as_ref().ok_or(MarketBuilderError::MissingNoRt)?;
             if live.collateral.is_some() || yes.outpoint.txid != no.outpoint.txid {
                 return Err(MarketBuilderError::InvalidSiblingGroup);
             }
+            validate_rt_pair(
+                compiled,
+                params,
+                yes,
+                no,
+                BinaryMarketSlot::DormantYesRt,
+                BinaryMarketSlot::DormantNoRt,
+            )?;
         }
         BinaryMarketPath::SubsequentIssuance
         | BinaryMarketPath::PartialCancellation
         | BinaryMarketPath::FullCancellation
         | BinaryMarketPath::ActiveResolution
         | BinaryMarketPath::ActiveExpiry => {
-            let yes = live.yes_rt.ok_or(MarketBuilderError::MissingYesRt)?;
-            let no = live.no_rt.ok_or(MarketBuilderError::MissingNoRt)?;
+            let yes = live
+                .yes_rt
+                .as_ref()
+                .ok_or(MarketBuilderError::MissingYesRt)?;
+            let no = live.no_rt.as_ref().ok_or(MarketBuilderError::MissingNoRt)?;
             let collateral = live
                 .collateral
                 .ok_or(MarketBuilderError::MissingCollateral)?;
@@ -1113,6 +1169,14 @@ fn validate_live_shape(
             {
                 return Err(MarketBuilderError::InvalidSiblingGroup);
             }
+            validate_rt_pair(
+                compiled,
+                params,
+                yes,
+                no,
+                BinaryMarketSlot::UnresolvedYesRt,
+                BinaryMarketSlot::UnresolvedNoRt,
+            )?;
         }
         BinaryMarketPath::ResolvedRedemption | BinaryMarketPath::ExpiryRedemption => {
             if live.yes_rt.is_some() || live.no_rt.is_some() || live.collateral.is_none() {
@@ -1121,6 +1185,36 @@ fn validate_live_shape(
         }
     }
     Ok(())
+}
+
+fn validate_rt_pair(
+    compiled: &CompiledBinaryMarket,
+    params: BinaryMarketParams,
+    yes: &MarketRtInput,
+    no: &MarketRtInput,
+    yes_slot: BinaryMarketSlot,
+    no_slot: BinaryMarketSlot,
+) -> Result<(), MarketBuilderError> {
+    if yes.txout.script_pubkey != *compiled.slot(yes_slot).script_pubkey()
+        || no.txout.script_pubkey != *compiled.slot(no_slot).script_pubkey()
+    {
+        return Err(MarketBuilderError::WrongContractInput);
+    }
+    let yes_side = infer_rt_side(yes, RtLeg::Yes, params.yes_reissuance_token_id)?;
+    let no_side = infer_rt_side(no, RtLeg::No, params.no_reissuance_token_id)?;
+    if yes_side != no_side {
+        return Err(MarketBuilderError::MismatchedRtSides);
+    }
+    Ok(())
+}
+
+fn infer_rt_side(
+    input: &MarketRtInput,
+    leg: RtLeg,
+    asset_id: AssetId,
+) -> Result<RtSide, MarketBuilderError> {
+    infer_side(leg, asset_id, input.txout.asset, input.txout.value)
+        .map_err(|_| MarketBuilderError::WrongContractInput)
 }
 
 fn validate_attestation(
@@ -1258,18 +1352,6 @@ fn validate_entropies(
     Ok(())
 }
 
-fn verify_rt_input(
-    txout: &TxOut,
-    asset_id: AssetId,
-    factors: RtFactors,
-) -> Result<(), MarketBuilderError> {
-    let expected = commitments(asset_id, factors)?;
-    if (txout.asset, txout.value) != expected {
-        return Err(MarketBuilderError::WrongContractInput);
-    }
-    Ok(())
-}
-
 fn collateral_amount(
     params: BinaryMarketParams,
     state: BinaryMarketState,
@@ -1352,14 +1434,6 @@ fn compile(params: BinaryMarketParams) -> Result<CompiledBinaryMarket, MarketBui
         .map_err(|error| MarketBuilderError::Compilation(error.to_string()))
 }
 
-const fn zero_factors() -> RtFactors {
-    RtFactors {
-        abf: [0; 32],
-        vbf: [0; 32],
-        cbf: [0; 32],
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum MarketBuilderError {
     #[error("binary-market economics error: {0}")]
@@ -1386,6 +1460,8 @@ pub enum MarketBuilderError {
     MissingCollateral,
     #[error("market live outpoints do not form the required sibling group")]
     InvalidSiblingGroup,
+    #[error("the live YES and NO RTs are on different A/B sides")]
+    MismatchedRtSides,
     #[error("unsupported state/action transition")]
     UnsupportedTransition,
     #[error("resolution requires an oracle attestation")]
@@ -1452,22 +1528,6 @@ mod tests {
 
     fn asset(byte: u8) -> AssetId {
         AssetId::from_slice(&[byte; 32]).expect("asset")
-    }
-
-    fn scalar(byte: u8) -> [u8; 32] {
-        let mut value = [0; 32];
-        value[31] = byte;
-        value
-    }
-
-    fn factors(abf: u8, cbf: u8) -> RtFactors {
-        let abf = scalar(abf);
-        let cbf = scalar(cbf);
-        RtFactors {
-            abf,
-            vbf: deadcat_contracts::rt::subtract_mod_order(cbf, abf),
-            cbf,
-        }
     }
 
     fn oracle_keypair() -> Keypair {
@@ -1639,28 +1699,58 @@ mod tests {
     }
 
     fn live_for_state(state: BinaryMarketState) -> BinaryMarketLiveInputs {
+        let params = params();
+        let compiled = CompiledBinaryMarket::new(params).expect("compile");
         match state {
             BinaryMarketState::Trading {
                 outstanding_pairs: 0,
             } => BinaryMarketLiveInputs {
                 yes_rt: Some(MarketRtInput {
                     outpoint: OutPoint::new(Txid::from_byte_array([0x70; 32]), 2),
-                    factors: factors(1, 3),
+                    txout: rt_input_txout(
+                        params.yes_reissuance_token_id,
+                        factors(RtLeg::Yes, RtSide::A),
+                        compiled
+                            .slot(BinaryMarketSlot::DormantYesRt)
+                            .script_pubkey()
+                            .clone(),
+                    ),
                 }),
                 no_rt: Some(MarketRtInput {
                     outpoint: OutPoint::new(Txid::from_byte_array([0x70; 32]), 9),
-                    factors: factors(2, 5),
+                    txout: rt_input_txout(
+                        params.no_reissuance_token_id,
+                        factors(RtLeg::No, RtSide::A),
+                        compiled
+                            .slot(BinaryMarketSlot::DormantNoRt)
+                            .script_pubkey()
+                            .clone(),
+                    ),
                 }),
                 collateral: None,
             },
             BinaryMarketState::Trading { .. } => BinaryMarketLiveInputs {
                 yes_rt: Some(MarketRtInput {
                     outpoint: OutPoint::new(Txid::from_byte_array([0x71; 32]), 4),
-                    factors: factors(1, 3),
+                    txout: rt_input_txout(
+                        params.yes_reissuance_token_id,
+                        factors(RtLeg::Yes, RtSide::B),
+                        compiled
+                            .slot(BinaryMarketSlot::UnresolvedYesRt)
+                            .script_pubkey()
+                            .clone(),
+                    ),
                 }),
                 no_rt: Some(MarketRtInput {
                     outpoint: OutPoint::new(Txid::from_byte_array([0x71; 32]), 5),
-                    factors: factors(2, 5),
+                    txout: rt_input_txout(
+                        params.no_reissuance_token_id,
+                        factors(RtLeg::No, RtSide::B),
+                        compiled
+                            .slot(BinaryMarketSlot::UnresolvedNoRt)
+                            .script_pubkey()
+                            .clone(),
+                    ),
                 }),
                 collateral: Some(OutPoint::new(Txid::from_byte_array([0x71; 32]), 6)),
             },
@@ -1690,26 +1780,12 @@ mod tests {
         for slot in plan.input_slots() {
             let (outpoint, txout) = match slot {
                 BinaryMarketSlot::DormantYesRt | BinaryMarketSlot::UnresolvedYesRt => {
-                    let live = plan.live.yes_rt.expect("YES live");
-                    (
-                        live.outpoint,
-                        rt_input_txout(
-                            params.yes_reissuance_token_id,
-                            live.factors,
-                            compiled.slot(slot).script_pubkey().clone(),
-                        ),
-                    )
+                    let live = plan.live.yes_rt.as_ref().expect("YES live");
+                    (live.outpoint, live.txout.clone())
                 }
                 BinaryMarketSlot::DormantNoRt | BinaryMarketSlot::UnresolvedNoRt => {
-                    let live = plan.live.no_rt.expect("NO live");
-                    (
-                        live.outpoint,
-                        rt_input_txout(
-                            params.no_reissuance_token_id,
-                            live.factors,
-                            compiled.slot(slot).script_pubkey().clone(),
-                        ),
-                    )
+                    let live = plan.live.no_rt.as_ref().expect("NO live");
+                    (live.outpoint, live.txout.clone())
                 }
                 _ => (
                     plan.live.collateral.expect("collateral live"),
@@ -1904,24 +1980,26 @@ mod tests {
                 );
             }
             if path_consumes_rt(expected_path) {
-                let yes = plan.live.yes_rt.expect("yes");
-                let no = plan.live.no_rt.expect("no");
-                verify_surjection(
-                    &pset,
-                    output_base,
-                    &[
-                        (input_base, params.yes_reissuance_token_id, yes.factors),
-                        (input_base + 1, params.no_reissuance_token_id, no.factors),
-                    ],
-                );
-                verify_surjection(
-                    &pset,
-                    output_base + 1,
-                    &[
-                        (input_base, params.yes_reissuance_token_id, yes.factors),
-                        (input_base + 1, params.no_reissuance_token_id, no.factors),
-                    ],
-                );
+                let yes = plan.live.yes_rt.as_ref().expect("yes");
+                let no = plan.live.no_rt.as_ref().expect("no");
+                let yes_side = infer_rt_side(yes, RtLeg::Yes, params.yes_reissuance_token_id)
+                    .expect("YES side");
+                let no_side =
+                    infer_rt_side(no, RtLeg::No, params.no_reissuance_token_id).expect("NO side");
+                let known = [
+                    (
+                        input_base,
+                        params.yes_reissuance_token_id,
+                        factors(RtLeg::Yes, yes_side),
+                    ),
+                    (
+                        input_base + 1,
+                        params.no_reissuance_token_id,
+                        factors(RtLeg::No, no_side),
+                    ),
+                ];
+                verify_surjection(&pset, output_base, &known);
+                verify_surjection(&pset, output_base + 1, &known);
             }
         }
     }
@@ -1932,6 +2010,24 @@ mod tests {
         let before = BinaryMarketState::Trading {
             outstanding_pairs: 3,
         };
+        let mut mismatched = live_for_state(before);
+        let no = mismatched.no_rt.as_mut().expect("live NO RT");
+        let (asset, value) =
+            commitments(params.no_reissuance_token_id, factors(RtLeg::No, RtSide::A))
+                .expect("side-A NO commitments");
+        no.txout.asset = asset;
+        no.txout.value = value;
+        assert!(matches!(
+            BinaryMarketTransitionPlan::new(
+                params,
+                before,
+                BinaryMarketAction::Expire,
+                mismatched,
+                None,
+            ),
+            Err(MarketBuilderError::MismatchedRtSides)
+        ));
+
         let expiry = BinaryMarketTransitionPlan::new(
             params,
             before,

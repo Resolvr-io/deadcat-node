@@ -895,13 +895,17 @@ name = "deadcat-client"
 version = "0.1.0-alpha"
 dependencies = [
  "bip39",
+ "bitcoincore-rpc",
  "deadcat-contracts",
  "deadcat-rpc",
  "deadcat-types",
  "elements",
  "hmac",
  "rand 0.8.7",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
+ "smplx-regtest",
  "smplx-std",
  "thiserror 2.0.18",
 ]
@@ -942,6 +946,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "deadcat-client",
  "deadcat-contracts",
  "deadcat-iroh",
  "deadcat-rpc",
@@ -971,26 +976,6 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "deadcat-rt-study"
-version = "0.1.0-alpha"
-dependencies = [
- "bitcoincore-rpc",
- "deadcat-client",
- "deadcat-contracts",
- "elements",
- "hex",
- "rand 0.8.7",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "smplx-regtest",
- "smplx-sdk",
- "smplx-std",
- "tempfile",
  "thiserror 2.0.18",
 ]
 

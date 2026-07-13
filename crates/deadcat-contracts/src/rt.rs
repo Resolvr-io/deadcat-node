@@ -1,8 +1,7 @@
-//! Deterministic reissuance-token blinding factors.
+//! Public A/B reissuance-token blinding schedule.
 
 use std::cmp::Ordering;
 
-use elements::OutPoint;
 use elements::confidential::{Asset, AssetBlindingFactor, Value, ValueBlindingFactor};
 use elements::secp256k1_zkp::Secp256k1;
 use sha2::{Digest as _, Sha256};
@@ -14,11 +13,57 @@ pub const SECP256K1_ORDER: [u8; 32] = [
     0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
 ];
 
+/// Asset blinding factor for side A of every market RT.
+pub const ABF_A: [u8; 32] = [1; 32];
+
+/// Asset blinding factor for side B of every market RT.
+pub const ABF_B: [u8; 32] = [2; 32];
+
+/// Commitment blinding factor for the YES RT leg.
+///
+/// The NO leg uses its additive inverse, so the two one-unit RT outputs
+/// balance locally at market creation without a confidential wallet change
+/// output.
+pub const YES_CBF: [u8; 32] = [3; 32];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RtFactors {
     pub abf: [u8; 32],
     pub vbf: [u8; 32],
     pub cbf: [u8; 32],
+}
+
+/// One of the two independently reissuable market outcome-token legs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RtLeg {
+    Yes,
+    No,
+}
+
+/// The currently live member of an RT leg's two-state commitment schedule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RtSide {
+    A,
+    B,
+}
+
+impl RtSide {
+    /// The side required for the next continuation or terminal burn.
+    #[must_use]
+    pub const fn flip(self) -> Self {
+        match self {
+            Self::A => Self::B,
+            Self::B => Self::A,
+        }
+    }
+
+    #[must_use]
+    pub const fn abf(self) -> [u8; 32] {
+        match self {
+            Self::A => ABF_A,
+            Self::B => ABF_B,
+        }
+    }
 }
 
 /// Materialize the confidential one-unit asset/value commitments enforced by
@@ -49,15 +94,6 @@ pub enum RtCommitmentError {
     InvalidValueBlindingFactor,
 }
 
-/// Elements consensus outpoint serialization: internal txid bytes followed by
-/// little-endian `vout`. This differs from the redb key's big-endian integer.
-#[must_use]
-pub fn serialize_outpoint(outpoint: OutPoint) -> [u8; 36] {
-    elements::encode::serialize(&outpoint)
-        .try_into()
-        .expect("Elements outpoints always serialize to 36 bytes")
-}
-
 #[must_use]
 pub fn tagged_hash(tag: &str, message: &[u8]) -> [u8; 32] {
     let tag_hash = Sha256::digest(tag.as_bytes());
@@ -85,21 +121,55 @@ pub fn hash_to_scalar(domain: &str, message: &[u8]) -> [u8; 32] {
     reduce_scalar(tagged_hash(domain, message))
 }
 
+/// Commitment blinding factor for the NO RT leg.
 #[must_use]
-pub fn creation_factors(defining_outpoint: OutPoint) -> RtFactors {
-    let encoded = serialize_outpoint(defining_outpoint);
-    let abf = hash_to_scalar("deadcat/rt_abf", &encoded);
-    let vbf = hash_to_scalar("deadcat/rt_vbf", &encoded);
-    let cbf = add_mod_order(abf, vbf);
-    RtFactors { abf, vbf, cbf }
+pub fn no_cbf() -> [u8; 32] {
+    subtract_mod_order([0; 32], YES_CBF)
 }
 
 #[must_use]
-pub fn continuation_factors(spent_rt_outpoint: OutPoint, input_cbf: [u8; 32]) -> RtFactors {
-    let abf = hash_to_scalar("deadcat/rt_abf", &serialize_outpoint(spent_rt_outpoint));
-    let cbf = reduce_scalar(input_cbf);
+pub fn cbf(leg: RtLeg) -> [u8; 32] {
+    match leg {
+        RtLeg::Yes => YES_CBF,
+        RtLeg::No => no_cbf(),
+    }
+}
+
+/// Materialize the public blinding factors for one RT leg and side.
+#[must_use]
+pub fn factors(leg: RtLeg, side: RtSide) -> RtFactors {
+    let abf = side.abf();
+    let cbf = cbf(leg);
     let vbf = subtract_mod_order(cbf, abf);
     RtFactors { abf, vbf, cbf }
+}
+
+/// Infer the live A/B side solely from the on-chain asset and value
+/// commitments.
+pub fn infer_side(
+    leg: RtLeg,
+    asset_id: elements::AssetId,
+    asset: Asset,
+    value: Value,
+) -> Result<RtSide, SideInferenceError> {
+    let a = commitments(asset_id, factors(leg, RtSide::A))?;
+    let b = commitments(asset_id, factors(leg, RtSide::B))?;
+    match ((asset, value) == a, (asset, value) == b) {
+        (true, false) => Ok(RtSide::A),
+        (false, true) => Ok(RtSide::B),
+        (false, false) => Err(SideInferenceError::UnknownCommitment),
+        (true, true) => Err(SideInferenceError::AmbiguousCommitment),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum SideInferenceError {
+    #[error("invalid public A/B factors: {0}")]
+    Commitment(#[from] RtCommitmentError),
+    #[error("RT commitment matches neither public side")]
+    UnknownCommitment,
+    #[error("RT commitment matches both public sides")]
+    AmbiguousCommitment,
 }
 
 #[must_use]
@@ -157,9 +227,6 @@ fn subtract_same_width<const N: usize>(left: [u8; N], right: [u8; N]) -> (bool, 
 
 #[cfg(test)]
 mod tests {
-    use elements::Txid;
-    use elements::hashes::Hash as _;
-
     use super::*;
 
     fn scalar(value: u8) -> [u8; 32] {
@@ -184,33 +251,37 @@ mod tests {
     }
 
     #[test]
-    fn outpoint_encoding_uses_consensus_little_endian_vout() {
-        let outpoint = OutPoint::new(Txid::from_byte_array([0x11; 32]), 0x0102_0304);
-        let encoded = serialize_outpoint(outpoint);
-        assert_eq!(&encoded[..32], &[0x11; 32]);
-        assert_eq!(&encoded[32..], &[4, 3, 2, 1]);
+    fn complementary_leg_cbfs_balance() {
+        assert_eq!(add_mod_order(cbf(RtLeg::Yes), cbf(RtLeg::No)), [0; 32]);
     }
 
     #[test]
-    fn continuation_preserves_cbf_and_recomputes_vbf() {
-        let defining = OutPoint::new(Txid::from_byte_array([0x22; 32]), 7);
-        let creation = creation_factors(defining);
-        let continuation = continuation_factors(defining, creation.cbf);
-        assert_eq!(continuation.cbf, creation.cbf);
-        assert_eq!(
-            add_mod_order(continuation.abf, continuation.vbf),
-            continuation.cbf
-        );
-    }
-
-    #[test]
-    fn commitments_are_deterministic_and_confidential() {
+    fn sides_round_trip_through_commitments() {
         let asset = elements::AssetId::from_slice(&[0x33; 32]).expect("asset");
-        let factors = creation_factors(OutPoint::new(Txid::from_byte_array([0x44; 32]), 2));
-        let first = commitments(asset, factors).expect("commitments");
-        let second = commitments(asset, factors).expect("commitments");
-        assert_eq!(first, second);
-        assert!(first.0.is_confidential());
-        assert!(first.1.is_confidential());
+        for leg in [RtLeg::Yes, RtLeg::No] {
+            for side in [RtSide::A, RtSide::B] {
+                let committed = commitments(asset, factors(leg, side)).expect("commitments");
+                assert_eq!(infer_side(leg, asset, committed.0, committed.1), Ok(side));
+                assert!(committed.0.is_confidential());
+                assert!(committed.1.is_confidential());
+            }
+            assert_eq!(factors(leg, RtSide::A).cbf, factors(leg, RtSide::B).cbf);
+            assert_ne!(factors(leg, RtSide::A).abf, factors(leg, RtSide::B).abf);
+        }
+    }
+
+    #[test]
+    fn public_schedule_has_stable_scalar_vectors() {
+        assert_eq!(ABF_A, [1; 32]);
+        assert_eq!(ABF_B, [2; 32]);
+        assert_eq!(YES_CBF, [3; 32]);
+        assert_eq!(
+            no_cbf(),
+            [
+                0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc,
+                0xfc, 0xfb, 0xb7, 0xab, 0xd9, 0xe3, 0xac, 0x45, 0x9d, 0x38, 0xbc, 0xcf, 0x5b, 0x89,
+                0xcd, 0x33, 0x3e, 0x3e,
+            ]
+        );
     }
 }

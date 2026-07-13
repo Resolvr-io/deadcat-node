@@ -5,7 +5,9 @@
 // covenant composes with unrelated wallet inputs and outputs without relying on
 // global transaction positions.
 
-type RtFactors = (u256, u256); // (asset blinding factor, commitment blinding factor)
+type CompressedCommitment = (bool, u256); // (odd y, x)
+// (side-A asset, side-B asset, side-independent one-unit value)
+type RtCommitments = (CompressedCommitment, CompressedCommitment, CompressedCommitment);
 
 // -----------------------------------------------------------------------------
 // Boolean and arithmetic helpers
@@ -17,6 +19,10 @@ fn not(bit: bool) -> bool {
 
 fn or(a: bool, b: bool) -> bool {
     <u1>::into(jet::or_1(<bool>::into(a), <bool>::into(b)))
+}
+
+fn and(a: bool, b: bool) -> bool {
+    <u1>::into(jet::and_1(<bool>::into(a), <bool>::into(b)))
 }
 
 fn safe_add_32(a: u32, b: u32) -> u32 {
@@ -133,7 +139,20 @@ fn ensure_no_issuance(index: u32) {
     assert!(is_none::<u256>(entropy));
 }
 
-fn ensure_reissuance(index: u32, expected_asset: u256, expected_rt: u256) -> u64 {
+fn rt_abf_a() -> u256 {
+    0x0101010101010101010101010101010101010101010101010101010101010101
+}
+
+fn rt_abf_b() -> u256 {
+    0x0202020202020202020202020202020202020202020202020202020202020202
+}
+
+fn ensure_reissuance(
+    index: u32,
+    expected_asset: u256,
+    expected_rt: u256,
+    input_is_a: bool,
+) -> u64 {
     let issued_asset: u256 = unwrap(unwrap(jet::issuance_asset(index)));
     let issuance_token: u256 = unwrap(unwrap(jet::issuance_token(index)));
     assert!(jet::eq_256(issued_asset, expected_asset));
@@ -149,6 +168,12 @@ fn ensure_reissuance(index: u32, expected_asset: u256, expected_rt: u256) -> u64
         unwrap(unwrap(jet::issuance_token_amount(index)))
     );
     assert!(jet::is_zero_64(token_amount));
+    let reissuance_blinding: u256 = unwrap(unwrap(jet::reissuance_blinding(index)));
+    let expected_blinding: u256 = match input_is_a {
+        true => rt_abf_a(),
+        false => rt_abf_b(),
+    };
+    assert!(jet::eq_256(reissuance_blinding, expected_blinding));
     ensure_nonzero(amount);
     amount
 }
@@ -233,98 +258,102 @@ fn ensure_unresolved_group(yes_index: u32, no_index: u32, collateral_index: u32)
 }
 
 // -----------------------------------------------------------------------------
-// Confidential one-unit RT commitments
+// A/B confidential one-unit RT commitments
 // -----------------------------------------------------------------------------
 
-fn verify_rt_commitment(
-    asset_commitment: (u1, u256),
-    value_commitment: (u1, u256),
-    expected_rt: u256,
-    abf: u256,
-    cbf: u256,
-) {
-    let asset_h: Ge = jet::hash_to_curve(expected_rt);
-    let asset_generator: Gej = jet::gej_ge_add(jet::generate(abf), asset_h);
-    let (asset_x, asset_y): (u256, u256) = unwrap(jet::gej_normalize(asset_generator));
-    let (stored_asset_parity, stored_asset_x): (u1, u256) = asset_commitment;
-    assert!(jet::eq_256(asset_x, stored_asset_x));
-    assert!(jet::eq_1(
-        <bool>::into(is_none::<u256>(jet::fe_square_root(asset_y))),
-        stored_asset_parity,
-    ));
-
-    // Value is exactly one, so its Pedersen commitment is H(asset) + cbf*G.
-    let value_generator: Gej = jet::gej_ge_add(jet::generate(cbf), asset_h);
-    let (value_x, value_y): (u256, u256) = unwrap(jet::gej_normalize(value_generator));
-    let (stored_value_parity, stored_value_x): (u1, u256) = value_commitment;
-    assert!(jet::eq_256(value_x, stored_value_x));
-    assert!(jet::eq_1(
-        <bool>::into(is_none::<u256>(jet::fe_square_root(value_y))),
-        stored_value_parity,
-    ));
+fn commitment_matches(actual: (u1, u256), expected: CompressedCommitment) -> bool {
+    let (actual_parity, actual_x): (u1, u256) = actual;
+    let (expected_parity, expected_x): CompressedCommitment = expected;
+    and(
+        jet::eq_1(actual_parity, <bool>::into(expected_parity)),
+        jet::eq_256(actual_x, expected_x),
+    )
 }
 
-fn verify_input_rt(index: u32, expected_rt: u256, factors: RtFactors) {
-    let (abf, cbf): RtFactors = factors;
+fn get_input_confidential(index: u32) -> ((u1, u256), (u1, u256)) {
     let (asset, amount): (Asset1, Amount1) = unwrap(jet::input_amount(index));
     let asset_commitment: (u1, u256) = unwrap_left::<u256>(asset);
     let value_commitment: (u1, u256) = unwrap_left::<u64>(amount);
-    verify_rt_commitment(asset_commitment, value_commitment, expected_rt, abf, cbf);
+    (asset_commitment, value_commitment)
 }
 
-fn verify_output_rt(index: u32, expected_rt: u256, factors: RtFactors) {
-    let (abf, cbf): RtFactors = factors;
+fn get_output_confidential(index: u32) -> ((u1, u256), (u1, u256)) {
     let (asset, amount): (Asset1, Amount1) = unwrap(jet::output_amount(index));
     let asset_commitment: (u1, u256) = unwrap_left::<u256>(asset);
     let value_commitment: (u1, u256) = unwrap_left::<u64>(amount);
-    verify_rt_commitment(asset_commitment, value_commitment, expected_rt, abf, cbf);
+    (asset_commitment, value_commitment)
 }
 
-fn little_endian_u32(value: u32) -> u32 {
-    let (b0, b1, b2, b3): (u8, u8, u8, u8) = <u32>::into(value);
-    <(u8, u8, u8, u8)>::into((b3, b2, b1, b0))
+fn yes_rt_commitments() -> RtCommitments {
+    (
+        (param::YES_RT_ASSET_A_PARITY, param::YES_RT_ASSET_A_X),
+        (param::YES_RT_ASSET_B_PARITY, param::YES_RT_ASSET_B_X),
+        (param::YES_RT_VALUE_PARITY, param::YES_RT_VALUE_X),
+    )
 }
 
-fn rt_abf_domain() -> u256 {
-    // SHA256("deadcat/rt_abf")
-    0x69dfe8386bc167a102c60d19ca7d562d802c7c658ef49b31010aa0b396e01cbe
+fn no_rt_commitments() -> RtCommitments {
+    (
+        (param::NO_RT_ASSET_A_PARITY, param::NO_RT_ASSET_A_X),
+        (param::NO_RT_ASSET_B_PARITY, param::NO_RT_ASSET_B_X),
+        (param::NO_RT_VALUE_PARITY, param::NO_RT_VALUE_X),
+    )
 }
 
-fn deterministic_output_abf(input_index: u32) -> u256 {
-    let (txid, vout): (u256, u32) = unwrap(jet::input_prev_outpoint(input_index));
-    let ctx: Ctx8 = jet::sha_256_ctx_8_init();
-    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, rt_abf_domain());
-    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, rt_abf_domain());
-    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, txid);
-    // SHA add-jets serialize integers big-endian; Elements outpoints use LE vout.
-    let ctx: Ctx8 = jet::sha_256_ctx_8_add_4(ctx, little_endian_u32(vout));
-    jet::sha_256_ctx_8_finalize(ctx)
+fn ensure_same_rt_side(yes_is_a: bool, no_is_a: bool) {
+    assert!(jet::eq_1(<bool>::into(yes_is_a), <bool>::into(no_is_a)));
+}
+
+// Validate the complete input/output commitments and return the input side.
+// Every transition, including terminal burns, must flip A <-> B.
+fn verify_rt_flip(
+    input_index: u32,
+    output_index: u32,
+    expected: RtCommitments,
+) -> bool {
+    let (asset_a, asset_b, value): RtCommitments = expected;
+    let (input_asset, input_value): ((u1, u256), (u1, u256)) =
+        get_input_confidential(input_index);
+    let (output_asset, output_value): ((u1, u256), (u1, u256)) =
+        get_output_confidential(output_index);
+
+    assert!(commitment_matches(input_value, value));
+    assert!(commitment_matches(output_value, value));
+
+    let input_is_a: bool = commitment_matches(input_asset, asset_a);
+    let input_is_b: bool = commitment_matches(input_asset, asset_b);
+    match input_is_a {
+        true => {
+            assert!(not(input_is_b));
+            assert!(commitment_matches(output_asset, asset_b));
+        },
+        false => {
+            assert!(input_is_b);
+            assert!(commitment_matches(output_asset, asset_a));
+        },
+    };
+    input_is_a
 }
 
 fn ensure_rt_continuation(
     input_index: u32,
     output_index: u32,
-    expected_rt: u256,
-    input_factors: RtFactors,
+    expected: RtCommitments,
     output_slot: u8,
-) {
-    let (input_abf, input_cbf): RtFactors = input_factors;
-    verify_input_rt(input_index, expected_rt, input_factors);
-    let output_factors: RtFactors = (deterministic_output_abf(input_index), input_cbf);
-    verify_output_rt(output_index, expected_rt, output_factors);
+) -> bool {
+    let input_is_a: bool = verify_rt_flip(input_index, output_index, expected);
     ensure_output_script(output_index, script_for_slot(output_slot));
+    input_is_a
 }
 
 fn ensure_rt_burn(
     input_index: u32,
     output_index: u32,
-    expected_rt: u256,
-    input_factors: RtFactors,
-    burn_factors: RtFactors,
-) {
-    verify_input_rt(input_index, expected_rt, input_factors);
-    verify_output_rt(output_index, expected_rt, burn_factors);
+    expected: RtCommitments,
+) -> bool {
+    let input_is_a: bool = verify_rt_flip(input_index, output_index, expected);
     ensure_burn_script(output_index);
+    input_is_a
 }
 
 // -----------------------------------------------------------------------------
@@ -365,8 +394,6 @@ fn initial_issuance(
     slot: u8,
     input_base: u32,
     output_base: u32,
-    yes_input: RtFactors,
-    no_input: RtFactors,
 ) {
     let yes_in: u32 = input_base;
     let no_in: u32 = safe_add_32(input_base, 1);
@@ -378,19 +405,26 @@ fn initial_issuance(
     match jet::eq_8(slot, 0) {
         true => {
             ensure_current_index(yes_in);
-            let yes_pairs: u64 = ensure_reissuance(yes_in, param::YES_TOKEN_ASSET_ID, param::YES_REISSUANCE_TOKEN_ID);
-            let no_pairs: u64 = ensure_reissuance(no_in, param::NO_TOKEN_ASSET_ID, param::NO_REISSUANCE_TOKEN_ID);
+            let yes_is_a: bool = ensure_rt_continuation(yes_in, yes_out, yes_rt_commitments(), 2);
+            let no_is_a: bool = ensure_rt_continuation(no_in, no_out, no_rt_commitments(), 3);
+            ensure_same_rt_side(yes_is_a, no_is_a);
+            let yes_pairs: u64 = ensure_reissuance(
+                yes_in, param::YES_TOKEN_ASSET_ID, param::YES_REISSUANCE_TOKEN_ID, yes_is_a,
+            );
+            let no_pairs: u64 = ensure_reissuance(
+                no_in, param::NO_TOKEN_ASSET_ID, param::NO_REISSUANCE_TOKEN_ID, no_is_a,
+            );
             assert!(jet::eq_64(yes_pairs, no_pairs));
-            ensure_rt_continuation(yes_in, yes_out, param::YES_REISSUANCE_TOKEN_ID, yes_input, 2);
-            ensure_rt_continuation(no_in, no_out, param::NO_REISSUANCE_TOKEN_ID, no_input, 3);
             ensure_output_explicit(collateral_out, param::COLLATERAL_ASSET_ID, collateral_for_pairs(yes_pairs));
             ensure_output_script(collateral_out, script_for_slot(4));
         },
         false => {
             assert!(jet::eq_8(slot, 1));
             ensure_current_index(no_in);
-            let no_pairs: u64 = ensure_reissuance(no_in, param::NO_TOKEN_ASSET_ID, param::NO_REISSUANCE_TOKEN_ID);
-            ensure_rt_continuation(no_in, no_out, param::NO_REISSUANCE_TOKEN_ID, no_input, 3);
+            let no_is_a: bool = ensure_rt_continuation(no_in, no_out, no_rt_commitments(), 3);
+            let no_pairs: u64 = ensure_reissuance(
+                no_in, param::NO_TOKEN_ASSET_ID, param::NO_REISSUANCE_TOKEN_ID, no_is_a,
+            );
         },
     };
 }
@@ -399,8 +433,6 @@ fn subsequent_issuance(
     slot: u8,
     input_base: u32,
     output_base: u32,
-    yes_input: RtFactors,
-    no_input: RtFactors,
 ) {
     let yes_in: u32 = input_base;
     let no_in: u32 = safe_add_32(input_base, 1);
@@ -413,11 +445,16 @@ fn subsequent_issuance(
     match jet::eq_8(slot, 2) {
         true => {
             ensure_current_index(yes_in);
-            let yes_pairs: u64 = ensure_reissuance(yes_in, param::YES_TOKEN_ASSET_ID, param::YES_REISSUANCE_TOKEN_ID);
-            let no_pairs: u64 = ensure_reissuance(no_in, param::NO_TOKEN_ASSET_ID, param::NO_REISSUANCE_TOKEN_ID);
+            let yes_is_a: bool = ensure_rt_continuation(yes_in, yes_out, yes_rt_commitments(), 2);
+            let no_is_a: bool = ensure_rt_continuation(no_in, no_out, no_rt_commitments(), 3);
+            ensure_same_rt_side(yes_is_a, no_is_a);
+            let yes_pairs: u64 = ensure_reissuance(
+                yes_in, param::YES_TOKEN_ASSET_ID, param::YES_REISSUANCE_TOKEN_ID, yes_is_a,
+            );
+            let no_pairs: u64 = ensure_reissuance(
+                no_in, param::NO_TOKEN_ASSET_ID, param::NO_REISSUANCE_TOKEN_ID, no_is_a,
+            );
             assert!(jet::eq_64(yes_pairs, no_pairs));
-            ensure_rt_continuation(yes_in, yes_out, param::YES_REISSUANCE_TOKEN_ID, yes_input, 2);
-            ensure_rt_continuation(no_in, no_out, param::NO_REISSUANCE_TOKEN_ID, no_input, 3);
             let old_collateral: u64 = ensure_input_explicit(collateral_in, param::COLLATERAL_ASSET_ID);
             ensure_no_issuance(collateral_in);
             let new_collateral: u64 = safe_add(old_collateral, collateral_for_pairs(yes_pairs));
@@ -427,8 +464,10 @@ fn subsequent_issuance(
         false => match jet::eq_8(slot, 3) {
             true => {
                 ensure_current_index(no_in);
-                let no_pairs: u64 = ensure_reissuance(no_in, param::NO_TOKEN_ASSET_ID, param::NO_REISSUANCE_TOKEN_ID);
-                ensure_rt_continuation(no_in, no_out, param::NO_REISSUANCE_TOKEN_ID, no_input, 3);
+                let no_is_a: bool = ensure_rt_continuation(no_in, no_out, no_rt_commitments(), 3);
+                let no_pairs: u64 = ensure_reissuance(
+                    no_in, param::NO_TOKEN_ASSET_ID, param::NO_REISSUANCE_TOKEN_ID, no_is_a,
+                );
             },
             false => {
                 assert!(jet::eq_8(slot, 4));
@@ -447,8 +486,6 @@ fn partial_cancellation(
     slot: u8,
     input_base: u32,
     output_base: u32,
-    yes_input: RtFactors,
-    no_input: RtFactors,
 ) {
     let yes_in: u32 = input_base;
     let no_in: u32 = safe_add_32(input_base, 1);
@@ -469,8 +506,9 @@ fn partial_cancellation(
             ensure_nonzero(pairs);
             ensure_explicit_burn(yes_burn, param::YES_TOKEN_ASSET_ID, pairs);
             ensure_explicit_burn(no_burn, param::NO_TOKEN_ASSET_ID, pairs);
-            ensure_rt_continuation(yes_in, yes_out, param::YES_REISSUANCE_TOKEN_ID, yes_input, 2);
-            ensure_rt_continuation(no_in, no_out, param::NO_REISSUANCE_TOKEN_ID, no_input, 3);
+            let yes_is_a: bool = ensure_rt_continuation(yes_in, yes_out, yes_rt_commitments(), 2);
+            let no_is_a: bool = ensure_rt_continuation(no_in, no_out, no_rt_commitments(), 3);
+            ensure_same_rt_side(yes_is_a, no_is_a);
             let old_collateral: u64 = ensure_input_explicit(collateral_in, param::COLLATERAL_ASSET_ID);
             let remaining: u64 = safe_subtract(old_collateral, collateral_for_pairs(pairs));
             ensure_nonzero(remaining);
@@ -480,7 +518,7 @@ fn partial_cancellation(
         false => match jet::eq_8(slot, 3) {
             true => {
                 ensure_current_index(no_in);
-                ensure_rt_continuation(no_in, no_out, param::NO_REISSUANCE_TOKEN_ID, no_input, 3);
+                let no_is_a: bool = ensure_rt_continuation(no_in, no_out, no_rt_commitments(), 3);
             },
             false => {
                 assert!(jet::eq_8(slot, 4));
@@ -499,8 +537,6 @@ fn full_cancellation(
     slot: u8,
     input_base: u32,
     output_base: u32,
-    yes_input: RtFactors,
-    no_input: RtFactors,
 ) {
     let yes_in: u32 = input_base;
     let no_in: u32 = safe_add_32(input_base, 1);
@@ -522,13 +558,14 @@ fn full_cancellation(
             ensure_explicit_burn(no_burn, param::NO_TOKEN_ASSET_ID, pairs);
             let collateral: u64 = ensure_input_explicit(collateral_in, param::COLLATERAL_ASSET_ID);
             assert!(jet::eq_64(collateral, collateral_for_pairs(pairs)));
-            ensure_rt_continuation(yes_in, yes_out, param::YES_REISSUANCE_TOKEN_ID, yes_input, 0);
-            ensure_rt_continuation(no_in, no_out, param::NO_REISSUANCE_TOKEN_ID, no_input, 1);
+            let yes_is_a: bool = ensure_rt_continuation(yes_in, yes_out, yes_rt_commitments(), 0);
+            let no_is_a: bool = ensure_rt_continuation(no_in, no_out, no_rt_commitments(), 1);
+            ensure_same_rt_side(yes_is_a, no_is_a);
         },
         false => match jet::eq_8(slot, 3) {
             true => {
                 ensure_current_index(no_in);
-                ensure_rt_continuation(no_in, no_out, param::NO_REISSUANCE_TOKEN_ID, no_input, 1);
+                let no_is_a: bool = ensure_rt_continuation(no_in, no_out, no_rt_commitments(), 1);
             },
             false => {
                 assert!(jet::eq_8(slot, 4));
@@ -543,10 +580,6 @@ fn active_resolution(
     slot: u8,
     input_base: u32,
     output_base: u32,
-    yes_input: RtFactors,
-    no_input: RtFactors,
-    yes_burn_factors: RtFactors,
-    no_burn_factors: RtFactors,
     outcome_yes: bool,
     signature: Signature,
 ) {
@@ -563,8 +596,9 @@ fn active_resolution(
         true => {
             ensure_current_index(yes_in);
             verify_oracle(outcome_yes, signature);
-            ensure_rt_burn(yes_in, yes_burn, param::YES_REISSUANCE_TOKEN_ID, yes_input, yes_burn_factors);
-            ensure_rt_burn(no_in, no_burn, param::NO_REISSUANCE_TOKEN_ID, no_input, no_burn_factors);
+            let yes_is_a: bool = ensure_rt_burn(yes_in, yes_burn, yes_rt_commitments());
+            let no_is_a: bool = ensure_rt_burn(no_in, no_burn, no_rt_commitments());
+            ensure_same_rt_side(yes_is_a, no_is_a);
             let collateral: u64 = ensure_input_explicit(collateral_in, param::COLLATERAL_ASSET_ID);
             ensure_output_explicit(collateral_out, param::COLLATERAL_ASSET_ID, collateral);
             let resolved_slot: u8 = match outcome_yes {
@@ -576,7 +610,7 @@ fn active_resolution(
         false => match jet::eq_8(slot, 3) {
             true => {
                 ensure_current_index(no_in);
-                ensure_rt_burn(no_in, no_burn, param::NO_REISSUANCE_TOKEN_ID, no_input, no_burn_factors);
+                let no_is_a: bool = ensure_rt_burn(no_in, no_burn, no_rt_commitments());
             },
             false => {
                 assert!(jet::eq_8(slot, 4));
@@ -591,10 +625,6 @@ fn dormant_resolution(
     slot: u8,
     input_base: u32,
     output_base: u32,
-    yes_input: RtFactors,
-    no_input: RtFactors,
-    yes_burn_factors: RtFactors,
-    no_burn_factors: RtFactors,
     outcome_yes: bool,
     signature: Signature,
 ) {
@@ -609,13 +639,14 @@ fn dormant_resolution(
         true => {
             ensure_current_index(yes_in);
             verify_oracle(outcome_yes, signature);
-            ensure_rt_burn(yes_in, yes_burn, param::YES_REISSUANCE_TOKEN_ID, yes_input, yes_burn_factors);
-            ensure_rt_burn(no_in, no_burn, param::NO_REISSUANCE_TOKEN_ID, no_input, no_burn_factors);
+            let yes_is_a: bool = ensure_rt_burn(yes_in, yes_burn, yes_rt_commitments());
+            let no_is_a: bool = ensure_rt_burn(no_in, no_burn, no_rt_commitments());
+            ensure_same_rt_side(yes_is_a, no_is_a);
         },
         false => {
             assert!(jet::eq_8(slot, 1));
             ensure_current_index(no_in);
-            ensure_rt_burn(no_in, no_burn, param::NO_REISSUANCE_TOKEN_ID, no_input, no_burn_factors);
+            let no_is_a: bool = ensure_rt_burn(no_in, no_burn, no_rt_commitments());
         },
     };
 }
@@ -624,10 +655,6 @@ fn active_expiry(
     slot: u8,
     input_base: u32,
     output_base: u32,
-    yes_input: RtFactors,
-    no_input: RtFactors,
-    yes_burn_factors: RtFactors,
-    no_burn_factors: RtFactors,
 ) {
     let yes_in: u32 = input_base;
     let no_in: u32 = safe_add_32(input_base, 1);
@@ -642,8 +669,9 @@ fn active_expiry(
     match jet::eq_8(slot, 2) {
         true => {
             ensure_current_index(yes_in);
-            ensure_rt_burn(yes_in, yes_burn, param::YES_REISSUANCE_TOKEN_ID, yes_input, yes_burn_factors);
-            ensure_rt_burn(no_in, no_burn, param::NO_REISSUANCE_TOKEN_ID, no_input, no_burn_factors);
+            let yes_is_a: bool = ensure_rt_burn(yes_in, yes_burn, yes_rt_commitments());
+            let no_is_a: bool = ensure_rt_burn(no_in, no_burn, no_rt_commitments());
+            ensure_same_rt_side(yes_is_a, no_is_a);
             let collateral: u64 = ensure_input_explicit(collateral_in, param::COLLATERAL_ASSET_ID);
             ensure_output_explicit(collateral_out, param::COLLATERAL_ASSET_ID, collateral);
             ensure_output_script(collateral_out, script_for_slot(7));
@@ -651,7 +679,7 @@ fn active_expiry(
         false => match jet::eq_8(slot, 3) {
             true => {
                 ensure_current_index(no_in);
-                ensure_rt_burn(no_in, no_burn, param::NO_REISSUANCE_TOKEN_ID, no_input, no_burn_factors);
+                let no_is_a: bool = ensure_rt_burn(no_in, no_burn, no_rt_commitments());
             },
             false => {
                 assert!(jet::eq_8(slot, 4));
@@ -666,10 +694,6 @@ fn dormant_expiry(
     slot: u8,
     input_base: u32,
     output_base: u32,
-    yes_input: RtFactors,
-    no_input: RtFactors,
-    yes_burn_factors: RtFactors,
-    no_burn_factors: RtFactors,
 ) {
     let yes_in: u32 = input_base;
     let no_in: u32 = safe_add_32(input_base, 1);
@@ -682,13 +706,14 @@ fn dormant_expiry(
     match jet::eq_8(slot, 0) {
         true => {
             ensure_current_index(yes_in);
-            ensure_rt_burn(yes_in, yes_burn, param::YES_REISSUANCE_TOKEN_ID, yes_input, yes_burn_factors);
-            ensure_rt_burn(no_in, no_burn, param::NO_REISSUANCE_TOKEN_ID, no_input, no_burn_factors);
+            let yes_is_a: bool = ensure_rt_burn(yes_in, yes_burn, yes_rt_commitments());
+            let no_is_a: bool = ensure_rt_burn(no_in, no_burn, no_rt_commitments());
+            ensure_same_rt_side(yes_is_a, no_is_a);
         },
         false => {
             assert!(jet::eq_8(slot, 1));
             ensure_current_index(no_in);
-            ensure_rt_burn(no_in, no_burn, param::NO_REISSUANCE_TOKEN_ID, no_input, no_burn_factors);
+            let no_is_a: bool = ensure_rt_burn(no_in, no_burn, no_rt_commitments());
         },
     };
 }
@@ -765,43 +790,31 @@ fn main() {
     // executing this program. Individual paths then restrict it to a valid role.
     ensure_input_script(jet::current_index(), script_for_slot(slot));
 
-    let yes_input: RtFactors = (witness::YES_INPUT_ABF, witness::YES_INPUT_CBF);
-    let no_input: RtFactors = (witness::NO_INPUT_ABF, witness::NO_INPUT_CBF);
-    let yes_burn: RtFactors = (witness::YES_BURN_ABF, witness::YES_BURN_CBF);
-    let no_burn: RtFactors = (witness::NO_BURN_ABF, witness::NO_BURN_CBF);
     let oracle_outcome_yes: bool = witness::ORACLE_OUTCOME_YES;
     let oracle_signature: Signature = witness::ORACLE_SIGNATURE;
     let tokens_burned: u64 = witness::TOKENS_BURNED;
     let redeem_yes: bool = witness::REDEEM_YES;
 
     match jet::eq_8(path, 0) {
-        true => initial_issuance(slot, input_base, output_base, yes_input, no_input),
+        true => initial_issuance(slot, input_base, output_base),
         false => match jet::eq_8(path, 1) {
-            true => subsequent_issuance(slot, input_base, output_base, yes_input, no_input),
+            true => subsequent_issuance(slot, input_base, output_base),
             false => match jet::eq_8(path, 2) {
-                true => partial_cancellation(slot, input_base, output_base, yes_input, no_input),
+                true => partial_cancellation(slot, input_base, output_base),
                 false => match jet::eq_8(path, 3) {
-                    true => full_cancellation(slot, input_base, output_base, yes_input, no_input),
+                    true => full_cancellation(slot, input_base, output_base),
                     false => match jet::eq_8(path, 4) {
                         true => active_resolution(
-                            slot, input_base, output_base, yes_input, no_input,
-                            yes_burn, no_burn, oracle_outcome_yes, oracle_signature,
+                            slot, input_base, output_base, oracle_outcome_yes, oracle_signature,
                         ),
                         false => match jet::eq_8(path, 5) {
                             true => dormant_resolution(
-                                slot, input_base, output_base, yes_input, no_input,
-                                yes_burn, no_burn, oracle_outcome_yes, oracle_signature,
+                                slot, input_base, output_base, oracle_outcome_yes, oracle_signature,
                             ),
                             false => match jet::eq_8(path, 6) {
-                                true => active_expiry(
-                                    slot, input_base, output_base, yes_input, no_input,
-                                    yes_burn, no_burn,
-                                ),
+                                true => active_expiry(slot, input_base, output_base),
                                 false => match jet::eq_8(path, 7) {
-                                    true => dormant_expiry(
-                                        slot, input_base, output_base, yes_input, no_input,
-                                        yes_burn, no_burn,
-                                    ),
+                                    true => dormant_expiry(slot, input_base, output_base),
                                     false => match jet::eq_8(path, 8) {
                                         true => resolved_redemption(slot, input_base, output_base, tokens_burned),
                                         false => {

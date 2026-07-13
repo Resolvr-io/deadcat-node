@@ -1,7 +1,7 @@
 # ADR 0005: Reissuance-token blinding schedule
 
-- Status: Proposed — research recommendation only
-- Date: 2026-07-12
+- Status: Proposed — engineering evidence complete; human acceptance pending
+- Date: 2026-07-13
 
 ## Context
 
@@ -12,7 +12,9 @@ different from the generator being spent. Deadcat's RT factors are public
 consensus data rather than privacy secrets; their purpose is to make an
 anyone-can-continue covenant compatible with those Elements rules.
 
-The current binary-market prototype uses an outpoint-derived rolling schedule:
+The binary-market baseline at commit
+`ed6de4c4c8a177b4a4ba92c2bac17f55b324781f` uses an outpoint-derived rolling
+schedule:
 
 ```text
 creation ABF = hash_to_scalar("deadcat/rt_abf", defining_outpoint)
@@ -37,21 +39,30 @@ blinder. This record therefore evaluates an A/B schedule adapted to Deadcat's
 composition and explicit-transaction goals rather than copying Astrolabe's VBF
 rule.
 
-## Research recommendation
+## Candidate decision
 
-The research recommendation is to replace rolling ABFs with two fixed public
+Replace rolling ABFs in the candidate v1 implementation with two fixed public
 ABFs and a constant effective commitment blinder per RT leg. The YES and NO
-leg CBFs should be additive inverses so that canonical two-leg market creation
-is locally balanced.
+leg CBFs are additive inverses so canonical two-leg market creation is locally
+balanced.
 
-This is **not an accepted protocol decision and does not authorize a production
-migration**. The rolling implementation remains the authoritative v1 behavior
-until the live-regtest, full-contract, and adversarial evidence listed below is
-complete and this ADR is explicitly accepted. In particular, this proposal
-alone must not be used to replace the market covenant, update its golden CMR,
-or advertise A/B-created markets as canonical.
+This is **not yet an accepted protocol decision**. The production-shaped
+implementation and engineering evidence are complete, but that does not make
+the constants final or authorize deployment. ADR acceptance still requires a
+focused external review and explicit protocol-owner sign-off.
 
-## Proposed schedule
+For the committed golden test parameter set, the candidate binary-market CMR
+is:
+
+```text
+74031c77c0d4e678913f7a8685425fea07458851e0246496fd3174d734379301
+```
+
+That value is parameterized-vector evidence, not a universal CMR for every
+market. The rolling baseline remains available at the commit above for an
+exact source and covenant/witness diff audit.
+
+## Candidate schedule
 
 Let `n` be the secp256k1 group order. Use these fixed, valid, nonzero scalars:
 
@@ -117,12 +128,12 @@ obligation on another contract or on wallet change.
 
 ## Covenant and client shape
 
-The proposed covenant infers the input side from its exact asset commitment,
+The candidate covenant infers the input side from its exact asset commitment,
 requires the role-specific fixed value commitment, and requires the output to
 use the opposite asset commitment with the same value commitment. No factor or
 side supplied by a witness is authoritative.
 
-The preferred implementation derives and binds six internal compile-time
+The implementation derives and binds six internal compile-time
 commitments from the existing market parameters:
 
 - YES asset generator A, asset generator B, and value commitment;
@@ -133,7 +144,7 @@ market parameters. Clients and nodes recompile them from the RT asset IDs and
 the constants above. Prebinding removes runtime curve generation and outpoint
 hashing while preserving the normal CMR/script verification trust model.
 
-Off-chain code should expose typed `RtLeg` and `RtSide` values and derive
+Off-chain code exposes typed `RtLeg` and `RtSide` values and derives
 factors from them. A live RT is accepted only after its raw `TxOut` matches one
 exact side; a node-provided side is at most a convenience hint. Reissuance uses
 the inferred input side's ABF as `asset_blinding_nonce`. The Rust interpreter
@@ -192,14 +203,16 @@ include the complete binary-market program, repeated market input witnesses,
 wallet signatures, creation, reissuance fields, or mined Elements validation.
 The absolute transaction sizes are dominated by the
 isolated Simplicity witness and confidential proofs. Full market savings may
-not scale linearly. The machine-readable fixture and live regtest results are
-in [`../measurements/rt-blinding-v1.json`](../measurements/rt-blinding-v1.json).
+not scale linearly. The historical machine-readable fixture and RT-slice
+regtest results are in
+[`../measurements/rt-blinding-v1.json`](../measurements/rt-blinding-v1.json).
 
-## Live Elements regtest
+## Historical RT-slice Elements regtest
 
-A dedicated ignored test starts one Elements Core 23.3.3 liquid-regtest daemon
-and Electrs instance and runs both schedules serially. Every valid transaction
-passed `testmempoolaccept`, broadcast, mining, and confirmation. Both
+The isolated study at commit `25ad4092293e86d71108cf6d10f490ed4d65dc4b`
+starts one Elements Core 23.3.3 liquid-regtest daemon and Electrs instance and
+runs both schedules serially. Every valid transaction passed
+`testmempoolaccept`, broadcast, mining, and confirmation. Both
 nonterminal transitions reissue seven units of each underlying asset with the
 stored entropy and the current RT input ABF as the actual Elements reissuance
 nonce. The sequence uses explicit wallet composition first, confidential wallet
@@ -221,8 +234,8 @@ change. Across the two RT covenant inputs, nonterminal A/B execution uses about
 
 This remains an RT-slice test, not the full binary-market covenant. The micro
 covenants validate the RT commitment transition and terminal shape while
-Elements consensus validates the nonterminal issuance fields. Full-market path
-equivalence remains an acceptance gate below. Exact live byte counts can vary
+Elements consensus validates the nonterminal issuance fields. The later
+full-market harness supersedes this acceptance boundary. Exact live byte counts can vary
 slightly between runs because the fresh daemon creates new issuance outpoints,
 asset IDs, signatures, and proofs; the schedule ordering and isolated fixture
 are deterministic. The rolling micro-covenant uses the outpoint-derived next
@@ -232,14 +245,15 @@ cost figures are therefore not an exact production-path comparison.
 
 ## Protocol-independent hardening found by the study
 
-The comparison exposed two correctness gaps in the rolling implementation that
-do not depend on accepting the A/B proposal:
+The comparison exposed two correctness gaps in the baseline implementation
+that do not depend on accepting the A/B candidate:
 
 - The confirmed-transaction interpreter previously checked only that tracked
   and continuing RT outputs were confidential and used the expected script. It
-  now reconstructs the rolling commitments from the decoded covenant witness,
-  validates both live inputs, validates the exact outpoint-derived continuation
-  commitments, and validates terminal burn commitments.
+  was hardened on the rolling baseline to reconstruct exact commitments from
+  decoded covenant data and to validate both live inputs, continuations, and
+  terminal burns. The A/B interpreter now performs the simpler exact-side
+  equivalent directly from raw outputs.
 - Four continuation paths produced a valid BitMachine execution stack that was
   too small for Elements' Simplicity cost-budget rule. Client finalization now
   appends the padding annex returned by the Simplicity cost bound when needed.
@@ -247,13 +261,70 @@ do not depend on accepting the A/B proposal:
   input, both resolution outcomes, both redemption shapes, and all maker fill
   shapes.
 
-These changes preserve the rolling covenant, CMR, and source-level witness ABI.
-They make the existing off-chain interpretation and transaction finalization
-match rules that the current covenant and Elements consensus already enforce.
+The first hardening commit preserved the rolling covenant, CMR, and
+source-level witness ABI. It established a stronger baseline before the
+intentional A/B protocol change. Cost-budget finalization remains part of the
+A/B implementation.
+
+## Full-market implementation and local evidence
+
+The candidate is integrated across the production-shaped binary-market stack:
+
+- SimplicityHL receives the two asset commitments and one value commitment for
+  each RT role as derived compile-time arguments. It recognizes the raw input
+  side, requires the opposite output side, requires the role-specific value
+  commitment, and binds each reissuance nonce to the inferred input-side ABF.
+- The factor arrays were removed from the market covenant witness. Neither the
+  covenant nor the Rust interpreter treats witness-supplied blinders as truth.
+- Creation, registration, and independent client replay require both RT legs on
+  side A. The unchanged recovery hint supplies the same 38-byte or 70-byte
+  payload; A/B adds no field.
+- `MarketRtInput` carries the outpoint and exact raw `TxOut`. Builders infer the
+  side from that output, require the two live legs to agree, and recheck the
+  PSET `witness_utxo` before finalization.
+- Continuations and terminal bare-`OP_RETURN` burns use the opposite side.
+  Issuance uses the input-side ABF as the exact Elements
+  `asset_blinding_nonce` while the output flips.
+- Registration and client history replay reject non-A creation commitments.
+
+Local test evidence covers both `A -> B` and `B -> A`, side-A creation, exact
+scalar vectors, complementary CBF balance, commitment-to-side round trips,
+surjection/rangeproof construction, every binary-market lifecycle builder and
+interpreter path, both input sides for every RT-consuming path, sufficient
+finalized Simplicity budgets, and focused BitMachine execution of RT-continuing
+and terminal shapes.
+Commitment golden vectors include nonuniform asset IDs independently derived
+with direct libsecp256k1-zkp calls, making an accidental `AssetId` display-order
+reversal observable.
+Adversarial cases reject same-side output/burn, mixed live sides,
+wrong-role CBF/value commitments, wrong input-side reissuance nonces, malformed
+creation side, sibling substitution, and designated-output tampering.
+
+The production-shaped live harness additionally mined three markets through 16
+transactions. It covers canonical creation, A→B and B→A issuance, confidential
+wallet composition, partial/full cancellation, return to Dormant, B-side
+Dormant reissuance, YES/NO resolution, active expiry, both terminal flip
+directions, and partial/full redemption. Every valid stage passed
+`testmempoolaccept`, broadcast, mining, and confirmation; missing and corrupted
+surjection proofs were rejected.
+
+Concrete-block sync tests start with no registered contract and exercise
+OP_RETURN recovery through `SyncCoordinator + DeadcatInterpreter`, redb reopen,
+idempotent replay, and coordinator-driven one-/two-block branch replacement. A
+separate two-market transaction proves atomic interpreter/store orchestration.
+Exact full-market and live measurements are preserved in
+[`../measurements/binary-market-ab-v1.json`](../measurements/binary-market-ab-v1.json)
+and the acceptance packet.
+
+The A/B full-market rows are emitted by the committed reporter. The rolling
+full-market rows were captured with temporary instrumentation against the
+hardened baseline, but that reporter patch was not committed. Those exact rows
+are therefore historical capture rather than directly reproducible evidence;
+the earlier isolated rolling/A-B harness at `25ad409...` remains reproducible.
 
 ## Security trade-offs
 
-The proposed A/B schedule provides:
+The candidate A/B schedule provides:
 
 - structural inequality between a leg's input and output asset generators;
 - no hash-collision or zero-scalar continuation liveness edge case;
@@ -273,10 +344,12 @@ The costs and risks are:
   external golden vectors;
 - rangeproof construction must use the side-specific VBF even though the
   side-A and side-B value commitments are byte-identical;
-- a terminal confidential `OP_RETURN` output must be demonstrated against
-  Elements consensus; and
-- the prebound commitment approach must be checked for cost and program-size
-  behavior inside the full parameterized market, not only the isolated study.
+- terminal confidential `OP_RETURN` outputs depend on Elements confidential
+  proof behavior and therefore remain consensus-sensitive, although both flip
+  directions now pass live Elements regtest; and
+- prebinding adds consensus-critical commitment encodings to compilation, so
+  literal golden vectors and independent reproduction remain important even
+  though full-market cost/program behavior is now measured.
 
 Rolling factors retain one modest property: every lineage and transition uses
 a different-looking ABF rather than one of two protocol-wide values. That does
@@ -285,31 +358,48 @@ lineage are public.
 
 ## Evidence required before acceptance
 
-This ADR must remain proposed until all of the following are complete:
+This ADR must remain Proposed until all of the following are complete. The
+full checklist and evidence locations live in
+[`../acceptance/binary-market-ab-v1.md`](../acceptance/binary-market-ab-v1.md).
 
-1. **Complete:** a serial `elementsd` regtest proves canonical A/B
-   explicit-only creation,
-   `A -> B -> A` reissuance, confidential-wallet composition, and the terminal
-   confidential burn through `testmempoolaccept`, broadcast, and mining.
-2. The candidate is integrated into an experimental full binary-market
-   covenant and every lifecycle path passes the same positive and adversarial
-   BitMachine corpus as rolling.
-3. The Rust interpreter rejects wrong-side, same-side, wrong-role-CBF, wrong
-   value-commitment, and malformed issuance-nonce transactions whenever the
-   covenant rejects them.
-4. Full-market cost, witness, weight, and vsize measurements replace or
-   supplement the isolated continuation figures.
-5. Recovery, restart/reorg replay, terminal burns, and custom multi-contract
-   compositions pass differential tests.
-6. The final constants, algebra, commitment vectors, and migration diff receive
-   focused external review.
+1. **Complete — RT slice:** serial `elementsd` regtest proves A/B
+   explicit-only creation, `A -> B -> A` reissuance, confidential-wallet
+   composition, and terminal confidential burns through mempool acceptance,
+   broadcast, and mining.
+2. **Complete — implementation:** the A/B candidate is integrated into the
+   full binary-market covenant, builders, interpreter, registration, and client
+   replay. The golden test parameter set compiles to the CMR recorded above.
+3. **Complete — deterministic local tests:** both directions and all lifecycle
+   builder/interpreter shapes are covered, with focused BitMachine and
+   adversarial rejection of same-side, mixed-side, wrong-role-CBF/value,
+   wrong-nonce, and malformed-creation cases.
+4. **Complete — full live lifecycle and measurements:** three
+   production-shaped market chains pass Elements mempool acceptance, broadcast,
+   mining, and confirmation across every lifecycle class. The deterministic
+   corpus emits machine-readable metrics, and one live run preserves txids,
+   block hashes, sizes, weights, and proof bytes.
+5. **Complete — recovery and orchestration:** zero-seed concrete-block recovery,
+   generic chain-verified registration, restart, direct and coordinator-driven
+   one-/two-block reorg replay, live wallet composition, and two-market atomic
+   indexing pass the candidate corpus.
+6. **Pending — review and approval:** the constants, scalar byte order,
+   complementary-CBF algebra, derived commitments, CMR change, and clean
+   replacement diff must receive focused external review, after which the
+   protocol owner must explicitly sign off.
 
-## Consequences if later accepted
+## Consequences if accepted
 
-Acceptance would intentionally change the binary-market CMR, witness schema,
-creation commitments, golden vectors, builder API, interpreter rules, and
-recovery validation. Because Deadcat v1 is not deployed and has no compatibility
-requirement, the preferred migration would be a clean replacement rather than
-support for both schedules under one contract version.
+Acceptance makes the A/B CMR, witness shape, creation commitments, golden
+vectors, builder API, interpreter rules, and recovery validation canonical v1.
+Deadcat has no deployed rolling markets or databases, so this is a clean source
+replacement: there is no rolling compatibility mode, migration path, or redb
+schema-version bump. Disposable development databases may be deleted and
+reindexed if they contain rolling-era records.
 
-Until then, none of those production changes follows from this record.
+Rolling implementation and comparison-study code have been removed from the
+candidate. The hardened baseline commit, isolated-study commit, ADR, and
+machine-readable measurements remain the permanent historical reference.
+
+Until external review and explicit protocol-owner approval are recorded, this
+ADR remains Proposed and the candidate must not be described as production
+ready.

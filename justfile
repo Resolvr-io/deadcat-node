@@ -24,12 +24,11 @@ clippy: generate
 test: generate
     cargo test --locked --workspace
 
-# Run the external-daemon RT blinding comparison. This is intentionally
-# ignored by the normal workspace test suite: it starts one isolated
-# liquidregtest elementsd + Electrs pair and drives both schedules serially.
-regtest-rt-study: generate
-    cargo test --locked -p deadcat-rt-study --lib \
-        regtest::rolling_and_ab_chains_are_accepted_by_elementsd \
+# Run the production-shaped A/B binary-market lifecycle against an isolated
+# liquidregtest elementsd + Electrs pair.
+regtest-market-ab: generate
+    cargo test --locked -p deadcat-client --test market_regtest \
+        binary_market_ab_lifecycle_is_accepted_by_elementsd \
         -- --ignored --nocapture --test-threads=1
 
 wasm-check:
