@@ -243,6 +243,7 @@ impl MakerFillPlan {
             .as_ref()
             .finalize(pset, &witness.build_witness(), input_index, network)
             .map_err(|error| MakerBuilderError::Covenant(error.to_string()))?;
+        let stack = crate::simplicity::ensure_budget(stack).map_err(MakerBuilderError::Covenant)?;
         pset.inputs_mut()[input_index].final_script_witness = Some(stack);
         Ok(())
     }

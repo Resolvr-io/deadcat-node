@@ -603,6 +603,8 @@ impl BinaryMarketTransitionPlan {
                 .as_ref()
                 .finalize(pset, &witness.build_witness(), input_index, network)
                 .map_err(|error| MarketBuilderError::Covenant(error.to_string()))?;
+            let stack =
+                crate::simplicity::ensure_budget(stack).map_err(MarketBuilderError::Covenant)?;
             finalized.push((input_index, stack));
         }
         for (input_index, stack) in finalized {
@@ -1890,13 +1892,15 @@ mod tests {
             plan.finalize(&mut pset, input_base, output_base, &network)
                 .unwrap_or_else(|error| panic!("{expected_path:?}: {error}"));
             for index in plan.contract_input_indices(input_base).expect("indices") {
-                assert_eq!(
-                    pset.inputs()[index]
-                        .final_script_witness
-                        .as_ref()
-                        .expect("final witness")
-                        .len(),
-                    4
+                let stack = pset.inputs()[index]
+                    .final_script_witness
+                    .as_ref()
+                    .expect("final witness");
+                let (core, annex) = deadcat_contracts::interpret::strip_taproot_annex(stack);
+                assert_eq!(core.len(), 4);
+                assert!(
+                    annex.is_none_or(|padding| padding.first() == Some(&0x50)),
+                    "budget padding must be a Taproot annex"
                 );
             }
             if path_consumes_rt(expected_path) {

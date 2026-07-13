@@ -653,11 +653,27 @@ fn interprets_active_expiry_and_rejects_nonconsecutive_sibling_decoy() {
     );
     assert_eq!(interpreted.continuations[0].output.outpoint.vout, 4);
 
-    let mut decoy = scenario.transaction;
+    let mut decoy = scenario.transaction.clone();
     decoy.input[2].previous_output.vout = 13;
     assert!(
         interpret_binary_market_spend(scenario.params, scenario.before, &scenario.live, &decoy,)
             .is_err()
+    );
+
+    let mut wrong_burn = scenario.transaction.clone();
+    wrong_burn.output[2] = confidential_rt_txout(
+        scenario.params.yes_reissuance_token_id,
+        rt_factors(19, 23),
+        bare_op_return(),
+    );
+    assert!(
+        interpret_binary_market_spend(
+            scenario.params,
+            scenario.before,
+            &scenario.live,
+            &wrong_burn,
+        )
+        .is_err()
     );
 }
 
@@ -798,4 +814,26 @@ fn interprets_partial_cancellation_when_path_equals_slot_and_bases_are_shared() 
             outstanding_pairs: 2,
         }
     );
+
+    let mut wrong_continuation = transaction.clone();
+    wrong_continuation.output[0] = confidential_rt_txout(
+        params.yes_reissuance_token_id,
+        rt_factors(29, 31),
+        compiled
+            .slot(BinaryMarketSlot::UnresolvedYesRt)
+            .script_pubkey()
+            .clone(),
+    );
+    assert!(interpret_binary_market_spend(params, before, &live, &wrong_continuation).is_err());
+
+    let mut wrong_live = live;
+    wrong_live.yes_rt.as_mut().expect("YES RT").txout = confidential_rt_txout(
+        params.yes_reissuance_token_id,
+        rt_factors(37, 41),
+        compiled
+            .slot(BinaryMarketSlot::UnresolvedYesRt)
+            .script_pubkey()
+            .clone(),
+    );
+    assert!(interpret_binary_market_spend(params, before, &wrong_live, &transaction).is_err());
 }

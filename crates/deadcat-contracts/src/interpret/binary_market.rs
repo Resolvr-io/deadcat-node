@@ -13,6 +13,7 @@ use crate::binary_market::{
 };
 use crate::binary_market::{BinaryMarketTransition, BinaryOutcome};
 use crate::market_crypto::{BinaryOutcome as OracleOutcome, oracle_message};
+use crate::rt::{RtFactors, commitments, continuation_factors, subtract_mod_order};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -73,6 +74,12 @@ pub struct BinaryMarketInterpretation {
     pub continuations: Vec<BinaryMarketContinuation>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BinaryMarketRtFactors {
+    yes: Option<RtFactors>,
+    no: Option<RtFactors>,
+}
+
 pub fn interpret_binary_market_spend(
     params: BinaryMarketParams,
     before: BinaryMarketState,
@@ -113,6 +120,7 @@ pub fn interpret_binary_market_spend(
     if !decoded.u8_values().contains(&(expected_slot as u8)) {
         return Err(InterpretError::MissingWitness("SLOT"));
     }
+    let live_rt_factors = decode_live_rt_factors(params, before, live, &decoded)?;
 
     let u8_values = decoded.u8_values();
     let paths: Vec<BinaryMarketPath> = u8_values
@@ -162,8 +170,10 @@ pub fn interpret_binary_market_spend(
                         params,
                         economics,
                         &compiled,
+                        &decoded,
                         before,
                         live,
+                        live_rt_factors,
                         transaction,
                         path,
                         input_base,
@@ -192,8 +202,10 @@ fn interpret_candidate(
     params: BinaryMarketParams,
     economics: BinaryMarketEconomics,
     compiled: &CompiledBinaryMarket,
+    decoded: &DecodedSimplicityWitness,
     before: BinaryMarketState,
     live: &BinaryMarketLiveOutputs,
+    live_rt_factors: BinaryMarketRtFactors,
     transaction: &Transaction,
     path: BinaryMarketPath,
     input_base: u32,
@@ -283,9 +295,12 @@ fn interpret_candidate(
     let continuations = verify_outputs(
         params,
         compiled,
+        decoded,
         transaction,
         path,
         before,
+        live,
+        live_rt_factors,
         applied,
         output_base,
         tokens,
@@ -307,14 +322,19 @@ fn interpret_candidate(
 fn verify_outputs(
     params: BinaryMarketParams,
     compiled: &CompiledBinaryMarket,
+    decoded: &DecodedSimplicityWitness,
     transaction: &Transaction,
     path: BinaryMarketPath,
     before: BinaryMarketState,
+    live: &BinaryMarketLiveOutputs,
+    live_rt_factors: BinaryMarketRtFactors,
     applied: AppliedBinaryMarketTransition,
     output_base: u32,
     tokens: u64,
 ) -> Result<Vec<BinaryMarketContinuation>, InterpretError> {
     let mut output = Vec::new();
+    let yes_continuation = continuation_from_live(live.yes_rt.as_ref(), live_rt_factors.yes)?;
+    let no_continuation = continuation_from_live(live.no_rt.as_ref(), live_rt_factors.no)?;
     match path {
         BinaryMarketPath::InitialIssuance | BinaryMarketPath::SubsequentIssuance => {
             push_rt_continuation(
@@ -323,6 +343,8 @@ fn verify_outputs(
                 transaction,
                 output_base,
                 BinaryMarketSlot::UnresolvedYesRt,
+                params.yes_reissuance_token_id,
+                yes_continuation.ok_or(InterpretError::MissingWitness("YES_INPUT_CBF"))?,
             )?;
             push_rt_continuation(
                 &mut output,
@@ -330,6 +352,8 @@ fn verify_outputs(
                 transaction,
                 add_index(output_base, 1)?,
                 BinaryMarketSlot::UnresolvedNoRt,
+                params.no_reissuance_token_id,
+                no_continuation.ok_or(InterpretError::MissingWitness("NO_INPUT_CBF"))?,
             )?;
             let amount = trading_collateral(applied.new_state, params)?;
             push_collateral_continuation(
@@ -349,6 +373,8 @@ fn verify_outputs(
                 transaction,
                 output_base,
                 BinaryMarketSlot::UnresolvedYesRt,
+                params.yes_reissuance_token_id,
+                yes_continuation.ok_or(InterpretError::MissingWitness("YES_INPUT_CBF"))?,
             )?;
             push_rt_continuation(
                 &mut output,
@@ -356,6 +382,8 @@ fn verify_outputs(
                 transaction,
                 add_index(output_base, 1)?,
                 BinaryMarketSlot::UnresolvedNoRt,
+                params.no_reissuance_token_id,
+                no_continuation.ok_or(InterpretError::MissingWitness("NO_INPUT_CBF"))?,
             )?;
             let amount = trading_collateral(applied.new_state, params)?;
             if amount == 0 {
@@ -387,6 +415,8 @@ fn verify_outputs(
                 transaction,
                 output_base,
                 BinaryMarketSlot::DormantYesRt,
+                params.yes_reissuance_token_id,
+                yes_continuation.ok_or(InterpretError::MissingWitness("YES_INPUT_CBF"))?,
             )?;
             push_rt_continuation(
                 &mut output,
@@ -394,11 +424,23 @@ fn verify_outputs(
                 transaction,
                 add_index(output_base, 1)?,
                 BinaryMarketSlot::DormantNoRt,
+                params.no_reissuance_token_id,
+                no_continuation.ok_or(InterpretError::MissingWitness("NO_INPUT_CBF"))?,
             )?;
         }
         BinaryMarketPath::ActiveResolution => {
-            check_rt_burn(transaction, output_base)?;
-            check_rt_burn(transaction, add_index(output_base, 1)?)?;
+            check_rt_burn(
+                transaction,
+                output_base,
+                params.yes_reissuance_token_id,
+                decoded,
+            )?;
+            check_rt_burn(
+                transaction,
+                add_index(output_base, 1)?,
+                params.no_reissuance_token_id,
+                decoded,
+            )?;
             let (slot, amount) = terminal_slot_amount(applied.new_state)?;
             push_collateral_continuation(
                 &mut output,
@@ -411,8 +453,18 @@ fn verify_outputs(
             )?;
         }
         BinaryMarketPath::DormantResolution => {
-            check_rt_burn(transaction, output_base)?;
-            check_rt_burn(transaction, add_index(output_base, 1)?)?;
+            check_rt_burn(
+                transaction,
+                output_base,
+                params.yes_reissuance_token_id,
+                decoded,
+            )?;
+            check_rt_burn(
+                transaction,
+                add_index(output_base, 1)?,
+                params.no_reissuance_token_id,
+                decoded,
+            )?;
             if !matches!(
                 before,
                 BinaryMarketState::Trading {
@@ -423,8 +475,18 @@ fn verify_outputs(
             }
         }
         BinaryMarketPath::ActiveExpiry => {
-            check_rt_burn(transaction, output_base)?;
-            check_rt_burn(transaction, add_index(output_base, 1)?)?;
+            check_rt_burn(
+                transaction,
+                output_base,
+                params.yes_reissuance_token_id,
+                decoded,
+            )?;
+            check_rt_burn(
+                transaction,
+                add_index(output_base, 1)?,
+                params.no_reissuance_token_id,
+                decoded,
+            )?;
             let (_, amount) = terminal_slot_amount(applied.new_state)?;
             push_collateral_continuation(
                 &mut output,
@@ -437,8 +499,18 @@ fn verify_outputs(
             )?;
         }
         BinaryMarketPath::DormantExpiry => {
-            check_rt_burn(transaction, output_base)?;
-            check_rt_burn(transaction, add_index(output_base, 1)?)?;
+            check_rt_burn(
+                transaction,
+                output_base,
+                params.yes_reissuance_token_id,
+                decoded,
+            )?;
+            check_rt_burn(
+                transaction,
+                add_index(output_base, 1)?,
+                params.no_reissuance_token_id,
+                decoded,
+            )?;
         }
         BinaryMarketPath::ResolvedRedemption | BinaryMarketPath::ExpiryRedemption => {
             if tokens == 0 {
@@ -702,6 +774,85 @@ fn validate_live_outputs(
     Ok(())
 }
 
+fn decode_live_rt_factors(
+    params: BinaryMarketParams,
+    state: BinaryMarketState,
+    live: &BinaryMarketLiveOutputs,
+    decoded: &DecodedSimplicityWitness,
+) -> Result<BinaryMarketRtFactors, InterpretError> {
+    if !matches!(state, BinaryMarketState::Trading { .. }) {
+        return Ok(BinaryMarketRtFactors::default());
+    }
+    let yes = live
+        .yes_rt
+        .as_ref()
+        .ok_or(InterpretError::InvalidTrackedOutput("missing YES RT"))?;
+    let no = live
+        .no_rt
+        .as_ref()
+        .ok_or(InterpretError::InvalidTrackedOutput("missing NO RT"))?;
+    Ok(BinaryMarketRtFactors {
+        yes: Some(decode_rt_factors(
+            &yes.txout,
+            params.yes_reissuance_token_id,
+            decoded,
+        )?),
+        no: Some(decode_rt_factors(
+            &no.txout,
+            params.no_reissuance_token_id,
+            decoded,
+        )?),
+    })
+}
+
+fn decode_rt_factors(
+    output: &TxOut,
+    asset_id: AssetId,
+    decoded: &DecodedSimplicityWitness,
+) -> Result<RtFactors, InterpretError> {
+    let scalars: Vec<[u8; 32]> = decoded
+        .bytes_values(32)
+        .into_iter()
+        .filter_map(|bytes| bytes.try_into().ok())
+        .collect();
+    let mut candidates = Vec::new();
+    for abf in scalars.iter().copied() {
+        for cbf in scalars.iter().copied() {
+            let factors = RtFactors {
+                abf,
+                vbf: subtract_mod_order(cbf, abf),
+                cbf,
+            };
+            if commitments(asset_id, factors)
+                .is_ok_and(|commitment| commitment == (output.asset, output.value))
+                && !candidates.contains(&factors)
+            {
+                candidates.push(factors);
+            }
+        }
+    }
+    match candidates.len() {
+        1 => Ok(candidates[0]),
+        0 => Err(InterpretError::Inconsistent(
+            "RT commitment does not match decoded factors",
+        )),
+        _ => Err(InterpretError::AmbiguousInterpretation),
+    }
+}
+
+fn continuation_from_live(
+    live: Option<&TrackedContractOutput>,
+    factors: Option<RtFactors>,
+) -> Result<Option<RtFactors>, InterpretError> {
+    match (live, factors) {
+        (Some(live), Some(factors)) => Ok(Some(continuation_factors(live.outpoint, factors.cbf))),
+        (None, None) => Ok(None),
+        _ => Err(InterpretError::InvalidTrackedOutput(
+            "RT output and decoded factors disagree",
+        )),
+    }
+}
+
 fn candidate_outcomes(
     path: BinaryMarketPath,
     params: BinaryMarketParams,
@@ -894,11 +1045,14 @@ fn push_rt_continuation(
     transaction: &Transaction,
     index: u32,
     slot: BinaryMarketSlot,
+    asset_id: AssetId,
+    factors: RtFactors,
 ) -> Result<(), InterpretError> {
     let txout = output_at(transaction, index)?;
+    let expected = commitments(asset_id, factors)
+        .map_err(|_| InterpretError::Inconsistent("invalid RT continuation factors"))?;
     if txout.script_pubkey != *compiled.slot(slot).script_pubkey()
-        || !matches!(txout.asset, Asset::Confidential(_))
-        || !matches!(txout.value, Value::Confidential(_))
+        || (txout.asset, txout.value) != expected
     {
         return Err(InterpretError::Inconsistent("RT continuation"));
     }
@@ -940,14 +1094,18 @@ fn continuation(
     }
 }
 
-fn check_rt_burn(transaction: &Transaction, index: u32) -> Result<(), InterpretError> {
+fn check_rt_burn(
+    transaction: &Transaction,
+    index: u32,
+    asset_id: AssetId,
+    decoded: &DecodedSimplicityWitness,
+) -> Result<(), InterpretError> {
     let output = output_at(transaction, index)?;
-    if output.script_pubkey.as_bytes() != [0x6a]
-        || !matches!(output.asset, Asset::Confidential(_))
-        || !matches!(output.value, Value::Confidential(_))
-    {
+    if output.script_pubkey.as_bytes() != [0x6a] {
         return Err(InterpretError::Inconsistent("RT burn"));
     }
+    decode_rt_factors(output, asset_id, decoded)
+        .map_err(|_| InterpretError::Inconsistent("RT burn commitment"))?;
     Ok(())
 }
 
