@@ -1,0 +1,16 @@
+[build]
+src_dir = "./simplicityhl"
+simf_files = ["binary_market.simf", "maker_order.simf"]
+out_dir = "./src/artifacts"
+
+[regtest]
+mnemonic = "exist carry drive collect lend cereal occur much tiger just involve mean"
+bitcoins = 10_000_000
+rpc_port = 18443
+esplora_port = 3000
+rpc_user = "user"
+rpc_password = "password"
+
+[test]
+mnemonic = "exist carry drive collect lend cereal occur much tiger just involve mean"
+bitcoins = 10_000_000

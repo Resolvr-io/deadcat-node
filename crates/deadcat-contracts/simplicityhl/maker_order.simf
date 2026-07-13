@@ -1,0 +1,155 @@
+// Deadcat persistent maker limit order v1.
+//
+// The Taproot internal key is the maker key and provides the only cancellation
+// path. This Simplicity leaf is a permissionless exact-price fill path.
+
+fn not(bit: bool) -> bool {
+    <u1>::into(jet::complement_1(<bool>::into(bit)))
+}
+
+fn safe_add(a: u64, b: u64) -> u64 {
+    let (carry, sum): (bool, u64) = jet::add_64(a, b);
+    assert!(not(carry));
+    sum
+}
+
+fn safe_subtract(a: u64, b: u64) -> u64 {
+    let (borrow, difference): (bool, u64) = jet::subtract_64(a, b);
+    assert!(not(borrow));
+    difference
+}
+
+fn safe_multiply(a: u64, b: u64) -> u64 {
+    let product: u128 = jet::multiply_64(a, b);
+    let (high, low): (u64, u64) = <u128>::into(product);
+    assert!(jet::is_zero_64(high));
+    low
+}
+
+fn widen_u32(value: u32) -> u64 {
+    <(u32, u32)>::into((0, value))
+}
+
+fn ensure_nonzero(value: u64) {
+    assert!(not(jet::is_zero_64(value)));
+}
+
+fn get_input_explicit(index: u32) -> (u256, u64) {
+    let (asset, amount): (Asset1, Amount1) = unwrap(jet::input_amount(index));
+    let explicit_asset: u256 = unwrap_right::<(u1, u256)>(asset);
+    let explicit_amount: u64 = unwrap_right::<(u1, u256)>(amount);
+    (explicit_asset, explicit_amount)
+}
+
+fn get_output_explicit(index: u32) -> (u256, u64) {
+    let (asset, amount): (Asset1, Amount1) = unwrap(jet::output_amount(index));
+    let explicit_asset: u256 = unwrap_right::<(u1, u256)>(asset);
+    let explicit_amount: u64 = unwrap_right::<(u1, u256)>(amount);
+    (explicit_asset, explicit_amount)
+}
+
+fn ensure_no_issuance(index: u32) {
+    let asset_amount: Option<Amount1> = unwrap(jet::issuance_asset_amount(index));
+    let token_amount: Option<Amount1> = unwrap(jet::issuance_token_amount(index));
+    let entropy: Option<u256> = unwrap(jet::issuance_entropy(index));
+    assert!(is_none::<Amount1>(asset_amount));
+    assert!(is_none::<Amount1>(token_amount));
+    assert!(is_none::<u256>(entropy));
+}
+
+fn validate_parameters() {
+    assert!(not(jet::eq_256(param::BASE_ASSET_ID, param::QUOTE_ASSET_ID)));
+    ensure_nonzero(widen_u32(param::PRICE));
+    ensure_nonzero(widen_u32(param::MIN_ACTIVE_BASE));
+}
+
+fn ensure_maker_payment(index: u32, asset: u256) -> u64 {
+    let (actual_asset, amount): (u256, u64) = get_output_explicit(index);
+    assert!(jet::eq_256(actual_asset, asset));
+    assert!(jet::eq_256(
+        unwrap(jet::output_script_hash(index)),
+        param::MAKER_RECEIVE_SPK_HASH,
+    ));
+    amount
+}
+
+fn ensure_remainder(index: u32, input_index: u32, asset: u256) -> u64 {
+    assert!(not(jet::eq_32(index, input_index)));
+    let (actual_asset, amount): (u256, u64) = get_output_explicit(index);
+    assert!(jet::eq_256(actual_asset, asset));
+    assert!(jet::eq_256(
+        unwrap(jet::output_script_hash(index)),
+        unwrap(jet::input_script_hash(input_index)),
+    ));
+    amount
+}
+
+fn fill_sell_base(input_index: u32, remainder_index: u32) {
+    let (input_asset, input_amount): (u256, u64) = get_input_explicit(input_index);
+    assert!(jet::eq_256(input_asset, param::BASE_ASSET_ID));
+
+    let maker_payment: u64 = ensure_maker_payment(input_index, param::QUOTE_ASSET_ID);
+    let price: u64 = widen_u32(param::PRICE);
+    let minimum: u64 = widen_u32(param::MIN_ACTIVE_BASE);
+    let complete_payment: u64 = safe_multiply(input_amount, price);
+
+    match jet::eq_64(maker_payment, complete_payment) {
+        true => {
+            assert!(jet::le_64(minimum, input_amount));
+        },
+        false => {
+            let remainder: u64 = ensure_remainder(
+                remainder_index,
+                input_index,
+                param::BASE_ASSET_ID,
+            );
+            ensure_nonzero(remainder);
+            let filled: u64 = safe_subtract(input_amount, remainder);
+            ensure_nonzero(filled);
+            assert!(jet::eq_64(maker_payment, safe_multiply(filled, price)));
+            assert!(jet::le_64(minimum, filled));
+            assert!(jet::le_64(minimum, remainder));
+        },
+    };
+}
+
+fn fill_sell_quote(input_index: u32, remainder_index: u32) {
+    let (input_asset, input_amount): (u256, u64) = get_input_explicit(input_index);
+    assert!(jet::eq_256(input_asset, param::QUOTE_ASSET_ID));
+
+    let filled: u64 = ensure_maker_payment(input_index, param::BASE_ASSET_ID);
+    let price: u64 = widen_u32(param::PRICE);
+    let minimum: u64 = widen_u32(param::MIN_ACTIVE_BASE);
+    ensure_nonzero(filled);
+    assert!(jet::le_64(minimum, filled));
+    let quote_filled: u64 = safe_multiply(filled, price);
+
+    match jet::eq_64(quote_filled, input_amount) {
+        true => {},
+        false => {
+            let remainder: u64 = ensure_remainder(
+                remainder_index,
+                input_index,
+                param::QUOTE_ASSET_ID,
+            );
+            ensure_nonzero(remainder);
+            assert!(jet::eq_64(safe_add(quote_filled, remainder), input_amount));
+            assert!(jet::le_64(safe_multiply(minimum, price), remainder));
+        },
+    };
+}
+
+fn main() {
+    validate_parameters();
+    let input_index: u32 = jet::current_index();
+    ensure_no_issuance(input_index);
+
+    // The maker payment is position-anchored to this input. The remainder is
+    // witness-selected so batched fills can place it anywhere without aliasing
+    // another order's mandatory payment output.
+    let remainder_index: u32 = witness::REMAINDER_INDEX;
+    match param::DIRECTION_SELL_QUOTE {
+        false => fill_sell_base(input_index, remainder_index),
+        true => fill_sell_quote(input_index, remainder_index),
+    };
+}

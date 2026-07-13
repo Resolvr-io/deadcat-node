@@ -1,0 +1,71 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/deadcat-types",
+    "crates/deadcat-contracts",
+    "crates/deadcat-client",
+    "crates/deadcat-rpc",
+    "crates/deadcat-iroh",
+    "crates/deadcat-node",
+    "crates/deadcat-cli",
+]
+
+[workspace.package]
+version = "0.1.0-alpha"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bip39 = "2"
+clap = { version = "4", features = ["derive"] }
+elements = { version = "0.25", features = ["serde"] }
+hex = { version = "0.4", features = ["serde"] }
+hmac = "0.12"
+iroh = "1"
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+rand = "0.8"
+redb = "4"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "charset"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# Internal crates. These are implementation boundaries, not public artifacts.
+deadcat-types = { path = "crates/deadcat-types" }
+deadcat-contracts = { path = "crates/deadcat-contracts" }
+deadcat-client = { path = "crates/deadcat-client" }
+deadcat-rpc = { path = "crates/deadcat-rpc" }
+deadcat-iroh = { path = "crates/deadcat-iroh" }
+
+# The CLI and Rust libraries must remain on the exact same smplx release.
+smplx-std = "=0.0.6"
+smplx-sdk = "=0.0.6"
+smplx-regtest = "=0.0.6"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+needless_pass_by_value = "warn"
+redundant_clone = "warn"
+uninlined_format_args = "warn"
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+opt-level = 1
+debug = 0
+incremental = false
+
+[profile.release]
+overflow-checks = true

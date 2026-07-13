@@ -1,0 +1,31 @@
+[package]
+name = "deadcat-iroh"
+description = "Bounded Iroh transport for the deadcat-node RPC protocol."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+deadcat-rpc.workspace = true
+deadcat-types.workspace = true
+iroh.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+# Tokio's native `signal`/`rt-multi-thread` features pull in `mio`, which is
+# intentionally unavailable in a browser. Iroh itself supports this target;
+# the client only needs the single-thread runtime, timers, I/O traits, and
+# synchronization primitives.
+tokio = { version = "1", default-features = false, features = ["io-util", "rt", "sync", "time"] }
+
+[target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

@@ -1,0 +1,22 @@
+[package]
+name = "deadcat-contracts"
+description = "Canonical Deadcat SimplicityHL contracts and deterministic interpreters."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+deadcat-types.workspace = true
+elements.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+smplx-std.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+smplx-regtest.workspace = true
+smplx-sdk.workspace = true

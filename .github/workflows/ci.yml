@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: nixbuild/nix-quick-install-action@v35
+      - name: Check flake
+        run: nix flake check --print-build-logs
+      - name: Rust and contract checks
+        run: nix develop .#default --command just ci

@@ -1,0 +1,21 @@
+[package]
+name = "deadcat-client"
+description = "Client-side Deadcat evidence verification, recovery, routing, and transaction construction."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bip39.workspace = true
+deadcat-contracts.workspace = true
+deadcat-rpc.workspace = true
+deadcat-types.workspace = true
+elements.workspace = true
+hmac.workspace = true
+rand.workspace = true
+sha2.workspace = true
+smplx-std.workspace = true
+thiserror.workspace = true
