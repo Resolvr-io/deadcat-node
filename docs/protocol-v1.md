@@ -5,7 +5,7 @@ release. Historical Deadcat SDK sources and design documents are reference
 material only when they agree with this file and the accepted ADRs.
 
 - Status: Proposed for byte-vector review
-- Date: 2026-07-12
+- Date: 2026-07-13
 
 ## 1. Common conventions
 
@@ -29,6 +29,20 @@ contexts, and fixed database keys use the pinned `elements` crate's internal
 32-byte hash serialization (`to_byte_array()`), not bytes obtained by decoding
 the reversed human display string. Cross-language implementations must follow
 the committed byte vectors rather than infer order from rendered hex.
+
+### Scalar encoding and reduction
+
+Protocol scalar constants are written and serialized as 32-byte big-endian
+integers. Hash-derived secp256k1 scalar uses elsewhere in v1 follow one rule:
+
+```text
+hash_to_scalar(domain, message) =
+    big_endian_integer(tagged_hash(domain, message)) mod n
+```
+
+Zero is permitted. This matches the scalar-reduction behavior of the
+Simplicity secp256k1 jets. Committed vectors, rather than rendered hash hex,
+are authoritative for cross-language implementations.
 
 ### Contract identity
 
@@ -110,17 +124,35 @@ The official standalone market builder fixes the following bootstrap:
 - because the issuance amount is null rather than confidential, RT IDs use the
   unblinded-issuance variant even though the RT outputs themselves are
   confidential;
-- output 0 is the deterministic one-unit YES RT commitment at
-  `DormantYesRt`, and output 1 is its NO counterpart at `DormantNoRt`; and
+- output 0 is the fixed side-A, one-unit YES RT commitment at `DormantYesRt`,
+  and output 1 is the fixed side-A NO counterpart at `DormantNoRt`; and
 - no other input carries issuance.
 
-Registration re-derives both entropies and all four asset IDs and verifies the
-two RT commitments from the defining outpoints and deterministic factors. For a
-custom composed creation, full supplied parameters may identify the YES/NO
-defining issuances and dormant RT outputs at other positions, but each
-association must be unique; unrelated issuances are ignored. The covenant
-cannot enforce creation-time blinding because it does not execute until a
-created RT output is spent.
+Registration re-derives both entropies and all four asset IDs, derives the two
+fixed side-A RT commitments from the RT asset IDs, and verifies the raw creation
+outputs exactly. For a custom composed creation, full supplied parameters may
+identify the YES/NO defining issuances and dormant RT outputs at other
+positions, but each association must be unique; unrelated issuances are
+ignored. The covenant cannot enforce creation-time blinding because it does not
+execute until a created RT output is spent, so side-A creation is independently
+enforced by registration and client replay.
+
+Creation-transaction validation is a solvency boundary, not merely a discovery
+or indexing check. For each leg, registration and independent client replay must
+establish one unique canonical defining issuance with an explicit one-unit RT
+amount, a null initial outcome-token amount, and one exact confidential
+value-one side-A commitment locked at the compiled dormant script. Given a
+confirmed, Elements-consensus-valid creation transaction, those checks exhaust
+the RT's spendable supply: commitment balance precludes another positive RT
+output, while Elements consensus rejects both explicit zero-valued spendable
+outputs and confidential spendable outputs whose rangeproof admits zero. A
+zero-valued RT can therefore exist only at a provably unspendable output such as
+`OP_RETURN`, where it carries no reissuance authority. Without this validation,
+a creator could retain a positive RT outside the market, reissue YES or NO
+independently of the covenant, and create claims with no corresponding
+collateral. The pinned Elements consensus rules are visible in the
+[explicit-output check](https://github.com/ElementsProject/elements/blob/1af7a4d9bea93b4d7f29a77f9751a0e6e03a4390/src/confidential_validation.cpp#L320-L331)
+and [confidential rangeproof check](https://github.com/ElementsProject/elements/blob/1af7a4d9bea93b4d7f29a77f9751a0e6e03a4390/src/script/sigcache.cpp#L198-L208).
 
 ```text
 collateral_per_pair = cp = checked_mul(base_payout, 2)
@@ -314,48 +346,67 @@ outcome_byte = 0x00 for NO
 
 The oracle supplies a BIP-340 signature under `oracle_public_key`.
 
-### Deterministic RT construction
+### Fixed A/B RT construction
 
-For the YES and NO creation defining outpoints:
-
-```text
-creation_abf = hash_to_scalar("deadcat/rt_abf", serialized_outpoint)
-creation_vbf = hash_to_scalar("deadcat/rt_vbf", serialized_outpoint)
-creation_cbf = creation_abf + creation_vbf mod n
-```
-
-`serialized_outpoint` is the 36-byte Elements consensus encoding: internal
-txid bytes followed by `vout` as little-endian `u32`. Database outpoint keys
-instead use big-endian `vout` for ordered storage; the two encodings must not be
-substituted.
-
-For every continuing RT leg:
+Let `n` be the secp256k1 group order. The public 32-byte big-endian scalar
+constants are:
 
 ```text
-out_abf = hash_to_scalar("deadcat/rt_abf", spent_rt_outpoint)
-out_cbf = in_cbf
-out_vbf = out_cbf - out_abf mod n
+ABF_A    = 0x0101010101010101010101010101010101010101010101010101010101010101
+ABF_B    = 0x0202020202020202020202020202020202020202020202020202020202020202
+C        = 0x0303030303030303030303030303030303030303030303030303030303030303
+YES_CBF  = C
+NO_CBF   = -C mod n
+         = 0xfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfbb7abd9e3ac459d38bccf5b89cd333e3e
 ```
 
-The covenant verifies the input commitment, computes the deterministic output
-ABF, and enforces CBF pass-through. Each RT output has value one.
-
-On terminal burns, the covenant verifies the expected RT asset/value commitment
-and bare burn script using witness-provided factors. It does not require a
-particular burn CBF. The official builder uses CBF pass-through because it
-self-balances the RT portion of the transaction.
-
-All hash-derived secp256k1 scalar uses go through one rule:
+For RT leg `r` and side `s`:
 
 ```text
-hash_to_scalar(domain, message) =
-    big_endian_integer(tagged_hash(domain, message)) mod n
+VBF(r, s) = CBF(r) - ABF(s) mod n
 ```
 
-Zero is permitted. This matches the scalar-reduction behavior of the Simplicity
-secp256k1 jets and avoids an off-chain parser rejecting a value that the covenant
-would reduce. Golden vectors cover values on both sides of the group-order
-boundary.
+The resulting VBFs are:
+
+| Leg | Side A | Side B |
+|---|---|---|
+| YES | `0x02` repeated 32 bytes | `0x01` repeated 32 bytes |
+| NO | `0xfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfab6aad8e2ab449c37bbce5a88cc323d3d` | `0xfafafafafafafafafafafafafafaf9b5a9d7e1aa439b36bacd5987cb313c3c` |
+
+Every RT has confidential value one. Its exact commitments are:
+
+```text
+asset(r, s) = H(asset_id(r)) + ABF(s) * G
+value(r)    = H(asset_id(r)) + CBF(r) * G
+```
+
+The value commitment is identical on A and B. The complementary leg factors
+satisfy `YES_CBF + NO_CBF = 0 mod n`, so the two canonical creation outputs
+balance against their explicit one-unit issuance pseudo-inputs without a
+confidential wallet balancing output.
+
+Both creation legs start on A. Every market operation that consumes live RTs
+must find the YES and NO legs on the same current side and must put every RT
+continuation on the opposite side. This includes a full cancellation that
+returns to Dormant. Every terminal resolution or expiry must instead create
+both opposite-side confidential commitments at bare `OP_RETURN` burn outputs.
+Same-side continuations and burns are invalid.
+
+The covenant and Rust interpreter infer the current side by comparing each raw
+input `TxOut`'s `(asset, value)` pair against the two exact role-specific
+commitments. The script and sibling relationship are checked separately. The
+raw `TxOut` is authoritative: a side value received from a node, database, or
+caller is never trusted as independent state and need not be persisted.
+
+On initial and subsequent issuance, each input's Elements
+`asset_blinding_nonce` must equal the exact ABF of that inferred input side:
+`ABF_A` for an A input and `ABF_B` for a B input. The continuation still flips
+to the other side. Rangeproof construction uses the role- and side-specific VBF
+even though each leg's A/B value commitment is byte-identical, and surjection
+proofs use the complete Elements input domain in canonical order.
+
+This algebra is specific to a one-unit RT. It must be redesigned if an RT value
+can differ from one.
 
 ### Recovery hint
 
@@ -375,6 +426,11 @@ bytes 38-69, for a 70-byte payload.
 
 Both payloads use a one-byte direct-push opcode, so their complete scripts are
 40 and 72 bytes respectively, including `OP_RETURN` and the push opcode.
+
+The A/B schedule adds no recovery field. Payloads remain 38 or 70 bytes and
+their complete scripts remain 40 or 72 bytes. The fixed side-A creation
+commitments are derived from the RT asset IDs already recoverable from the
+defining issuances.
 
 Collateral indices:
 
@@ -397,7 +453,7 @@ the v1 hint convention without a mnemonic or Nostr:
 2. decode the oracle key, collateral, payout denomination, and lock-height;
 3. derive YES, NO, and both RT asset IDs from the creation transaction's two
    associated new issuances;
-4. derive the deterministic initial RT commitments;
+4. derive the fixed side-A initial RT commitments;
 5. compile all eight slot scripts and require one unambiguous dormant RT pair
    matching the creation transaction; and
 6. replay spends from those verified outpoints to the canonical tip.
@@ -689,8 +745,8 @@ Machine-readable fixtures are committed before a contract is considered stable:
 
 1. fixed market params to arguments, CMR, tapleaf/control block, all eight
    scripts, and addresses per supported network;
-2. defining outpoints to issuance entropy, token/RT IDs, RT factors,
-   commitments, and creation transaction;
+2. defining outpoints to issuance entropy and token/RT IDs, plus the fixed A/B
+   RT factors, commitments, and side-A creation transaction;
 3. RT lineage through every continuing and terminal path;
 4. known/exotic market hints and every invalid tag/index/length case;
 5. oracle market ID, tagged messages, signatures, and wrong-key/outcome/domain
@@ -726,6 +782,7 @@ V1 deliberately supersedes these older proposals:
 - fixed `current_index + 1` order remainder;
 - first-matching-script transition detection;
 - state models that store `outstanding_pairs` after asymmetric expiry
-  redemption; and
-- any assumption that a custom-valid transaction has the official builder's
+  redemption;
+- outpoint-derived RT blinders and witness-authoritative RT factors;
+- and any assumption that a custom-valid transaction has the official builder's
   layout beyond what the covenant itself enforces.

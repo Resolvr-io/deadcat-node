@@ -1,0 +1,157 @@
+{
+  "schema": "deadcat.binary-market-ab-v1.measurements.v1",
+  "recorded_date": "2026-07-13",
+  "rolling_baseline_commit": "ed6de4c4c8a177b4a4ba92c2bac17f55b324781f",
+  "candidate_base_commit": "25ad4092293e86d71108cf6d10f490ed4d65dc4b",
+  "candidate_implementation_commit": "7ed20b8b81306eaf81ee49b80b4ea65b49804871",
+  "toolchain": {
+    "flake_lock_sha256": "39cb5ac107c5930e0184e9d01a43f7ee7ae3229a230e0f6e37b3cf6cebe3d0d7",
+    "nixpkgs_revision": "50ab793786d9de88ee30ec4e4c24fb4236fc2674",
+    "rustc": "1.94.1 (e408947bf 2026-03-25)",
+    "cargo": "1.94.0 (29ea6fb6a 2026-03-24)",
+    "simplex_smplx": "0.0.6",
+    "elements_core": "23.3.3",
+    "electrs": "0.4.1"
+  },
+  "units": {
+    "cost_milliweight": "Simplicity milliweight units reported by RedeemNode bounds",
+    "program_bytes": "bytes",
+    "witness_bytes": "bytes",
+    "stack_bytes": "Elements consensus-serialized script-witness stack bytes",
+    "padding_bytes": "annex bytes added to satisfy the Simplicity cost budget",
+    "tx_bytes": "Elements consensus-serialized transaction bytes",
+    "tx_weight": "Elements weight units",
+    "tx_vsize": "virtual bytes",
+    "tx_discount_weight": "Elements discounted weight units",
+    "tx_discount_vsize": "discounted virtual bytes"
+  },
+  "deterministic_full_market_fixture": {
+    "description": "Identical finalized binary-market PSET shapes at the hardened rolling baseline and A/B candidate. Covenant metrics are aggregated over every market input in the operation. Redemption paths have no live RT input and are side-independent.",
+    "ab_reproduction_command": "cargo test --locked -p deadcat-client --test simplicity_budget every_finalized_market_stack_has_sufficient_simplicity_budget -- --exact --nocapture",
+    "rolling_capture_provenance": {
+      "source_commit": "ed6de4c4c8a177b4a4ba92c2bac17f55b324781f",
+      "method": "temporary full-market metric instrumentation applied to the hardened rolling source",
+      "reporter_committed": false,
+      "limitation": "the rolling rows are a preserved historical capture, not directly reproducible from the recorded source commit; reconstruct equivalent instrumentation before treating the exact rolling numbers as independently reproduced"
+    },
+    "columns": [
+      "cost_milliweight",
+      "program_bytes",
+      "witness_bytes",
+      "stack_bytes",
+      "padding_bytes",
+      "tx_bytes",
+      "tx_weight",
+      "tx_vsize",
+      "tx_discount_weight",
+      "tx_discount_vsize"
+    ],
+    "rolling": {
+      "initial_issuance": [5007707, 4636, 212, 5463, 404, 14704, 16531, 4133, 7725, 1932],
+      "subsequent_issuance": [7061806, 7087, 222, 7977, 353, 17262, 19212, 4803, 10406, 2602],
+      "partial_cancellation": [7095891, 7289, 222, 8136, 310, 17367, 19143, 4786, 10337, 2585],
+      "full_cancellation": [6538775, 7216, 222, 7819, 68, 16970, 18512, 4628, 9706, 2427],
+      "active_resolution_yes": [6048683, 7400, 479, 8193, 0, 17264, 18572, 4643, 9766, 2442],
+      "active_resolution_no": [6048683, 7399, 479, 8192, 0, 17263, 18571, 4643, 9765, 2442],
+      "dormant_resolution_yes": [3986836, 4905, 469, 5584, 0, 14531, 15482, 3871, 6676, 1669],
+      "dormant_resolution_no": [3986836, 4905, 469, 5584, 0, 14531, 15482, 3871, 6676, 1669],
+      "active_expiry": [5911817, 7289, 414, 8017, 0, 17088, 18396, 4599, 9590, 2398],
+      "dormant_expiry": [3860379, 4747, 404, 5361, 0, 14308, 15259, 3815, 6453, 1614],
+      "resolved_yes_partial_redemption": [735435, 2226, 18, 2348, 0, 2622, 3405, 852, 3405, 852],
+      "resolved_yes_full_redemption": [460163, 2146, 18, 2268, 0, 2462, 3011, 753, 3011, 753],
+      "resolved_no_partial_redemption": [735435, 2225, 18, 2347, 0, 2621, 3404, 851, 3404, 851],
+      "resolved_no_full_redemption": [460163, 2145, 18, 2267, 0, 2461, 3010, 753, 3010, 753],
+      "expiry_yes_partial_redemption": [729299, 2223, 19, 2346, 0, 2620, 3403, 851, 3403, 851],
+      "expiry_yes_full_redemption": [454927, 2148, 19, 2271, 0, 2465, 3014, 754, 3014, 754],
+      "expiry_no_partial_redemption": [729299, 2222, 19, 2345, 0, 2619, 3402, 851, 3402, 851],
+      "expiry_no_full_redemption": [454927, 2147, 19, 2270, 0, 2464, 3013, 754, 3013, 754]
+    },
+    "ab_side_a_rt_inputs": {
+      "initial_issuance": [3304123, 4634, 20, 4862, 0, 14103, 15930, 3983, 7124, 1781],
+      "subsequent_issuance": [5337818, 7051, 30, 7393, 0, 16678, 18628, 4657, 9822, 2456],
+      "partial_cancellation": [5305427, 6898, 30, 7240, 0, 16471, 18247, 4562, 9441, 2361],
+      "full_cancellation": [4748215, 6818, 30, 7160, 0, 16311, 17853, 4464, 9047, 2262],
+      "active_resolution_yes": [4355300, 7230, 95, 7637, 0, 16708, 18016, 4504, 9210, 2303],
+      "active_resolution_no": [4355300, 7230, 95, 7637, 0, 16708, 18016, 4504, 9210, 2303],
+      "dormant_resolution_yes": [2325277, 4846, 85, 5139, 0, 14086, 15037, 3760, 6231, 1558],
+      "dormant_resolution_no": [2325277, 4846, 85, 5139, 0, 14086, 15037, 3760, 6231, 1558],
+      "active_expiry": [4207578, 7100, 30, 7442, 0, 16513, 17821, 4456, 9015, 2254],
+      "dormant_expiry": [2181780, 4679, 20, 4907, 0, 13854, 14805, 3702, 5999, 1500]
+    },
+    "ab_side_b_rt_inputs": {
+      "initial_issuance": [3302377, 4628, 20, 4856, 0, 14097, 15924, 3981, 7118, 1780],
+      "subsequent_issuance": [5336072, 7045, 30, 7387, 0, 16672, 18622, 4656, 9816, 2454],
+      "partial_cancellation": [5303681, 6892, 30, 7234, 0, 16465, 18241, 4561, 9435, 2359],
+      "full_cancellation": [4746469, 6813, 30, 7155, 0, 16306, 17848, 4462, 9042, 2261],
+      "active_resolution_yes": [4353554, 7224, 95, 7631, 0, 16702, 18010, 4503, 9204, 2301],
+      "active_resolution_no": [4353554, 7224, 95, 7631, 0, 16702, 18010, 4503, 9204, 2301],
+      "dormant_resolution_yes": [2323531, 4840, 85, 5133, 0, 14080, 15031, 3758, 6225, 1557],
+      "dormant_resolution_no": [2323531, 4840, 85, 5133, 0, 14080, 15031, 3758, 6225, 1557],
+      "active_expiry": [4205832, 7096, 30, 7438, 0, 16509, 17817, 4455, 9011, 2253],
+      "dormant_expiry": [2180034, 4674, 20, 4902, 0, 13849, 14800, 3700, 5994, 1499]
+    },
+    "ab_side_independent_redemptions": {
+      "resolved_yes_partial_redemption": [727595, 2188, 18, 2310, 0, 2584, 3367, 842, 3367, 842],
+      "resolved_yes_full_redemption": [452323, 2109, 18, 2231, 0, 2425, 2974, 744, 2974, 744],
+      "resolved_no_partial_redemption": [727595, 2188, 18, 2310, 0, 2584, 3367, 842, 3367, 842],
+      "resolved_no_full_redemption": [452323, 2108, 18, 2230, 0, 2424, 2973, 744, 2973, 744],
+      "expiry_yes_partial_redemption": [721059, 2184, 19, 2307, 0, 2581, 3364, 841, 3364, 841],
+      "expiry_yes_full_redemption": [446687, 2110, 19, 2233, 0, 2427, 2976, 744, 2976, 744],
+      "expiry_no_partial_redemption": [721059, 2184, 19, 2307, 0, 2581, 3364, 841, 3364, 841],
+      "expiry_no_full_redemption": [446687, 2110, 19, 2233, 0, 2427, 2976, 744, 2976, 744]
+    },
+    "aggregate_rt_consuming_reduction_percent": {
+      "method": "sum each metric across the ten RT-consuming lifecycle shapes, then compare A/B with rolling",
+      "side_a": {
+        "cost_milliweight": 30.8,
+        "program_bytes": 2.5,
+        "witness_bytes": 85.5,
+        "stack_bytes": 8.2,
+        "padding_bytes": 100.0,
+        "tx_bytes": 3.6,
+        "tx_weight": 3.3,
+        "tx_vsize": 3.3,
+        "tx_discount_weight": 6.6,
+        "tx_discount_vsize": 6.6
+      },
+      "side_b": {
+        "cost_milliweight": 30.8,
+        "program_bytes": 2.5,
+        "witness_bytes": 85.5,
+        "stack_bytes": 8.3,
+        "padding_bytes": 100.0,
+        "tx_bytes": 3.6,
+        "tx_weight": 3.3,
+        "tx_vsize": 3.3,
+        "tx_discount_weight": 6.7,
+        "tx_discount_vsize": 6.7
+      }
+    }
+  },
+  "live_elements_regtest": {
+    "status": "passed",
+    "command": "nix develop .#default --command just regtest-market-ab",
+    "run_date": "2026-07-13",
+    "duration_seconds": 44.81,
+    "confirmed_transactions": 16,
+    "markets": 3,
+    "raw_record": "binary-market-ab-live-2026-07-13.json",
+    "valid_transaction_checks": ["testmempoolaccept", "broadcast", "mine", "confirm"],
+    "negative_tests": [
+      {"case": "missing_rt_surjection_proof", "reject_reason": "bad-txns-in-ne-out"},
+      {"case": "malformed_rt_surjection_proof", "reject_reason": "bad-txns-in-ne-out"}
+    ],
+    "assertions": [
+      "canonical creation uses side A and only explicit wallet funding/change",
+      "initial issuance flips A to B and uses ABF_A as both exact reissuance nonces",
+      "subsequent issuance flips B to A and uses ABF_B as both exact reissuance nonces",
+      "subsequent issuance composes with confidential wallet input and change",
+      "partial and full cancellation flip B to A and A to B, with full cancellation returning Dormant",
+      "Dormant reissuance consumes side B, uses ABF_B as both nonces, and flips to A",
+      "active YES and NO resolutions create opposite-side confidential terminal burns at bare OP_RETURN",
+      "active expiry uses exact locktime and nonfinal sequences and burns B to A",
+      "partial and full resolved-market redemption are accepted and drain collateral to zero"
+    ],
+    "scope": "Three production-shaped full-contract chains cover every lifecycle class and both terminal flip directions. The deterministic BitMachine/interpreter corpus additionally enumerates both dormant terminal paths, both outcomes, both RT input sides, and every partial/full redemption shape."
+  }
+}

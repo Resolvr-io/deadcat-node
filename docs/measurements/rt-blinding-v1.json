@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "recorded_date": "2026-07-12",
+  "baseline_commit": "621a7e0",
+  "status": "isolated-research-only",
+  "decision_status": "proposed-no-production-migration",
+  "recommendation": "ab-complementary-cbf",
+  "toolchain": {
+    "rustc": "1.94.1 (e408947bf 2026-03-25)",
+    "simplex": "0.0.6",
+    "elements_core": "23.3.3"
+  },
+  "units": {
+    "cost_milliweight": "Simplicity milliweight units reported by RedeemNode bounds",
+    "program_bytes": "bytes",
+    "witness_bytes": "bytes",
+    "stack_bytes": "Elements consensus-serialized stack bytes",
+    "padding_bytes": "bytes",
+    "tx_bytes": "Elements transaction bytes",
+    "tx_weight": "Elements weight units",
+    "tx_vsize": "virtual bytes",
+    "tx_discount_weight": "Elements discounted weight units",
+    "tx_discount_vsize": "discounted virtual bytes"
+  },
+  "fixture": {
+    "kind": "single-rt-continuation",
+    "description": "An isolated RT covenant spend with one confidential RT input, one explicit decoy input, and one confidential RT output carrying a rangeproof and surjection proof.",
+    "simplicity_network": "ElementsRegtest",
+    "rolling_witness_fields": [
+      "output_index:u32",
+      "input_abf:u256",
+      "input_cbf:u256",
+      "terminal:bool"
+    ],
+    "ab_witness_fields": [
+      "output_index:u32",
+      "terminal:bool"
+    ],
+    "ab_prebound_commitments": [
+      "asset_a",
+      "asset_b",
+      "value"
+    ],
+    "limitations": [
+      "The fixture is not the complete binary-market covenant.",
+      "The transaction is not a market creation, token reissuance, or terminal burn.",
+      "The transaction was not submitted to elementsd or mined.",
+      "Wallet signatures and production funding/change selection are absent.",
+      "Full-market and multi-input witness savings may not scale linearly from this fixture."
+    ]
+  },
+  "schedules": {
+    "rolling": {
+      "cost_milliweight": 669509,
+      "program_bytes": 637,
+      "witness_bytes": 69,
+      "stack_bytes": 778,
+      "padding_bytes": 0,
+      "tx_bytes": 5257,
+      "tx_weight": 5842,
+      "tx_vsize": 1461,
+      "tx_discount_weight": 1471,
+      "tx_discount_vsize": 368
+    },
+    "ab_complementary_cbf": {
+      "cost_milliweight": 90861,
+      "program_bytes": 480,
+      "witness_bytes": 5,
+      "stack_bytes": 557,
+      "padding_bytes": 0,
+      "tx_bytes": 5036,
+      "tx_weight": 5621,
+      "tx_vsize": 1406,
+      "tx_discount_weight": 1250,
+      "tx_discount_vsize": 313
+    }
+  },
+  "protocol_independent_hardening": {
+    "rolling_interpreter_exact_commitments": true,
+    "simplicity_budget_padding": true,
+    "underbudget_market_paths_before_fix": {
+      "initial_issuance_required_annex_bytes": 404,
+      "subsequent_issuance_required_annex_bytes": 353,
+      "partial_cancellation_required_annex_bytes": 310,
+      "full_cancellation_required_annex_bytes": 68
+    }
+  },
+  "regtest": {
+    "status": "passed",
+    "elements_version": "23.3.3",
+    "command": "just regtest-rt-study",
+    "valid_transaction_checks": [
+      "testmempoolaccept",
+      "broadcast",
+      "mine",
+      "confirm"
+    ],
+    "negative_checks": [
+      "missing_rt_surjection_proof_rejected"
+    ],
+    "reissuance": {
+      "amount_per_leg": 7,
+      "legs": 2,
+      "nonterminal_transitions_per_scheme": 2,
+      "nonce": "current input RT ABF",
+      "entropy": "stored final issuance entropy",
+      "outputs": "explicit reissued assets"
+    },
+    "rolling": [
+      {"stage":"creation","bytes":13760,"weight":15593,"vsize":3899,"discount_weight":2256,"discount_vsize":564,"mempool_vsize":3899,"covenant":{"cost_milliweight":0,"program_bytes":0,"witness_bytes":0,"stack_bytes":0}},
+      {"stage":"explicit_transition","bytes":11026,"weight":13210,"vsize":3303,"discount_weight":4404,"discount_vsize":1101,"mempool_vsize":3303,"covenant":{"cost_milliweight":1339018,"program_bytes":1274,"witness_bytes":138,"stack_bytes":1556}},
+      {"stage":"confidential_transition","bytes":15389,"weight":17741,"vsize":4436,"discount_weight":4404,"discount_vsize":1101,"mempool_vsize":4436,"covenant":{"cost_milliweight":1339018,"program_bytes":1274,"witness_bytes":138,"stack_bytes":1556}},
+      {"stage":"terminal_burn","bytes":10976,"weight":12122,"vsize":3031,"discount_weight":3316,"discount_vsize":829,"mempool_vsize":3031,"covenant":{"cost_milliweight":1374212,"program_bytes":1574,"witness_bytes":138,"stack_bytes":1856}}
+    ],
+    "ab_complementary_cbf": [
+      {"stage":"creation","bytes":9397,"weight":11062,"vsize":2766,"discount_weight":2256,"discount_vsize":564,"mempool_vsize":2766,"covenant":{"cost_milliweight":0,"program_bytes":0,"witness_bytes":0,"stack_bytes":0}},
+      {"stage":"explicit_transition","bytes":10587,"weight":12771,"vsize":3193,"discount_weight":3965,"discount_vsize":992,"mempool_vsize":3193,"covenant":{"cost_milliweight":181722,"program_bytes":963,"witness_bytes":10,"stack_bytes":1117}},
+      {"stage":"confidential_transition","bytes":14938,"weight":17290,"vsize":4323,"discount_weight":3953,"discount_vsize":989,"mempool_vsize":4323,"covenant":{"cost_milliweight":180758,"program_bytes":951,"witness_bytes":10,"stack_bytes":1105}},
+      {"stage":"terminal_burn","bytes":10547,"weight":11693,"vsize":2924,"discount_weight":2887,"discount_vsize":722,"mempool_vsize":2924,"covenant":{"cost_milliweight":216916,"program_bytes":1273,"witness_bytes":10,"stack_bytes":1427}}
+    ],
+    "scope_boundary": "Isolated RT covenants with real Elements reissuance; not the full binary-market covenant or full lifecycle corpus. The rolling terminal micro-path uses an outpoint-derived next ABF, stricter than the production rolling market's arbitrary burn factors.",
+    "variability": "Fresh daemon runs derive new issuance outpoints, asset IDs, signatures, and proofs, so live byte counts may vary slightly."
+  }
+}

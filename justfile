@@ -24,6 +24,13 @@ clippy: generate
 test: generate
     cargo test --locked --workspace
 
+# Run the production-shaped A/B binary-market lifecycle against an isolated
+# liquidregtest elementsd + Electrs pair.
+regtest-market-ab: generate
+    cargo test --locked -p deadcat-client --test market_regtest \
+        binary_market_ab_lifecycle_is_accepted_by_elementsd \
+        -- --ignored --nocapture --test-threads=1
+
 wasm-check:
     NIX_HARDENING_ENABLE=pic cargo check --locked -p deadcat-iroh --lib --target wasm32-unknown-unknown
 

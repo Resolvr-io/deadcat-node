@@ -2,7 +2,7 @@ use deadcat_contracts::binary_market::{BinaryMarketSlot, CompiledBinaryMarket};
 use deadcat_contracts::maker_order::CompiledMakerOrder;
 use deadcat_contracts::market_crypto::derive_issuance_assets;
 use deadcat_contracts::recovery::{MarketCollateral, MarketRecoveryHint, recovery_txout};
-use deadcat_contracts::rt::{commitments, creation_factors};
+use deadcat_contracts::rt::{RtLeg, RtSide, commitments, factors};
 use deadcat_types::{
     BinaryMarketParams, ChainAnchor, ChainPosition, ContractSyncState, MakerOrderParams,
     MakerOrderState, OrderDirection, OrderSide,
@@ -411,14 +411,11 @@ fn standalone_market(policy_asset: AssetId) -> Transaction {
     let compiled = CompiledBinaryMarket::new(params).expect("compile market");
     let yes_commitments = commitments(
         params.yes_reissuance_token_id,
-        creation_factors(yes_input.previous_output),
+        factors(RtLeg::Yes, RtSide::A),
     )
     .expect("YES commitments");
-    let no_commitments = commitments(
-        params.no_reissuance_token_id,
-        creation_factors(no_input.previous_output),
-    )
-    .expect("NO commitments");
+    let no_commitments = commitments(params.no_reissuance_token_id, factors(RtLeg::No, RtSide::A))
+        .expect("NO commitments");
     let hint = MarketRecoveryHint {
         oracle_public_key: params.oracle_public_key,
         collateral: MarketCollateral::PolicyAsset,

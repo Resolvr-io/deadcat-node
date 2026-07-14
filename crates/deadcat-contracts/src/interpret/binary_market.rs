@@ -1,6 +1,6 @@
 use deadcat_types::{BinaryMarketParams, BinaryMarketState};
 use elements::confidential::{Asset, Value};
-use elements::secp256k1_zkp::{Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
+use elements::secp256k1_zkp::{Message, Secp256k1, Tweak, XOnlyPublicKey, schnorr::Signature};
 use elements::{AssetId, OutPoint, Transaction, TxOut};
 
 use super::{
@@ -13,6 +13,7 @@ use crate::binary_market::{
 };
 use crate::binary_market::{BinaryMarketTransition, BinaryOutcome};
 use crate::market_crypto::{BinaryOutcome as OracleOutcome, oracle_message};
+use crate::rt::{RtFactors, RtLeg, RtSide, commitments, factors, infer_side};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -73,6 +74,12 @@ pub struct BinaryMarketInterpretation {
     pub continuations: Vec<BinaryMarketContinuation>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BinaryMarketRtSides {
+    yes: Option<RtSide>,
+    no: Option<RtSide>,
+}
+
 pub fn interpret_binary_market_spend(
     params: BinaryMarketParams,
     before: BinaryMarketState,
@@ -113,6 +120,7 @@ pub fn interpret_binary_market_spend(
     if !decoded.u8_values().contains(&(expected_slot as u8)) {
         return Err(InterpretError::MissingWitness("SLOT"));
     }
+    let live_rt_sides = infer_live_rt_sides(params, before, live)?;
 
     let u8_values = decoded.u8_values();
     let paths: Vec<BinaryMarketPath> = u8_values
@@ -164,6 +172,7 @@ pub fn interpret_binary_market_spend(
                         &compiled,
                         before,
                         live,
+                        live_rt_sides,
                         transaction,
                         path,
                         input_base,
@@ -194,6 +203,7 @@ fn interpret_candidate(
     compiled: &CompiledBinaryMarket,
     before: BinaryMarketState,
     live: &BinaryMarketLiveOutputs,
+    live_rt_sides: BinaryMarketRtSides,
     transaction: &Transaction,
     path: BinaryMarketPath,
     input_base: u32,
@@ -204,17 +214,29 @@ fn interpret_candidate(
     let spent = verify_input_group(path, before, live, transaction, input_base)?;
     let action = match path {
         BinaryMarketPath::InitialIssuance | BinaryMarketPath::SubsequentIssuance => {
+            let yes_side = live_rt_sides
+                .yes
+                .ok_or(InterpretError::InvalidTrackedOutput(
+                    "missing inferred YES RT side",
+                ))?;
+            let no_side = live_rt_sides
+                .no
+                .ok_or(InterpretError::InvalidTrackedOutput(
+                    "missing inferred NO RT side",
+                ))?;
             let yes = issuance_amount(
                 transaction,
                 input_base,
                 params.yes_token_asset_id,
                 params.yes_reissuance_token_id,
+                factors(RtLeg::Yes, yes_side).abf,
             )?;
             let no = issuance_amount(
                 transaction,
                 add_index(input_base, 1)?,
                 params.no_token_asset_id,
                 params.no_reissuance_token_id,
+                factors(RtLeg::No, no_side).abf,
             )?;
             if yes == 0 || yes != no {
                 return Err(InterpretError::Inconsistent("unequal or zero issuance"));
@@ -286,6 +308,8 @@ fn interpret_candidate(
         transaction,
         path,
         before,
+        live,
+        live_rt_sides,
         applied,
         output_base,
         tokens,
@@ -310,11 +334,16 @@ fn verify_outputs(
     transaction: &Transaction,
     path: BinaryMarketPath,
     before: BinaryMarketState,
+    live: &BinaryMarketLiveOutputs,
+    live_rt_sides: BinaryMarketRtSides,
     applied: AppliedBinaryMarketTransition,
     output_base: u32,
     tokens: u64,
 ) -> Result<Vec<BinaryMarketContinuation>, InterpretError> {
     let mut output = Vec::new();
+    let yes_continuation =
+        opposite_side_factors(RtLeg::Yes, live.yes_rt.as_ref(), live_rt_sides.yes)?;
+    let no_continuation = opposite_side_factors(RtLeg::No, live.no_rt.as_ref(), live_rt_sides.no)?;
     match path {
         BinaryMarketPath::InitialIssuance | BinaryMarketPath::SubsequentIssuance => {
             push_rt_continuation(
@@ -323,6 +352,10 @@ fn verify_outputs(
                 transaction,
                 output_base,
                 BinaryMarketSlot::UnresolvedYesRt,
+                params.yes_reissuance_token_id,
+                yes_continuation.ok_or(InterpretError::InvalidTrackedOutput(
+                    "missing inferred YES RT side",
+                ))?,
             )?;
             push_rt_continuation(
                 &mut output,
@@ -330,6 +363,10 @@ fn verify_outputs(
                 transaction,
                 add_index(output_base, 1)?,
                 BinaryMarketSlot::UnresolvedNoRt,
+                params.no_reissuance_token_id,
+                no_continuation.ok_or(InterpretError::InvalidTrackedOutput(
+                    "missing inferred NO RT side",
+                ))?,
             )?;
             let amount = trading_collateral(applied.new_state, params)?;
             push_collateral_continuation(
@@ -349,6 +386,10 @@ fn verify_outputs(
                 transaction,
                 output_base,
                 BinaryMarketSlot::UnresolvedYesRt,
+                params.yes_reissuance_token_id,
+                yes_continuation.ok_or(InterpretError::InvalidTrackedOutput(
+                    "missing inferred YES RT side",
+                ))?,
             )?;
             push_rt_continuation(
                 &mut output,
@@ -356,6 +397,10 @@ fn verify_outputs(
                 transaction,
                 add_index(output_base, 1)?,
                 BinaryMarketSlot::UnresolvedNoRt,
+                params.no_reissuance_token_id,
+                no_continuation.ok_or(InterpretError::InvalidTrackedOutput(
+                    "missing inferred NO RT side",
+                ))?,
             )?;
             let amount = trading_collateral(applied.new_state, params)?;
             if amount == 0 {
@@ -387,6 +432,10 @@ fn verify_outputs(
                 transaction,
                 output_base,
                 BinaryMarketSlot::DormantYesRt,
+                params.yes_reissuance_token_id,
+                yes_continuation.ok_or(InterpretError::InvalidTrackedOutput(
+                    "missing inferred YES RT side",
+                ))?,
             )?;
             push_rt_continuation(
                 &mut output,
@@ -394,11 +443,29 @@ fn verify_outputs(
                 transaction,
                 add_index(output_base, 1)?,
                 BinaryMarketSlot::DormantNoRt,
+                params.no_reissuance_token_id,
+                no_continuation.ok_or(InterpretError::InvalidTrackedOutput(
+                    "missing inferred NO RT side",
+                ))?,
             )?;
         }
         BinaryMarketPath::ActiveResolution => {
-            check_rt_burn(transaction, output_base)?;
-            check_rt_burn(transaction, add_index(output_base, 1)?)?;
+            check_rt_burn(
+                transaction,
+                output_base,
+                params.yes_reissuance_token_id,
+                yes_continuation.ok_or(InterpretError::InvalidTrackedOutput(
+                    "missing inferred YES RT side",
+                ))?,
+            )?;
+            check_rt_burn(
+                transaction,
+                add_index(output_base, 1)?,
+                params.no_reissuance_token_id,
+                no_continuation.ok_or(InterpretError::InvalidTrackedOutput(
+                    "missing inferred NO RT side",
+                ))?,
+            )?;
             let (slot, amount) = terminal_slot_amount(applied.new_state)?;
             push_collateral_continuation(
                 &mut output,
@@ -411,8 +478,22 @@ fn verify_outputs(
             )?;
         }
         BinaryMarketPath::DormantResolution => {
-            check_rt_burn(transaction, output_base)?;
-            check_rt_burn(transaction, add_index(output_base, 1)?)?;
+            check_rt_burn(
+                transaction,
+                output_base,
+                params.yes_reissuance_token_id,
+                yes_continuation.ok_or(InterpretError::InvalidTrackedOutput(
+                    "missing inferred YES RT side",
+                ))?,
+            )?;
+            check_rt_burn(
+                transaction,
+                add_index(output_base, 1)?,
+                params.no_reissuance_token_id,
+                no_continuation.ok_or(InterpretError::InvalidTrackedOutput(
+                    "missing inferred NO RT side",
+                ))?,
+            )?;
             if !matches!(
                 before,
                 BinaryMarketState::Trading {
@@ -423,8 +504,22 @@ fn verify_outputs(
             }
         }
         BinaryMarketPath::ActiveExpiry => {
-            check_rt_burn(transaction, output_base)?;
-            check_rt_burn(transaction, add_index(output_base, 1)?)?;
+            check_rt_burn(
+                transaction,
+                output_base,
+                params.yes_reissuance_token_id,
+                yes_continuation.ok_or(InterpretError::InvalidTrackedOutput(
+                    "missing inferred YES RT side",
+                ))?,
+            )?;
+            check_rt_burn(
+                transaction,
+                add_index(output_base, 1)?,
+                params.no_reissuance_token_id,
+                no_continuation.ok_or(InterpretError::InvalidTrackedOutput(
+                    "missing inferred NO RT side",
+                ))?,
+            )?;
             let (_, amount) = terminal_slot_amount(applied.new_state)?;
             push_collateral_continuation(
                 &mut output,
@@ -437,8 +532,22 @@ fn verify_outputs(
             )?;
         }
         BinaryMarketPath::DormantExpiry => {
-            check_rt_burn(transaction, output_base)?;
-            check_rt_burn(transaction, add_index(output_base, 1)?)?;
+            check_rt_burn(
+                transaction,
+                output_base,
+                params.yes_reissuance_token_id,
+                yes_continuation.ok_or(InterpretError::InvalidTrackedOutput(
+                    "missing inferred YES RT side",
+                ))?,
+            )?;
+            check_rt_burn(
+                transaction,
+                add_index(output_base, 1)?,
+                params.no_reissuance_token_id,
+                no_continuation.ok_or(InterpretError::InvalidTrackedOutput(
+                    "missing inferred NO RT side",
+                ))?,
+            )?;
         }
         BinaryMarketPath::ResolvedRedemption | BinaryMarketPath::ExpiryRedemption => {
             if tokens == 0 {
@@ -702,6 +811,67 @@ fn validate_live_outputs(
     Ok(())
 }
 
+fn infer_live_rt_sides(
+    params: BinaryMarketParams,
+    state: BinaryMarketState,
+    live: &BinaryMarketLiveOutputs,
+) -> Result<BinaryMarketRtSides, InterpretError> {
+    if !matches!(state, BinaryMarketState::Trading { .. }) {
+        return Ok(BinaryMarketRtSides::default());
+    }
+    let yes = live
+        .yes_rt
+        .as_ref()
+        .ok_or(InterpretError::InvalidTrackedOutput("missing YES RT"))?;
+    let no = live
+        .no_rt
+        .as_ref()
+        .ok_or(InterpretError::InvalidTrackedOutput("missing NO RT"))?;
+    // The raw commitments are authoritative protocol state. In particular,
+    // do not trust or recover a side from the spending witness.
+    let yes_side = infer_side(
+        RtLeg::Yes,
+        params.yes_reissuance_token_id,
+        yes.txout.asset,
+        yes.txout.value,
+    )
+    .map_err(|_| {
+        InterpretError::InvalidTrackedOutput("YES RT commitment is not a recognized A/B side")
+    })?;
+    let no_side = infer_side(
+        RtLeg::No,
+        params.no_reissuance_token_id,
+        no.txout.asset,
+        no.txout.value,
+    )
+    .map_err(|_| {
+        InterpretError::InvalidTrackedOutput("NO RT commitment is not a recognized A/B side")
+    })?;
+    if yes_side != no_side {
+        return Err(InterpretError::InvalidTrackedOutput(
+            "YES and NO RT sides disagree",
+        ));
+    }
+    Ok(BinaryMarketRtSides {
+        yes: Some(yes_side),
+        no: Some(no_side),
+    })
+}
+
+fn opposite_side_factors(
+    leg: RtLeg,
+    live: Option<&TrackedContractOutput>,
+    side: Option<RtSide>,
+) -> Result<Option<RtFactors>, InterpretError> {
+    match (live, side) {
+        (Some(_), Some(side)) => Ok(Some(factors(leg, side.flip()))),
+        (None, None) => Ok(None),
+        _ => Err(InterpretError::InvalidTrackedOutput(
+            "RT output and inferred side disagree",
+        )),
+    }
+}
+
 fn candidate_outcomes(
     path: BinaryMarketPath,
     params: BinaryMarketParams,
@@ -798,14 +968,18 @@ fn issuance_amount(
     index: u32,
     expected_asset: AssetId,
     expected_rt: AssetId,
+    expected_nonce_abf: [u8; 32],
 ) -> Result<u64, InterpretError> {
     let input = transaction
         .input
         .get(index as usize)
         .ok_or(InterpretError::Inconsistent("issuance input index"))?;
+    let expected_nonce = Tweak::from_inner(expected_nonce_abf)
+        .map_err(|_| InterpretError::Inconsistent("invalid public RT nonce factor"))?;
     if !input.has_issuance()
         || input.issuance_ids() != (expected_asset, expected_rt)
         || !input.asset_issuance.inflation_keys.is_null()
+        || input.asset_issuance.asset_blinding_nonce != expected_nonce
     {
         return Err(InterpretError::Inconsistent("issuance identity"));
     }
@@ -894,11 +1068,14 @@ fn push_rt_continuation(
     transaction: &Transaction,
     index: u32,
     slot: BinaryMarketSlot,
+    asset_id: AssetId,
+    factors: RtFactors,
 ) -> Result<(), InterpretError> {
     let txout = output_at(transaction, index)?;
+    let expected = commitments(asset_id, factors)
+        .map_err(|_| InterpretError::Inconsistent("invalid RT continuation factors"))?;
     if txout.script_pubkey != *compiled.slot(slot).script_pubkey()
-        || !matches!(txout.asset, Asset::Confidential(_))
-        || !matches!(txout.value, Value::Confidential(_))
+        || (txout.asset, txout.value) != expected
     {
         return Err(InterpretError::Inconsistent("RT continuation"));
     }
@@ -940,12 +1117,16 @@ fn continuation(
     }
 }
 
-fn check_rt_burn(transaction: &Transaction, index: u32) -> Result<(), InterpretError> {
+fn check_rt_burn(
+    transaction: &Transaction,
+    index: u32,
+    asset_id: AssetId,
+    expected_factors: RtFactors,
+) -> Result<(), InterpretError> {
     let output = output_at(transaction, index)?;
-    if output.script_pubkey.as_bytes() != [0x6a]
-        || !matches!(output.asset, Asset::Confidential(_))
-        || !matches!(output.value, Value::Confidential(_))
-    {
+    let expected = commitments(asset_id, expected_factors)
+        .map_err(|_| InterpretError::Inconsistent("invalid RT burn factors"))?;
+    if output.script_pubkey.as_bytes() != [0x6a] || (output.asset, output.value) != expected {
         return Err(InterpretError::Inconsistent("RT burn"));
     }
     Ok(())

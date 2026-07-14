@@ -130,6 +130,22 @@ Nostr events and manual RPC calls are advisory locators. Registration performs:
 6. one atomic store transaction for metadata, scripts, indexes, and starting
    outpoints.
 
+For a binary market, step 5 is a critical solvency check. The node and client
+independently require each uniquely derived issuance to have a null initial
+outcome-token amount and a one-unit RT amount fully accounted for by the exact
+one-unit side-A commitment locked at its compiled dormant script. On a
+consensus-valid Elements transaction, this proves that no creator-retained
+spendable RT authority exists; accepting a script match without that creation
+proof could admit outcome tokens reissued outside the collateral covenant. The
+protocol specification defines the complete creation invariant.
+
+That proof is relative to the supplied canonical chain evidence. Elements Core
+mode validates the chain locally; an Esplora-backed node and a client using a
+remote node retain the stale, incomplete, or false-chain-view risks described
+in [ADR 0001](adr/0001-authority-and-shared-node.md). Contract-semantic replay
+does not by itself prove that one remote source supplied the current canonical
+Liquid chain.
+
 Market recovery hints are publicly reconstructible. Order recovery hints are
 mnemonic recovery aids for the maker; a public node needs the full announced or
 manually registered order parameters before it can compile and verify an order.

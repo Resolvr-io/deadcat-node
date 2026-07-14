@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 
 use deadcat_types::ContractId;
+use elements::confidential::{Asset, Value};
 use elements::hashes::{Hash as _, HashEngine as _, sha256};
 use elements::secp256k1_zkp::{Secp256k1, XOnlyPublicKey};
 use elements::taproot::{ControlBlock, TaprootBuilder, TaprootBuilderError};
@@ -14,6 +15,7 @@ use thiserror::Error;
 
 use super::{BinaryMarketEconomics, BinaryMarketParams, BinaryMarketSlot};
 use crate::artifacts::binary_market::{BinaryMarketProgram, derived_binary_market};
+use crate::rt::{RtCommitmentError, RtLeg, RtSide, commitments, factors};
 
 const NUMS_INTERNAL_KEY: [u8; 32] = [
     0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
@@ -69,7 +71,7 @@ impl CompiledBinaryMarket {
     pub fn new(params: BinaryMarketParams) -> Result<Self, CompiledBinaryMarketError> {
         validate_params(params)?;
 
-        let arguments = contract_arguments(params);
+        let arguments = contract_arguments(params)?;
         let compiled = CompiledProgram::new(
             BinaryMarketProgram::SOURCE,
             arguments.build_arguments(),
@@ -166,6 +168,12 @@ pub enum CompiledBinaryMarketError {
     InvalidNumsInternalKey,
     #[error("compiled binary-market slot count was not eight")]
     SlotCountInvariant,
+    #[error("failed to derive public RT commitments: {0}")]
+    RtCommitment(#[from] RtCommitmentError),
+    #[error("derived RT commitment was unexpectedly explicit")]
+    ExplicitRtCommitment,
+    #[error("A/B sides produced different value commitments for one RT leg")]
+    InconsistentRtValueCommitment,
 }
 
 fn validate_params(params: BinaryMarketParams) -> Result<(), CompiledBinaryMarketError> {
@@ -196,8 +204,12 @@ fn validate_params(params: BinaryMarketParams) -> Result<(), CompiledBinaryMarke
     Ok(())
 }
 
-fn contract_arguments(params: BinaryMarketParams) -> derived_binary_market::BinaryMarketArguments {
-    derived_binary_market::BinaryMarketArguments {
+fn contract_arguments(
+    params: BinaryMarketParams,
+) -> Result<derived_binary_market::BinaryMarketArguments, CompiledBinaryMarketError> {
+    let yes = rt_commitment_arguments(params.yes_reissuance_token_id, RtLeg::Yes)?;
+    let no = rt_commitment_arguments(params.no_reissuance_token_id, RtLeg::No)?;
+    Ok(derived_binary_market::BinaryMarketArguments {
         oracle_public_key: params.oracle_public_key,
         collateral_asset_id: params.collateral_asset_id.into_inner().to_byte_array(),
         yes_token_asset_id: params.yes_token_asset_id.into_inner().to_byte_array(),
@@ -206,6 +218,74 @@ fn contract_arguments(params: BinaryMarketParams) -> derived_binary_market::Bina
         no_reissuance_token_id: params.no_reissuance_token_id.into_inner().to_byte_array(),
         base_payout: params.base_payout,
         expiry_height: params.expiry_height,
+        yes_rt_asset_a_parity: yes.asset_a.parity,
+        yes_rt_asset_a_x: yes.asset_a.x,
+        yes_rt_asset_b_parity: yes.asset_b.parity,
+        yes_rt_asset_b_x: yes.asset_b.x,
+        yes_rt_value_parity: yes.value.parity,
+        yes_rt_value_x: yes.value.x,
+        no_rt_asset_a_parity: no.asset_a.parity,
+        no_rt_asset_a_x: no.asset_a.x,
+        no_rt_asset_b_parity: no.asset_b.parity,
+        no_rt_asset_b_x: no.asset_b.x,
+        no_rt_value_parity: no.value.parity,
+        no_rt_value_x: no.value.x,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CompressedCommitment {
+    parity: bool,
+    x: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RtCommitmentArguments {
+    asset_a: CompressedCommitment,
+    asset_b: CompressedCommitment,
+    value: CompressedCommitment,
+}
+
+fn rt_commitment_arguments(
+    asset_id: AssetId,
+    leg: RtLeg,
+) -> Result<RtCommitmentArguments, CompiledBinaryMarketError> {
+    let (asset_a, value_a) = commitments(asset_id, factors(leg, RtSide::A))?;
+    let (asset_b, value_b) = commitments(asset_id, factors(leg, RtSide::B))?;
+    let asset_a = compress_asset(asset_a)?;
+    let asset_b = compress_asset(asset_b)?;
+    let value_a = compress_value(value_a)?;
+    let value_b = compress_value(value_b)?;
+    if value_a != value_b {
+        return Err(CompiledBinaryMarketError::InconsistentRtValueCommitment);
+    }
+    Ok(RtCommitmentArguments {
+        asset_a,
+        asset_b,
+        value: value_a,
+    })
+}
+
+fn compress_asset(asset: Asset) -> Result<CompressedCommitment, CompiledBinaryMarketError> {
+    let Asset::Confidential(commitment) = asset else {
+        return Err(CompiledBinaryMarketError::ExplicitRtCommitment);
+    };
+    Ok(compress_serialized(commitment.serialize()))
+}
+
+fn compress_value(value: Value) -> Result<CompressedCommitment, CompiledBinaryMarketError> {
+    let Value::Confidential(commitment) = value else {
+        return Err(CompiledBinaryMarketError::ExplicitRtCommitment);
+    };
+    Ok(compress_serialized(commitment.serialize()))
+}
+
+fn compress_serialized(serialized: [u8; 33]) -> CompressedCommitment {
+    let mut x = [0_u8; 32];
+    x.copy_from_slice(&serialized[1..]);
+    CompressedCommitment {
+        parity: serialized[0] & 1 != 0,
+        x,
     }
 }
 
@@ -302,6 +382,54 @@ mod tests {
         );
         assert_eq!(compiled.arguments.base_payout, params.base_payout);
         assert_eq!(compiled.arguments.expiry_height, params.expiry_height);
+
+        let yes = rt_commitment_arguments(params.yes_reissuance_token_id, RtLeg::Yes)
+            .expect("YES RT commitments");
+        assert_eq!(
+            (
+                compiled.arguments.yes_rt_asset_a_parity,
+                compiled.arguments.yes_rt_asset_a_x
+            ),
+            (yes.asset_a.parity, yes.asset_a.x)
+        );
+        assert_eq!(
+            (
+                compiled.arguments.yes_rt_asset_b_parity,
+                compiled.arguments.yes_rt_asset_b_x
+            ),
+            (yes.asset_b.parity, yes.asset_b.x)
+        );
+        assert_eq!(
+            (
+                compiled.arguments.yes_rt_value_parity,
+                compiled.arguments.yes_rt_value_x
+            ),
+            (yes.value.parity, yes.value.x)
+        );
+
+        let no = rt_commitment_arguments(params.no_reissuance_token_id, RtLeg::No)
+            .expect("NO RT commitments");
+        assert_eq!(
+            (
+                compiled.arguments.no_rt_asset_a_parity,
+                compiled.arguments.no_rt_asset_a_x
+            ),
+            (no.asset_a.parity, no.asset_a.x)
+        );
+        assert_eq!(
+            (
+                compiled.arguments.no_rt_asset_b_parity,
+                compiled.arguments.no_rt_asset_b_x
+            ),
+            (no.asset_b.parity, no.asset_b.x)
+        );
+        assert_eq!(
+            (
+                compiled.arguments.no_rt_value_parity,
+                compiled.arguments.no_rt_value_x
+            ),
+            (no.value.parity, no.value.x)
+        );
     }
 
     #[test]
@@ -346,9 +474,9 @@ mod tests {
         assert_eq!(
             first.cmr(),
             [
-                0xd7, 0xb0, 0xbf, 0x24, 0x7d, 0x66, 0xc9, 0xe7, 0xd3, 0xb6, 0x8b, 0xe5, 0x53, 0xb5,
-                0x42, 0xc5, 0xc9, 0xbb, 0x5b, 0xf9, 0x2c, 0x10, 0x65, 0x6e, 0xe0, 0x83, 0xe3, 0x5e,
-                0x82, 0x3b, 0x4f, 0xcc,
+                0x74, 0x03, 0x1c, 0x77, 0xc0, 0xd4, 0xe6, 0x78, 0x91, 0x3f, 0x7a, 0x86, 0x85, 0x42,
+                0x5f, 0xea, 0x07, 0x45, 0x88, 0x51, 0xe0, 0x24, 0x64, 0x96, 0xfd, 0x31, 0x74, 0xd7,
+                0x34, 0x37, 0x93, 0x01,
             ]
         );
 

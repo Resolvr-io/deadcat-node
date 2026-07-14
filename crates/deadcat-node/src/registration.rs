@@ -8,7 +8,7 @@ use deadcat_contracts::market_crypto::derive_issuance_assets;
 use deadcat_contracts::recovery::{
     MARKET_V1_TAG, MarketCollateral, MarketRecoveryHint, OrderRecoveryHint, validate_recovery_txout,
 };
-use deadcat_contracts::rt::{commitments, creation_factors};
+use deadcat_contracts::rt::{RtLeg, RtSide, commitments, factors};
 use deadcat_rpc::ContractCandidate;
 use deadcat_types::{
     BinaryMarketParams, BinaryMarketState, ChainAnchor, ChainPosition, ContractKind,
@@ -141,7 +141,7 @@ pub fn verify_binary_market_creation(
     supplied_params: Option<BinaryMarketParams>,
 ) -> Result<VerifiedRegistration, RegistrationError> {
     let hints = market_hints(transaction, policy_asset);
-    let (params, yes_input, no_input, official_shape) = match supplied_params {
+    let (params, official_shape) = match supplied_params {
         Some(params) => {
             let yes_input = unique_defining_input(
                 transaction,
@@ -158,7 +158,7 @@ pub fn verify_binary_market_creation(
                     "YES and NO resolve to the same defining issuance".to_owned(),
                 ));
             }
-            (params, yes_input, no_input, false)
+            (params, false)
         }
         None => {
             if hints.len() != 1 {
@@ -199,19 +199,19 @@ pub fn verify_binary_market_creation(
                 base_payout: hint.base_payout,
                 expiry_height: hint.expiry_height,
             };
-            (params, yes_input, no_input, true)
+            (params, true)
         }
     };
 
     let compiled = CompiledBinaryMarket::new(params)
         .map_err(|error| RegistrationError::Compilation(error.to_string()))?;
-    let yes_outpoint = transaction.input[yes_input].previous_output;
-    let no_outpoint = transaction.input[no_input].previous_output;
-    let yes_factors = creation_factors(yes_outpoint);
-    let no_factors = creation_factors(no_outpoint);
-    let yes_commitments = commitments(params.yes_reissuance_token_id, yes_factors)
-        .map_err(|error| RegistrationError::InvalidCreation(error.to_string()))?;
-    let no_commitments = commitments(params.no_reissuance_token_id, no_factors)
+    // Canonical lineage always starts with both RT legs on side A.
+    let yes_commitments = commitments(
+        params.yes_reissuance_token_id,
+        factors(RtLeg::Yes, RtSide::A),
+    )
+    .map_err(|error| RegistrationError::InvalidCreation(error.to_string()))?;
+    let no_commitments = commitments(params.no_reissuance_token_id, factors(RtLeg::No, RtSide::A))
         .map_err(|error| RegistrationError::InvalidCreation(error.to_string()))?;
 
     let yes_output = unique_market_output(
@@ -627,7 +627,8 @@ mod tests {
     use elements::confidential::{Asset, Nonce, Value};
     use elements::hashes::Hash as _;
     use elements::{
-        AssetIssuance, BlockHash, LockTime, OutPoint, Transaction, TxIn, TxOut, TxOutWitness, Txid,
+        AssetIssuance, Block, BlockHash, LockTime, OutPoint, Script, Transaction, TxIn, TxOut,
+        TxOutWitness, Txid,
     };
 
     use super::*;
@@ -681,14 +682,12 @@ mod tests {
         let compiled = CompiledBinaryMarket::new(params).expect("compile market");
         let yes_commitments = commitments(
             params.yes_reissuance_token_id,
-            creation_factors(yes_input.previous_output),
+            factors(RtLeg::Yes, RtSide::A),
         )
         .expect("YES commitments");
-        let no_commitments = commitments(
-            params.no_reissuance_token_id,
-            creation_factors(no_input.previous_output),
-        )
-        .expect("NO commitments");
+        let no_commitments =
+            commitments(params.no_reissuance_token_id, factors(RtLeg::No, RtSide::A))
+                .expect("NO commitments");
         let hint = MarketRecoveryHint {
             oracle_public_key: params.oracle_public_key,
             collateral: MarketCollateral::PolicyAsset,
@@ -732,6 +731,65 @@ mod tests {
         (transaction, params, position, anchor(100, 0x55))
     }
 
+    struct RegistrationSource {
+        transaction: Transaction,
+        status: TransactionStatus,
+    }
+
+    #[async_trait::async_trait]
+    impl ChainSource for RegistrationSource {
+        async fn tip(&self) -> Result<ChainAnchor, ChainSourceError> {
+            unreachable!("registration reads only transaction evidence and status")
+        }
+
+        async fn block_hash(&self, _height: u32) -> Result<BlockHash, ChainSourceError> {
+            unreachable!("registration reads only transaction evidence and status")
+        }
+
+        async fn block(&self, _hash: BlockHash) -> Result<Block, ChainSourceError> {
+            unreachable!("registration reads only transaction evidence and status")
+        }
+
+        async fn transaction(&self, txid: Txid) -> Result<Transaction, ChainSourceError> {
+            assert_eq!(txid, self.transaction.txid());
+            Ok(self.transaction.clone())
+        }
+
+        async fn transaction_status(
+            &self,
+            txid: Txid,
+        ) -> Result<TransactionStatus, ChainSourceError> {
+            assert_eq!(txid, self.transaction.txid());
+            Ok(self.status)
+        }
+
+        async fn outspend(
+            &self,
+            _outpoint: DeadcatOutPoint,
+        ) -> Result<Option<crate::chain::Outspend>, ChainSourceError> {
+            unreachable!("registration reads only transaction evidence and status")
+        }
+
+        async fn script_history(&self, _script: &Script) -> Result<Vec<Txid>, ChainSourceError> {
+            unreachable!("registration reads only transaction evidence and status")
+        }
+
+        async fn issuance_transaction(
+            &self,
+            _asset_id: AssetId,
+        ) -> Result<Option<Txid>, ChainSourceError> {
+            unreachable!("registration reads only transaction evidence and status")
+        }
+
+        async fn estimate_fee_rate(&self, _target_blocks: u16) -> Result<f64, ChainSourceError> {
+            unreachable!("registration reads only transaction evidence and status")
+        }
+
+        async fn broadcast(&self, _transaction: &Transaction) -> Result<Txid, ChainSourceError> {
+            unreachable!("registration reads only transaction evidence and status")
+        }
+    }
+
     #[test]
     fn standalone_market_is_fully_recovered_from_chain_evidence() {
         let policy_asset = asset(0x99);
@@ -755,6 +813,82 @@ mod tests {
         assert_eq!(verified.associated_hint.expect("hint").output_index, 2);
     }
 
+    #[tokio::test]
+    async fn chain_verified_market_registration_is_persisted_and_idempotent() {
+        let policy_asset = asset(0x95);
+        let (transaction, expected_params, position, creation_anchor) =
+            standalone_market(policy_asset);
+        let source = RegistrationSource {
+            transaction: transaction.clone(),
+            status: TransactionStatus::Confirmed {
+                anchor: creation_anchor,
+                tx_index: position.tx_index,
+            },
+        };
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = directory.path().join("registration.redb");
+        let store = Store::open(&database).expect("open store");
+        store
+            .initialize_tip(creation_anchor)
+            .expect("initialize canonical tip");
+        let verifier = RegistrationVerifier::new(
+            &source,
+            &store,
+            LiquidNetwork::ElementsRegtest,
+            policy_asset,
+        );
+        let candidate = ContractCandidate::BinaryMarket {
+            creation_txid: transaction.txid(),
+            params: None,
+        };
+
+        let (verified, inserted) = verifier
+            .verify_and_register(candidate.clone())
+            .await
+            .expect("verify and register market");
+        assert!(inserted);
+        assert_eq!(
+            verified.record.params,
+            ContractParameters::BinaryMarket(expected_params)
+        );
+        assert_eq!(
+            store
+                .contract(verified.record.contract_id)
+                .expect("read contract")
+                .expect("persisted contract"),
+            verified.record
+        );
+        assert_eq!(
+            store.pending_backfills().expect("pending backfill").len(),
+            1
+        );
+
+        let (_, inserted) = verifier
+            .verify_and_register(candidate)
+            .await
+            .expect("idempotent registration retry");
+        assert!(!inserted);
+        drop(store);
+
+        let reopened = Store::open(&database).expect("reopen store");
+        assert_eq!(
+            reopened
+                .contract(verified.record.contract_id)
+                .expect("read reopened contract")
+                .expect("registration survived restart"),
+            verified.record
+        );
+        let evidence = reopened
+            .transaction(position)
+            .expect("read creation evidence")
+            .expect("persisted creation evidence");
+        assert_eq!(
+            elements::encode::deserialize::<Transaction>(&evidence.raw_tx)
+                .expect("decode creation evidence"),
+            transaction
+        );
+    }
+
     #[test]
     fn duplicate_deterministic_rt_output_is_ambiguous() {
         let policy_asset = asset(0x98);
@@ -770,6 +904,31 @@ mod tests {
                 Some(params),
             ),
             Err(RegistrationError::InvalidCreation(message)) if message.contains("found 2")
+        ));
+    }
+
+    #[test]
+    fn market_creation_rejects_non_a_rt_side() {
+        let policy_asset = asset(0x96);
+        let (mut transaction, params, position, anchor) = standalone_market(policy_asset);
+        let (asset, value) = commitments(
+            params.yes_reissuance_token_id,
+            factors(RtLeg::Yes, RtSide::B),
+        )
+        .expect("side-B YES commitments");
+        transaction.output[0].asset = asset;
+        transaction.output[0].value = value;
+
+        assert!(matches!(
+            verify_binary_market_creation(
+                &transaction,
+                position,
+                anchor,
+                LiquidNetwork::ElementsRegtest,
+                policy_asset,
+                Some(params),
+            ),
+            Err(RegistrationError::InvalidCreation(message)) if message.contains("found 0")
         ));
     }
 

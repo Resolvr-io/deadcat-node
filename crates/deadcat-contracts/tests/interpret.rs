@@ -10,7 +10,7 @@ use deadcat_contracts::interpret::{
     TrackedContractOutput, interpret_binary_market_spend, interpret_maker_order_spend,
 };
 use deadcat_contracts::maker_order::{CompiledMakerOrder, derived_maker_order};
-use deadcat_contracts::rt::{RtFactors, continuation_factors, subtract_mod_order};
+use deadcat_contracts::rt::{RtFactors, RtLeg, RtSide, factors};
 use deadcat_types::{
     BinaryMarketParams, BinaryMarketState, MakerOrderParams, MakerOrderState, OrderDirection,
 };
@@ -343,14 +343,6 @@ fn resolved_redemption_scenario(full: bool, decoy: bool, annex: bool) -> BinaryS
         slot: BinaryMarketSlot::ResolvedYesCollateral as u8,
         input_base: 0,
         output_base,
-        yes_input_abf: [0; 32],
-        yes_input_cbf: [0; 32],
-        no_input_abf: [0; 32],
-        no_input_cbf: [0; 32],
-        yes_burn_abf: [0; 32],
-        yes_burn_cbf: [0; 32],
-        no_burn_abf: [0; 32],
-        no_burn_cbf: [0; 32],
         oracle_outcome_yes: false,
         oracle_signature: [0; 64],
         tokens_burned: tokens,
@@ -460,22 +452,6 @@ fn interpreters_reject_tampered_designated_outputs_and_control_blocks() {
     assert!(matches!(error, InterpretError::Inconsistent(_)));
 }
 
-fn scalar(value: u8) -> [u8; 32] {
-    let mut scalar = [0_u8; 32];
-    scalar[31] = value;
-    scalar
-}
-
-fn rt_factors(abf: u8, cbf: u8) -> RtFactors {
-    let abf = scalar(abf);
-    let cbf = scalar(cbf);
-    RtFactors {
-        abf,
-        vbf: subtract_mod_order(cbf, abf),
-        cbf,
-    }
-}
-
 fn confidential_rt_txout(
     asset_id: elements::AssetId,
     factors: RtFactors,
@@ -502,16 +478,16 @@ fn confidential_rt_txout(
     }
 }
 
-fn finalized_active_expiry() -> BinaryScenario {
+fn finalized_active_expiry(side: RtSide) -> BinaryScenario {
     let params = binary_params();
     let compiled = CompiledBinaryMarket::new(params).expect("compile market");
     let before = BinaryMarketState::Trading {
         outstanding_pairs: 3,
     };
-    let yes_input = rt_factors(1, 3);
-    let no_input = rt_factors(2, 5);
-    let yes_burn = rt_factors(7, 11);
-    let no_burn = rt_factors(13, 17);
+    let yes_input = factors(RtLeg::Yes, side);
+    let no_input = factors(RtLeg::No, side);
+    let yes_burn = factors(RtLeg::Yes, side.flip());
+    let no_burn = factors(RtLeg::No, side.flip());
     let common_txid = elements::Txid::from_byte_array([0xd1; 32]);
     let yes_outpoint = OutPoint::new(common_txid, 10);
     let no_outpoint = OutPoint::new(common_txid, 11);
@@ -591,14 +567,6 @@ fn finalized_active_expiry() -> BinaryScenario {
         slot: BinaryMarketSlot::UnresolvedYesRt as u8,
         input_base: 0,
         output_base: 2,
-        yes_input_abf: yes_input.abf,
-        yes_input_cbf: yes_input.cbf,
-        no_input_abf: no_input.abf,
-        no_input_cbf: no_input.cbf,
-        yes_burn_abf: yes_burn.abf,
-        yes_burn_cbf: yes_burn.cbf,
-        no_burn_abf: no_burn.abf,
-        no_burn_cbf: no_burn.cbf,
         oracle_outcome_yes: false,
         oracle_signature: [0; 64],
         tokens_burned: 0,
@@ -635,29 +603,49 @@ fn finalized_active_expiry() -> BinaryScenario {
 
 #[test]
 fn interprets_active_expiry_and_rejects_nonconsecutive_sibling_decoy() {
-    let scenario = finalized_active_expiry();
-    let interpreted = interpret_binary_market_spend(
-        scenario.params,
-        scenario.before,
-        &scenario.live,
-        &scenario.transaction,
-    )
-    .expect("interpret active expiry");
-    assert_eq!(interpreted.path, BinaryMarketPath::ActiveExpiry);
-    assert_eq!(interpreted.output_base, 2);
-    assert_eq!(
-        interpreted.after,
-        BinaryMarketState::Expired {
-            collateral_unredeemed: 600,
-        }
-    );
-    assert_eq!(interpreted.continuations[0].output.outpoint.vout, 4);
+    for side in [RtSide::A, RtSide::B] {
+        let scenario = finalized_active_expiry(side);
+        let interpreted = interpret_binary_market_spend(
+            scenario.params,
+            scenario.before,
+            &scenario.live,
+            &scenario.transaction,
+        )
+        .unwrap_or_else(|error| panic!("interpret {side:?} expiry: {error}"));
+        assert_eq!(interpreted.path, BinaryMarketPath::ActiveExpiry);
+        assert_eq!(interpreted.output_base, 2);
+        assert_eq!(
+            interpreted.after,
+            BinaryMarketState::Expired {
+                collateral_unredeemed: 600,
+            }
+        );
+        assert_eq!(interpreted.continuations[0].output.outpoint.vout, 4);
+    }
 
-    let mut decoy = scenario.transaction;
+    let scenario = finalized_active_expiry(RtSide::A);
+
+    let mut decoy = scenario.transaction.clone();
     decoy.input[2].previous_output.vout = 13;
     assert!(
         interpret_binary_market_spend(scenario.params, scenario.before, &scenario.live, &decoy,)
             .is_err()
+    );
+
+    let mut wrong_burn = scenario.transaction.clone();
+    wrong_burn.output[2] = confidential_rt_txout(
+        scenario.params.yes_reissuance_token_id,
+        factors(RtLeg::Yes, RtSide::A),
+        bare_op_return(),
+    );
+    assert!(
+        interpret_binary_market_spend(
+            scenario.params,
+            scenario.before,
+            &scenario.live,
+            &wrong_burn,
+        )
+        .is_err()
     );
 }
 
@@ -668,8 +656,8 @@ fn interprets_partial_cancellation_when_path_equals_slot_and_bases_are_shared() 
     let before = BinaryMarketState::Trading {
         outstanding_pairs: 3,
     };
-    let yes_input = rt_factors(1, 3);
-    let no_input = rt_factors(2, 5);
+    let yes_input = factors(RtLeg::Yes, RtSide::A);
+    let no_input = factors(RtLeg::No, RtSide::A);
     let common_txid = elements::Txid::from_byte_array([0xe1; 32]);
     let yes_outpoint = OutPoint::new(common_txid, 10);
     let no_outpoint = OutPoint::new(common_txid, 11);
@@ -710,7 +698,7 @@ fn interprets_partial_cancellation_when_path_equals_slot_and_bases_are_shared() 
     }
     pset.add_output(pset_output(confidential_rt_txout(
         params.yes_reissuance_token_id,
-        continuation_factors(yes_outpoint, yes_input.cbf),
+        factors(RtLeg::Yes, RtSide::B),
         compiled
             .slot(BinaryMarketSlot::UnresolvedYesRt)
             .script_pubkey()
@@ -718,7 +706,7 @@ fn interprets_partial_cancellation_when_path_equals_slot_and_bases_are_shared() 
     )));
     pset.add_output(pset_output(confidential_rt_txout(
         params.no_reissuance_token_id,
-        continuation_factors(no_outpoint, no_input.cbf),
+        factors(RtLeg::No, RtSide::B),
         compiled
             .slot(BinaryMarketSlot::UnresolvedNoRt)
             .script_pubkey()
@@ -752,14 +740,6 @@ fn interprets_partial_cancellation_when_path_equals_slot_and_bases_are_shared() 
         slot: 2,
         input_base: 0,
         output_base: 0,
-        yes_input_abf: yes_input.abf,
-        yes_input_cbf: yes_input.cbf,
-        no_input_abf: no_input.abf,
-        no_input_cbf: no_input.cbf,
-        yes_burn_abf: [0; 32],
-        yes_burn_cbf: [0; 32],
-        no_burn_abf: [0; 32],
-        no_burn_cbf: [0; 32],
         oracle_outcome_yes: false,
         oracle_signature: [0; 64],
         tokens_burned: 0,
@@ -798,4 +778,39 @@ fn interprets_partial_cancellation_when_path_equals_slot_and_bases_are_shared() 
             outstanding_pairs: 2,
         }
     );
+
+    let mut wrong_continuation = transaction.clone();
+    wrong_continuation.output[0] = confidential_rt_txout(
+        params.yes_reissuance_token_id,
+        factors(RtLeg::Yes, RtSide::A),
+        compiled
+            .slot(BinaryMarketSlot::UnresolvedYesRt)
+            .script_pubkey()
+            .clone(),
+    );
+    assert!(interpret_binary_market_spend(params, before, &live, &wrong_continuation).is_err());
+
+    let mut mismatched_sides = live.clone();
+    mismatched_sides.no_rt.as_mut().expect("NO RT").txout = confidential_rt_txout(
+        params.no_reissuance_token_id,
+        factors(RtLeg::No, RtSide::B),
+        compiled
+            .slot(BinaryMarketSlot::UnresolvedNoRt)
+            .script_pubkey()
+            .clone(),
+    );
+    assert!(
+        interpret_binary_market_spend(params, before, &mismatched_sides, &transaction).is_err()
+    );
+
+    let mut wrong_live = live;
+    wrong_live.yes_rt.as_mut().expect("YES RT").txout = confidential_rt_txout(
+        params.yes_reissuance_token_id,
+        factors(RtLeg::No, RtSide::A),
+        compiled
+            .slot(BinaryMarketSlot::UnresolvedYesRt)
+            .script_pubkey()
+            .clone(),
+    );
+    assert!(interpret_binary_market_spend(params, before, &wrong_live, &transaction).is_err());
 }

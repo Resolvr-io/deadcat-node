@@ -5,6 +5,8 @@ pub mod maker_builder;
 pub mod market_builder;
 pub mod validation;
 
+mod simplicity;
+
 use deadcat_contracts::recovery::{OrderRecoveryHint, RecoveryError};
 use thiserror::Error;
 
