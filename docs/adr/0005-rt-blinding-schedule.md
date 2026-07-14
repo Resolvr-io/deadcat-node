@@ -1,6 +1,6 @@
 # ADR 0005: Reissuance-token blinding schedule
 
-- Status: Proposed — engineering evidence complete; human acceptance pending
+- Status: Proposed — engineering evidence and protocol-owner approval complete; focused external review pending
 - Date: 2026-07-13
 
 ## Context
@@ -48,8 +48,9 @@ balanced.
 
 This is **not yet an accepted protocol decision**. The production-shaped
 implementation and engineering evidence are complete, but that does not make
-the constants final or authorize deployment. ADR acceptance still requires a
-focused external review and explicit protocol-owner sign-off.
+the constants final or authorize deployment. Tommy Volk recorded protocol-owner
+approval on 2026-07-14 against the candidate implementation commit. ADR
+acceptance still requires the focused external review.
 
 For the committed golden test parameter set, the candidate binary-market CMR
 is:
@@ -383,10 +384,11 @@ full checklist and evidence locations live in
    generic chain-verified registration, restart, direct and coordinator-driven
    one-/two-block reorg replay, live wallet composition, and two-market atomic
    indexing pass the candidate corpus.
-6. **Pending — review and approval:** the constants, scalar byte order,
-   complementary-CBF algebra, derived commitments, CMR change, and clean
-   replacement diff must receive focused external review, after which the
-   protocol owner must explicitly sign off.
+6. **Partially complete — review and approval:** Tommy Volk approved the
+   protocol-owner checklist on 2026-07-14 against
+   `7ed20b8b81306eaf81ee49b80b4ea65b49804871`. The constants, scalar byte
+   order, complementary-CBF algebra, derived commitments, CMR change, and clean
+   replacement diff still require focused external review.
 
 ## Consequences if accepted
 
@@ -401,6 +403,5 @@ Rolling implementation and comparison-study code have been removed from the
 candidate. The hardened baseline commit, isolated-study commit, ADR, and
 machine-readable measurements remain the permanent historical reference.
 
-Until external review and explicit protocol-owner approval are recorded, this
-ADR remains Proposed and the candidate must not be described as production
-ready.
+Until focused external review is recorded, this ADR remains Proposed and the
+candidate must not be described as production ready.

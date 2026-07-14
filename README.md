@@ -35,7 +35,8 @@ The binary-market candidate now uses fixed A/B reissuance-token commitments,
 with side inferred from each raw chain output and an exact input-side
 reissuance nonce. [ADR 0005](docs/adr/0005-rt-blinding-schedule.md) remains
 Proposed while its [acceptance packet](docs/acceptance/binary-market-ab-v1.md)
-awaits focused external review and protocol-owner approval. Its exhaustive
+awaits focused external review; protocol-owner approval was recorded on
+2026-07-14. Its exhaustive
 dual-side corpus, full-market measurements, live Elements lifecycle, recovery,
 restart, and one-/two-block reorg gates are complete.
 

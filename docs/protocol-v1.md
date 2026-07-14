@@ -137,6 +137,23 @@ ignored. The covenant cannot enforce creation-time blinding because it does not
 execute until a created RT output is spent, so side-A creation is independently
 enforced by registration and client replay.
 
+Creation-transaction validation is a solvency boundary, not merely a discovery
+or indexing check. For each leg, registration and independent client replay must
+establish one unique canonical defining issuance with an explicit one-unit RT
+amount, a null initial outcome-token amount, and one exact confidential
+value-one side-A commitment locked at the compiled dormant script. Given a
+confirmed, Elements-consensus-valid creation transaction, those checks exhaust
+the RT's spendable supply: commitment balance precludes another positive RT
+output, while Elements consensus rejects both explicit zero-valued spendable
+outputs and confidential spendable outputs whose rangeproof admits zero. A
+zero-valued RT can therefore exist only at a provably unspendable output such as
+`OP_RETURN`, where it carries no reissuance authority. Without this validation,
+a creator could retain a positive RT outside the market, reissue YES or NO
+independently of the covenant, and create claims with no corresponding
+collateral. The pinned Elements consensus rules are visible in the
+[explicit-output check](https://github.com/ElementsProject/elements/blob/1af7a4d9bea93b4d7f29a77f9751a0e6e03a4390/src/confidential_validation.cpp#L320-L331)
+and [confidential rangeproof check](https://github.com/ElementsProject/elements/blob/1af7a4d9bea93b4d7f29a77f9751a0e6e03a4390/src/script/sigcache.cpp#L198-L208).
+
 ```text
 collateral_per_pair = cp = checked_mul(base_payout, 2)
 ```

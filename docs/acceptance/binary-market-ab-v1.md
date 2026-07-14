@@ -1,7 +1,8 @@
 # Binary-market A/B v1 acceptance packet
 
-- Status: Engineering candidate complete; external review and protocol-owner approval pending
+- Status: Engineering candidate complete; protocol-owner approved; focused external review pending
 - Prepared: 2026-07-13
+- Protocol-owner approval: Tommy Volk; 2026-07-14
 - Decision record: [ADR 0005](../adr/0005-rt-blinding-schedule.md)
 - Protocol specification: [Deadcat protocol v1](../protocol-v1.md)
 - Hardened rolling baseline: `ed6de4c4c8a177b4a4ba92c2bac17f55b324781f`
@@ -14,9 +15,10 @@ integration. It is not a claim that the entire Deadcat node is production
 ready; broader operational shakedowns and maker-order ownership recovery remain
 separate release work.
 
-ADR 0005 remains Proposed until a focused reviewer records a conclusion and
-the protocol owner checks the choices below. All checkboxes are intentionally
-left for humans; test success does not make a protocol choice on their behalf.
+ADR 0005 remains Proposed until a focused reviewer records a conclusion. Tommy
+Volk approved every protocol-owner choice below on 2026-07-14 against the
+candidate implementation commit. Reviewer checkboxes remain for the independent
+human review; test success does not check them automatically.
 
 ## Candidate identity
 
@@ -50,6 +52,7 @@ The CMR above is not universal across market parameters.
 | Fixed A/B algebra and complementary creation balance | Complete | Scalar/group tests plus literal golden vectors; `YES_CBF + NO_CBF = 0 mod n` |
 | Raw-output side authority | Complete | Builder, covenant, interpreter, registration, and independent replay infer from exact `(asset, value)` commitments; no side field is trusted or persisted |
 | Side-A-only creation | Complete | Builder output, node registration, and independent client replay reject side-B creation; three canonical creations mined on Elements regtest |
+| Creation authority exhaustion | Complete | Each unique defining issuance creates no initial outcome tokens and exactly one RT atom, whose exact value-one commitment is locked at its compiled dormant script; Elements consensus then precludes any additional spendable RT authority |
 | Mandatory synchronized flip/burn | Complete | SimplicityHL and Rust checks plus A→B, B→A, same-side, mixed-side, wrong-role, malformed-commitment, and terminal-burn tests |
 | Input-side reissuance nonce | Complete | Covenant/builder/interpreter adversarial tests and live A/B issuances inspect the exact nonce |
 | Every lifecycle shape | Complete | All 18 builder/BitMachine/interpreter shapes execute; every RT-consuming shape executes on both A and B, every sibling, with sufficient Simplicity budget |
@@ -64,7 +67,7 @@ The CMR above is not universal across market parameters.
 | Clean pinned-Nix CI | Passed on 2026-07-13 | `nix develop path:.#default --command just ci`; rerun after freezing nonuniform commitment vectors |
 | Independent implementation review | Complete | Plain-integer scalar arithmetic, direct C libsecp256k1-zkp commitments, and isolated pinned-compiler CMR reproduction all match |
 | Focused external human review | Pending | Reviewer record below |
-| Protocol-owner approval | Pending | Owner checklist and acceptance record below |
+| Protocol-owner approval | Complete | Tommy Volk; 2026-07-14; candidate implementation commit below |
 
 The node-level composition fixture is intentionally distinguished from mined
 multi-covenant evidence: it proves atomic orchestration of two contracts, while
@@ -162,30 +165,30 @@ witness bytes by 85.5% and eliminates required annex padding in this corpus.
 
 Acceptance means each choice below is intentional:
 
-- [ ] Every market RT is confidential and has value exactly one.
-- [ ] The four published scalars become permanent binary-market-v1 consensus
+- [x] Every market RT is confidential and has value exactly one.
+- [x] The four published scalars become permanent binary-market-v1 consensus
   constants in the stated big-endian encoding.
-- [ ] Complementary YES/NO CBFs are relied on for explicit-only canonical
+- [x] Complementary YES/NO CBFs are relied on for explicit-only canonical
   creation and locally neutral composition.
-- [ ] Canonical creation always places both RT legs on A; all live pairs must
+- [x] Canonical creation always places both RT legs on A; all live pairs must
   share one side.
-- [ ] Every continuation and terminal burn flips both legs, including full
+- [x] Every continuation and terminal burn flips both legs, including full
   cancellation back to Dormant.
-- [ ] Terminal RTs are opposite-side confidential outputs at bare `OP_RETURN`,
+- [x] Terminal RTs are opposite-side confidential outputs at bare `OP_RETURN`,
   not explicit burns.
-- [ ] Reissuance uses the inferred input-side ABF as its exact Elements nonce
+- [x] Reissuance uses the inferred input-side ABF as its exact Elements nonce
   while the continuation goes to the opposite side.
-- [ ] Raw on-chain `TxOut` commitments are authoritative; RPC, database, or
+- [x] Raw on-chain `TxOut` commitments are authoritative; RPC, database, or
   caller side metadata is never trusted as protocol state.
-- [ ] Side-specific VBFs remain necessary even though a leg's A/B value
+- [x] Side-specific VBFs remain necessary even though a leg's A/B value
   commitment is byte-identical.
-- [ ] Recovery payloads remain 38 or 70 bytes (40 or 72 complete script bytes),
+- [x] Recovery payloads remain 38 or 70 bytes (40 or 72 complete script bytes),
   with no A/B field or tag change.
-- [ ] Rolling is replaced cleanly: no compatibility path, deployed-state
+- [x] Rolling is replaced cleanly: no compatibility path, deployed-state
   migration, or redb schema-version bump.
-- [ ] The measured complexity/size trade-off is acceptable, including the
+- [x] The measured complexity/size trade-off is acceptable, including the
   documented provenance limitation on the exact rolling full-market rows.
-- [ ] The known oracle-resolution/expiry race and oracle trust model are
+- [x] The known oracle-resolution/expiry race and oracle trust model are
   unchanged by this decision.
 
 ## Focused review checklist
@@ -198,6 +201,9 @@ The external reviewer should work from the recorded implementation commit:
   vectors without using Rust `elements` commitment helpers.
 - [ ] Confirm the one-unit Pedersen algebra and that it is not generalized to
   another RT amount.
+- [ ] Confirm creation validation binds each unique defining issuance of exactly
+  one RT atom to the exact value-one side-A dormant output and, given Elements
+  consensus, thereby exhausts all spendable RT authority.
 - [ ] Confirm the covenant recognizes exactly one role-specific input side,
   synchronizes both legs, and requires the opposite continuation/burn side.
 - [ ] Confirm issuance binds the nonce to the input side for both legs.
@@ -233,16 +239,16 @@ not a substitute for the focused human review above.
 | Findings and dispositions | `<PENDING>` |
 | Reviewer conclusion | `<PENDING>` |
 
-- [ ] Clean pinned-Nix CI is recorded against the candidate commit.
+- [x] Clean pinned-Nix CI is recorded against the candidate commit.
 - [ ] Every focused-review finding has a disposition.
-- [ ] Every protocol-owner checkbox is checked.
+- [x] Every protocol-owner checkbox is checked.
 - [ ] ADR 0005 is changed from Proposed to Accepted only after those reviews.
 
 | Role | Name | Date | Commit | Decision |
 |---|---|---|---|---|
 | Implementation owner | Codex candidate | 2026-07-13 | `7ed20b8b81306eaf81ee49b80b4ea65b49804871` | Engineering-complete |
 | External reviewer | `<PENDING>` | `<PENDING>` | `<PENDING>` | `<PENDING>` |
-| Protocol owner | `<PENDING>` | `<PENDING>` | `<PENDING>` | `<PENDING>` |
+| Protocol owner | Tommy Volk | 2026-07-14 | `7ed20b8b81306eaf81ee49b80b4ea65b49804871` | Approved |
 
 ## Rolling retirement record
 
