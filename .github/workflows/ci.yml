@@ -17,4 +17,9 @@ jobs:
       - name: Check flake
         run: nix flake check --print-build-logs
       - name: Rust and contract checks
-        run: nix develop .#default --command just ci
+        run: nix develop .#default --command just ci-checks
+      - name: Live Elements protocol regtests
+        timeout-minutes: 15
+        env:
+          RUST_BACKTRACE: "1"
+        run: nix develop .#default --command just regtest

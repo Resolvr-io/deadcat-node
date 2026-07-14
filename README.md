@@ -40,10 +40,10 @@ awaits focused external review; protocol-owner approval was recorded on
 dual-side corpus, full-market measurements, live Elements lifecycle, recovery,
 restart, and one-/two-block reorg gates are complete.
 
-This is not yet a production release. Serial Elements regtest and public Liquid
-testnet shakedowns, operational backup/restore tooling, Nostr announcement
-ingestion, browser packaging of the full validator, and an external security
-review remain. The Iroh transport itself passes a `wasm32-unknown-unknown`
+This is not yet a production release. A live maker-order Elements regtest,
+public Liquid testnet shakedowns, operational backup/restore tooling, Nostr
+announcement ingestion, browser packaging of the full validator, and an external
+security review remain. The Iroh transport itself passes a `wasm32-unknown-unknown`
 compile gate; the pinned smplx 0.0.6 runtime currently pulls native regtest
 dependencies into `deadcat-client`, so that larger WASM target remains an
 upstream-integration task rather than a reason to add HTTP. LMSR is

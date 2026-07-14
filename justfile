@@ -31,10 +31,16 @@ regtest-market-ab: generate
         binary_market_ab_lifecycle_is_accepted_by_elementsd \
         -- --ignored --nocapture --test-threads=1
 
+# Every isolated live-chain protocol gate required before CI succeeds.
+regtest: regtest-market-ab
+
 wasm-check:
     NIX_HARDENING_ENABLE=pic cargo check --locked -p deadcat-iroh --lib --target wasm32-unknown-unknown
 
-ci: fmt-check clippy test wasm-check
+ci-checks: fmt-check clippy test wasm-check
+
+# Mirror the complete required CI gate locally, including live-chain tests.
+ci: ci-checks regtest
 
 node *ARGS:
     cargo run --locked -p deadcat-node -- {{ARGS}}

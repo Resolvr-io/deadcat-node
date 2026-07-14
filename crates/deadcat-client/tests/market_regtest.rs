@@ -1,7 +1,8 @@
 //! Serial, production-shaped A/B binary-market lifecycle on liquidregtest.
 //!
-//! This test is ignored by the normal workspace suite because it starts an
-//! isolated `elementsd` + Electrs pair. Run it through `just regtest-market-ab`.
+//! This test is ignored by ordinary `cargo test` because it starts an isolated
+//! `elementsd` + Electrs pair. It is required by `just ci` through the explicit
+//! `just regtest` suite and can be run alone with `just regtest-market-ab`.
 
 use bitcoincore_rpc::{Client, RpcApi};
 use deadcat_client::market_builder::{
