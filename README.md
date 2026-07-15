@@ -26,11 +26,12 @@ spread, and last fill, but no canonical continuous market price.
 
 The clean-slate v1 alpha is implemented for binary markets and maker limit
 orders. It includes the canonical `.simf` covenants, wallet-agnostic PSET
-builders, mnemonic-derived order-recovery primitives, confirmed-transaction interpreters,
-atomic redb state/history, two-block reorg undo, late-registration backfill,
-Elements RPC and Esplora chain sources, evidence queries, advisory routing,
-durable subscriptions, and bounded Iroh transport. Finalized Simplicity
-execution tests cover every market lifecycle path and both order directions.
+builders, mnemonic-derived order-recovery primitives, confirmed-transaction
+interpreters, atomic redb state/history, two-block reorg undo,
+late-registration backfill, Elements RPC and Esplora chain sources, evidence
+queries, advisory routing, durable subscriptions, and bounded Iroh transport.
+Finalized Simplicity execution tests cover every market lifecycle path and both
+order directions.
 The binary-market candidate now uses fixed A/B reissuance-token commitments,
 with side inferred from each raw chain output and an exact input-side
 reissuance nonce. [ADR 0005](docs/adr/0005-rt-blinding-schedule.md) remains
@@ -43,7 +44,12 @@ restart, and one-/two-block reorg gates are complete.
 This is not yet a production release. A live maker-order Elements regtest,
 public Liquid testnet shakedowns, operational backup/restore tooling, Nostr
 announcement ingestion, browser packaging of the full validator, and an external
-security review remain. The Iroh transport itself passes a `wasm32-unknown-unknown`
+security review remain. Public operators should currently protect package
+registration with `--registration-bearer-token` or an edge rate limiter: the
+alpha bounds package size and concurrent verification, but per-peer admission,
+a process-wide weighted evidence budget, and a stored-evidence fast path for
+identical retries are still deployment hardening work. The Iroh transport
+itself passes a `wasm32-unknown-unknown`
 compile gate; the pinned smplx 0.0.6 runtime currently pulls native regtest
 dependencies into `deadcat-client`, so that larger WASM target remains an
 upstream-integration task rather than a reason to add HTTP. LMSR is
@@ -86,8 +92,30 @@ The daemon prints its serialized Iroh endpoint address on startup and persists
 a stable endpoint secret beside the database. For a new database,
 `--baseline-height` is the canonical checkpoint immediately before the block
 range the node should scan. Elements-backed nodes report full public market
-hint coverage; Esplora-backed nodes support validated manual registration and
-report advisory discovery coverage.
+hint coverage; Esplora-backed nodes support chain-validated contract-package
+registration and report advisory discovery coverage.
+
+Contract identity and ingestion are deliberately separate. A compact
+`ContractId` is the exact creation-anchor outpoint: the initial dormant YES RT
+output for a market, or the initial covenant output for a maker order. A
+portable `ContractPackage` carries complete untrusted declarations, their
+dependency relationships, and the target network/genesis. The receiving node
+fetches canonical chain evidence, recompiles and validates every declaration,
+and registers the package atomically; the package publisher is never an
+authority for contract validity.
+
+Register a package over Iroh with the package object itself (not an RPC
+envelope):
+
+```sh
+deadcat --endpoint-id <node-endpoint-id> register --file ./package.json
+```
+
+The committed
+[`register_contract_package` wire fixture](fixtures/wire-v1/register-contract-package-request.json)
+shows the exact strict JSON shape; `package.json` is its nested `package` value.
+The CLI also accepts compact `TXID:VOUT` syntax for individual `ContractId`
+arguments, while RPC JSON always uses `{"txid":"...","vout":n}`.
 
 Start with:
 

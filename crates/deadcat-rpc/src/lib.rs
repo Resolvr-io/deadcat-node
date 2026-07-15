@@ -2,10 +2,10 @@
 
 use deadcat_types::{
     BinaryMarketParams, BinaryMarketState, ChainAnchor, ChainPosition, ContractId, ContractKind,
-    ContractSyncState, DeadcatOutPoint, DiscoveryCoverage, EventCursor, LiquidNetwork,
+    ContractPackage, ContractSyncState, DiscoveryCoverage, EventCursor, LiquidNetwork,
     MakerOrderParams, MakerOrderState, OrderDirection, OrderSide, RecoveryHintLocation,
 };
-use elements::{AssetId, BlockHash, Transaction, Txid};
+use elements::{AssetId, BlockHash, OutPoint, Transaction, Txid};
 use serde::{Deserialize, Serialize};
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -50,8 +50,8 @@ pub struct ServerEnvelope {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     GetInfo,
-    RegisterContract {
-        candidate: ContractCandidate,
+    RegisterContractPackage {
+        package: ContractPackage,
         bearer_token: Option<String>,
     },
     GetContract {
@@ -74,8 +74,7 @@ pub enum Request {
     },
     ListRecoveryHints {
         family: Option<RecoveryFamily>,
-        after: Option<RecoveryHintLocation>,
-        limit: u16,
+        page: PageRequest,
     },
     GetContractHistory {
         contract_id: ContractId,
@@ -108,21 +107,6 @@ pub enum Request {
     SubscribeEvents {
         after: Option<EventCursor>,
         filter: EventFilter,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum ContractCandidate {
-    BinaryMarket {
-        creation_txid: Txid,
-        params: Option<BinaryMarketParams>,
-    },
-    MakerOrder {
-        creation_txid: Txid,
-        parent_market: ContractId,
-        side: OrderSide,
-        params: MakerOrderParams,
     },
 }
 
@@ -160,7 +144,7 @@ pub enum Response {
         info: NodeInfo,
     },
     RegistrationAccepted {
-        registration: RegistrationReceipt,
+        registration: PackageRegistrationReceipt,
     },
     Contract {
         contract: Option<ContractView>,
@@ -246,7 +230,7 @@ pub enum Capability {
     ElementsRpc,
     Esplora,
     FullHintScan,
-    RegisterContract,
+    RegisterContractPackage,
     BroadcastSignedTransaction,
     EvidenceQueries,
     DurableSubscriptions,
@@ -263,11 +247,17 @@ pub struct RegistrationReceipt {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct PackageRegistrationReceipt {
+    pub roots: Vec<ContractId>,
+    pub contracts: Vec<RegistrationReceipt>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContractView {
     pub contract_id: ContractId,
     pub kind: ContractKind,
     pub sync_state: ContractSyncState,
-    pub creation_txid: Txid,
     pub creation_position: ChainPosition,
     pub parameters: ContractParametersView,
     pub state: ContractStateView,
@@ -288,8 +278,25 @@ pub struct PageRequest {
 pub struct SnapshotCursor {
     pub as_of: ChainAnchor,
     pub event_high_watermark: EventCursor,
+    /// Exact query and filters that produced this continuation. Servers reject
+    /// a cursor if it is replayed against a different scope.
+    pub scope: SnapshotScope,
     #[serde(with = "hex::serde")]
     pub after_key: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum SnapshotScope {
+    Markets,
+    Orders {
+        market_id: ContractId,
+        side: Option<OrderSide>,
+        direction: Option<OrderDirection>,
+    },
+    RecoveryHints {
+        family: Option<RecoveryFamily>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -325,7 +332,8 @@ pub enum ContractStateView {
 #[serde(deny_unknown_fields)]
 pub struct LiveOutpoint {
     pub role: u8,
-    pub outpoint: DeadcatOutPoint,
+    #[serde(with = "deadcat_types::serde_outpoint_object")]
+    pub outpoint: OutPoint,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -362,9 +370,9 @@ pub struct OrderBookLevel {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryHintPage {
-    pub as_of: ChainAnchor,
+    pub snapshot: SnapshotMetadata,
     pub hints: Vec<RecoveryHintRecord>,
-    pub next: Option<RecoveryHintLocation>,
+    pub next: Option<SnapshotCursor>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -581,6 +589,71 @@ pub enum RpcErrorCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deadcat_types::{
+        CONTRACT_PACKAGE_FORMAT_VERSION, ChainIdentity, ContractDeclaration, ContractDescriptor,
+    };
+    use elements::hashes::Hash as _;
+    use std::str::FromStr as _;
+
+    const PACKAGE_TXID: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+    fn package_fixture() -> ContractPackage {
+        let market_id = ContractId::new(OutPoint::new(
+            Txid::from_str(PACKAGE_TXID).expect("txid"),
+            2,
+        ));
+        let order_id = ContractId::new(OutPoint::new(
+            Txid::from_str(PACKAGE_TXID).expect("txid"),
+            9,
+        ));
+        let asset =
+            |byte: &str| AssetId::from_str(&byte.repeat(32)).expect("fixture asset identifier");
+
+        ContractPackage {
+            format_version: CONTRACT_PACKAGE_FORMAT_VERSION,
+            chain: ChainIdentity {
+                network: LiquidNetwork::ElementsRegtest,
+                genesis_hash: BlockHash::from_str(&"aa".repeat(32)).expect("genesis hash"),
+            },
+            roots: vec![order_id],
+            // Dependency order is intentionally reversed. The wire contract
+            // preserves declaration order even though verification topologically
+            // evaluates the market before its order.
+            declarations: vec![
+                ContractDeclaration {
+                    contract_id: order_id,
+                    descriptor: ContractDescriptor::MakerOrderV1 {
+                        parent_market: market_id,
+                        side: OrderSide::Yes,
+                        params: MakerOrderParams {
+                            base_asset_id: asset("22"),
+                            quote_asset_id: asset("11"),
+                            price: 2_500,
+                            min_active_base: 10,
+                            direction: OrderDirection::SellQuote,
+                            maker_receive_spk_hash: [0x66; 32],
+                            maker_pubkey: [0x77; 32],
+                        },
+                    },
+                },
+                ContractDeclaration {
+                    contract_id: market_id,
+                    descriptor: ContractDescriptor::BinaryMarketV1 {
+                        params: BinaryMarketParams {
+                            oracle_public_key: [0x02; 32],
+                            collateral_asset_id: asset("11"),
+                            yes_token_asset_id: asset("22"),
+                            no_token_asset_id: asset("33"),
+                            yes_reissuance_token_id: asset("44"),
+                            no_reissuance_token_id: asset("55"),
+                            base_payout: 100_000_000,
+                            expiry_height: 1_234,
+                        },
+                    },
+                },
+            ],
+        }
+    }
 
     #[test]
     fn request_ids_are_decimal_strings() {
@@ -612,6 +685,182 @@ mod tests {
     }
 
     #[test]
+    fn register_package_request_matches_committed_fixture() {
+        let envelope = RequestEnvelope {
+            schema_version: SCHEMA_VERSION,
+            request_id: RequestId(7),
+            request: Request::RegisterContractPackage {
+                package: package_fixture(),
+                bearer_token: None,
+            },
+        };
+        let json = serde_json::to_string(&envelope).expect("serialize");
+        assert_eq!(
+            json,
+            include_str!("../../../fixtures/wire-v1/register-contract-package-request.json").trim()
+        );
+        assert_eq!(
+            serde_json::from_str::<RequestEnvelope>(&json).expect("deserialize"),
+            envelope
+        );
+    }
+
+    #[test]
+    fn registration_receipt_matches_committed_fixture_and_preserves_order() {
+        let package = package_fixture();
+        let synced_through = ChainAnchor {
+            height: 321,
+            hash: BlockHash::from_str(&"bb".repeat(32)).expect("block hash"),
+        };
+        let envelope = ServerEnvelope {
+            schema_version: SCHEMA_VERSION,
+            request_id: RequestId(7),
+            frame: ServerFrame::Unary {
+                outcome: RpcOutcome::Success {
+                    value: Response::RegistrationAccepted {
+                        registration: PackageRegistrationReceipt {
+                            roots: package.roots.clone(),
+                            contracts: vec![
+                                RegistrationReceipt {
+                                    contract_id: package.declarations[0].contract_id,
+                                    sync_state: ContractSyncState::CatchingUp { synced_through },
+                                    already_registered: false,
+                                },
+                                RegistrationReceipt {
+                                    contract_id: package.declarations[1].contract_id,
+                                    sync_state: ContractSyncState::CatchingUp { synced_through },
+                                    already_registered: false,
+                                },
+                            ],
+                        },
+                    },
+                },
+            },
+        };
+        let json = serde_json::to_string(&envelope).expect("serialize");
+        assert_eq!(
+            json,
+            include_str!("../../../fixtures/wire-v1/register-contract-package-receipt.json").trim()
+        );
+        assert_eq!(
+            serde_json::from_str::<ServerEnvelope>(&json).expect("deserialize"),
+            envelope
+        );
+    }
+
+    #[test]
+    fn recovery_hint_page_request_matches_committed_fixture() {
+        let envelope = RequestEnvelope {
+            schema_version: SCHEMA_VERSION,
+            request_id: RequestId(8),
+            request: Request::ListRecoveryHints {
+                family: Some(RecoveryFamily::MakerOrderV1),
+                page: PageRequest {
+                    cursor: None,
+                    limit: 2,
+                },
+            },
+        };
+        let json = serde_json::to_string(&envelope).expect("serialize");
+        assert_eq!(
+            json,
+            include_str!("../../../fixtures/wire-v1/list-recovery-hints-request.json").trim()
+        );
+        assert_eq!(
+            serde_json::from_str::<RequestEnvelope>(&json).expect("deserialize"),
+            envelope
+        );
+    }
+
+    #[test]
+    fn recovery_hint_page_response_binds_next_cursor_to_snapshot_and_scope() {
+        let as_of = ChainAnchor {
+            height: 42,
+            hash: BlockHash::from_str(&"bb".repeat(32)).expect("block hash"),
+        };
+        let event_high_watermark = EventCursor {
+            epoch: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            sequence: 9,
+        };
+        let snapshot = SnapshotMetadata {
+            as_of,
+            event_high_watermark,
+        };
+        let contract_id = ContractId::new(OutPoint::new(
+            Txid::from_str(PACKAGE_TXID).expect("txid"),
+            9,
+        ));
+        let location = RecoveryHintLocation {
+            position: ChainPosition {
+                block_height: 42,
+                tx_index: 3,
+            },
+            output_index: 4,
+        };
+        let mut payload = vec![0x40, 0x00, 0x01];
+        payload.extend_from_slice(&contract_id.txid().to_byte_array());
+        payload.extend_from_slice(&2_500_u32.to_be_bytes());
+        payload.extend_from_slice(&10_u32.to_be_bytes());
+        assert_eq!(payload.len(), 43);
+        let envelope = ServerEnvelope {
+            schema_version: SCHEMA_VERSION,
+            request_id: RequestId(8),
+            frame: ServerFrame::Unary {
+                outcome: RpcOutcome::Success {
+                    value: Response::RecoveryHints {
+                        page: RecoveryHintPage {
+                            snapshot,
+                            hints: vec![RecoveryHintRecord {
+                                location,
+                                creation_txid: contract_id.txid(),
+                                family: RecoveryFamily::MakerOrderV1,
+                                payload,
+                                associated_contract: None,
+                            }],
+                            next: Some(SnapshotCursor {
+                                as_of,
+                                event_high_watermark,
+                                scope: SnapshotScope::RecoveryHints {
+                                    family: Some(RecoveryFamily::MakerOrderV1),
+                                },
+                                after_key: vec![0, 0, 0, 42, 0, 0, 0, 3, 0, 0, 0, 4],
+                            }),
+                        },
+                    },
+                },
+            },
+        };
+        let json = serde_json::to_string(&envelope).expect("serialize");
+        assert_eq!(
+            json,
+            include_str!("../../../fixtures/wire-v1/list-recovery-hints-response.json").trim()
+        );
+        assert_eq!(
+            serde_json::from_str::<ServerEnvelope>(&json).expect("deserialize"),
+            envelope
+        );
+    }
+
+    #[test]
+    fn nested_package_unknown_fields_are_rejected() {
+        let envelope = RequestEnvelope {
+            schema_version: SCHEMA_VERSION,
+            request_id: RequestId(7),
+            request: Request::RegisterContractPackage {
+                package: package_fixture(),
+                bearer_token: None,
+            },
+        };
+        let mut json = serde_json::to_value(envelope).expect("serialize");
+        json["request"]["register_contract_package"]["package"]["declarations"][1]
+            ["descriptor"]["binary_market_v1"]["params"]
+            .as_object_mut()
+            .expect("params object")
+            .insert("surprise".to_owned(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<RequestEnvelope>(json).is_err());
+    }
+
+    #[test]
     fn unknown_fields_are_rejected() {
         let json = r#"{
             "schema_version":1,
@@ -635,6 +884,25 @@ mod tests {
                 RpcErrorCode::UnsupportedVersion,
                 "unsupported RPC schema 2; expected 1"
             )
+        );
+    }
+
+    #[test]
+    fn live_outpoints_keep_strict_object_json_while_using_elements_type() {
+        let outpoint = OutPoint::new(Txid::from_byte_array([0x22; 32]), 3);
+        let live = LiveOutpoint { role: 7, outpoint };
+        let json = serde_json::to_value(live).expect("serialize");
+        assert_eq!(json["outpoint"]["txid"], outpoint.txid.to_string());
+        assert_eq!(json["outpoint"]["vout"], 3);
+        assert_eq!(
+            serde_json::from_value::<LiveOutpoint>(json).expect("deserialize"),
+            live
+        );
+        assert!(
+            serde_json::from_str::<LiveOutpoint>(&format!(
+                r#"{{"role":7,"outpoint":"{outpoint}"}}"#
+            ))
+            .is_err()
         );
     }
 }

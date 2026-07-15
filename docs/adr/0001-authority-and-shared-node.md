@@ -28,7 +28,7 @@ designed as though the operator may be remote and untrusted.
 
 The node:
 
-- discovers and registers candidate contracts;
+- discovers contract hints and verifies untrusted declaration packages;
 - verifies canonical parameters against raw creation transactions;
 - follows confirmed chain state;
 - stores current state and ordered transition evidence;
@@ -91,10 +91,14 @@ compliance suite.
 
 ## Discovery and transport
 
-Manual registration and read-only Nostr ingestion supply candidate parameters
-and creation-transaction references. Neither is authoritative. The node fetches
-the chain data, compiles the canonical contract version, and compares the
-resulting scripts before tracking it.
+Manual registration and read-only Nostr ingestion supply chain-bound
+`ContractPackage` values: requested roots plus complete public declarations and
+their parent dependencies. Neither source is authoritative. A `ContractId` is
+only the exact creation-anchor outpoint, while its declaration supplies the
+claimed contract semantics. The node fetches canonical creation data from its
+own chain source, compiles each canonical contract version, verifies the exact
+anchor and creation invariant, and registers the whole package atomically only
+after every declaration succeeds.
 
 Iroh is the only v1 application transport. It uses a versioned ALPN, bounded
 length-delimited messages, a stable server identity, connection and stream

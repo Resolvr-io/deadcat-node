@@ -7,10 +7,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use deadcat_types::{ChainAnchor, DeadcatOutPoint};
+use deadcat_types::ChainAnchor;
 use elements::encode::{deserialize, serialize};
 use elements::hashes::{Hash, sha256};
-use elements::{AssetId, Block, BlockHash, Script, Transaction, Txid};
+use elements::{AssetId, Block, BlockHash, OutPoint, Script, Transaction, Txid};
 use reqwest::{Method, RequestBuilder, StatusCode, Url};
 use serde::Deserialize;
 
@@ -326,10 +326,7 @@ impl ChainSource for EsploraChainSource {
         self.canonical_status(txid, &status).await
     }
 
-    async fn outspend(
-        &self,
-        outpoint: DeadcatOutPoint,
-    ) -> Result<Option<Outspend>, ChainSourceError> {
+    async fn outspend(&self, outpoint: OutPoint) -> Result<Option<Outspend>, ChainSourceError> {
         let body = self
             .get(&format!("tx/{}/outspend/{}", outpoint.txid, outpoint.vout))
             .await?;

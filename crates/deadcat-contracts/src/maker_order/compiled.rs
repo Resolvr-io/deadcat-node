@@ -1,9 +1,8 @@
 //! Validation-first compilation of the canonical maker-order covenant.
 
-use deadcat_types::ContractId;
+use elements::Script;
 use elements::secp256k1_zkp::{Secp256k1, XOnlyPublicKey};
 use elements::taproot::{ControlBlock, TaprootBuilder, TaprootBuilderError};
-use elements::{Script, Txid};
 use simplex::program::ArgumentsTrait as _;
 use simplex::simplicityhl::CompiledProgram;
 use simplex::simplicityhl::simplicity::{HasCmr as _, leaf_version};
@@ -69,14 +68,6 @@ impl CompiledMakerOrder {
     }
 
     #[must_use]
-    pub const fn contract_id(&self, creation_txid: Txid) -> ContractId {
-        ContractId {
-            cmr: self.cmr,
-            creation_txid,
-        }
-    }
-
-    #[must_use]
     pub fn script_pubkey(&self) -> &Script {
         &self.script_pubkey
     }
@@ -122,9 +113,8 @@ fn contract_arguments(params: MakerOrderParams) -> derived_maker_order::MakerOrd
 
 #[cfg(test)]
 mod tests {
-    use elements::hashes::Hash as _;
+    use elements::AssetId;
     use elements::schnorr::TweakedPublicKey;
-    use elements::{AssetId, Txid};
     use simplex::provider::SimplicityNetwork;
 
     use super::*;
@@ -175,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn params_map_exactly_and_identity_is_deterministic() {
+    fn params_map_exactly_and_compilation_is_deterministic() {
         let params = params();
         let first = CompiledMakerOrder::new(params).expect("compile");
         let second = CompiledMakerOrder::new(params).expect("compile");
@@ -194,15 +184,6 @@ mod tests {
         );
         assert_eq!(first.arguments.price, params.price);
         assert!(first.arguments.direction_sell_quote);
-
-        let creation_txid = Txid::from_byte_array([0x77; 32]);
-        assert_eq!(
-            first.contract_id(creation_txid),
-            ContractId {
-                cmr: first.cmr(),
-                creation_txid,
-            }
-        );
     }
 
     #[test]

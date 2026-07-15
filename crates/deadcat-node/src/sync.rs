@@ -8,7 +8,9 @@ use std::collections::HashSet;
 use std::error::Error as StdError;
 
 use deadcat_rpc::{RecoveryFamily, SyncStatus};
-use deadcat_types::{ChainAnchor, ChainPosition, ContractId, RecoveryHintLocation};
+use deadcat_types::{
+    ChainAnchor, ChainPosition, ContractDeclaration, ContractId, RecoveryHintLocation,
+};
 use elements::hashes::{Hash as _, HashEngine as _, sha256d};
 use elements::{Block, BlockHash, Transaction, TxMerkleNode};
 use thiserror::Error;
@@ -51,6 +53,10 @@ pub struct InterpretationContext<'a> {
     /// is the authoritative view for same-block creations and spends that are
     /// not visible in redb until the complete block commits.
     pub prior_transactions: &'a [ChainTxDelta],
+    /// Explicit watch declarations whose creation IDs share the transaction
+    /// currently being interpreted. Canonical block coordination prefetches
+    /// these once per block; backfill and advisory interpretation pass none.
+    pub retained_declarations: &'a [ContractDeclaration],
     pub mode: InterpretationMode<'a>,
 }
 
@@ -398,6 +404,15 @@ where
     fn interpret_canonical_block(&self, fetched: &FetchedBlock) -> Result<BlockDelta, SyncError> {
         let mut relevant_transactions = Vec::new();
         let mut recovery_hints = Vec::new();
+        let ordered_txids = fetched
+            .block
+            .txdata
+            .iter()
+            .map(Transaction::txid)
+            .collect::<Vec<_>>();
+        let retained = self
+            .store
+            .retained_declarations_for_transactions(&ordered_txids)?;
         for (tx_index, transaction) in fetched.block.txdata.iter().enumerate() {
             let position = ChainPosition {
                 block_height: fetched.anchor.height,
@@ -408,6 +423,9 @@ where
                 anchor: fetched.anchor,
                 position,
                 prior_transactions: &relevant_transactions,
+                retained_declarations: retained
+                    .get(&ordered_txids[tx_index])
+                    .map_or(&[], Vec::as_slice),
                 mode: InterpretationMode::Canonical,
             };
             let interpreted = self
@@ -428,7 +446,7 @@ where
         Ok(BlockDelta {
             anchor: fetched.anchor,
             prev_block_hash: fetched.block.header.prev_blockhash,
-            ordered_txids: fetched.block.txdata.iter().map(Transaction::txid).collect(),
+            ordered_txids,
             relevant_transactions,
             recovery_hints,
         })
@@ -459,6 +477,7 @@ where
                 anchor: fetched.anchor,
                 position,
                 prior_transactions: &relevant_transactions,
+                retained_declarations: &[],
                 mode: InterpretationMode::Backfill {
                     contract_ids: &active,
                 },
@@ -666,9 +685,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use deadcat_types::{
-        BinaryMarketParams, BinaryMarketState, ContractKind, ContractSyncState, DeadcatOutPoint,
-    };
+    use deadcat_types::{BinaryMarketParams, BinaryMarketState, ContractKind, ContractSyncState};
     use elements::hashes::Hash as _;
     use elements::{
         AssetId, BlockExtData, BlockHeader, LockTime, OutPoint, Script, TxIn, TxOut, Txid,
@@ -785,15 +802,12 @@ mod tests {
             Err(ChainSourceError::NotFound(txid.to_string()))
         }
 
-        async fn outspend(
-            &self,
-            outpoint: DeadcatOutPoint,
-        ) -> Result<Option<Outspend>, ChainSourceError> {
+        async fn outspend(&self, outpoint: OutPoint) -> Result<Option<Outspend>, ChainSourceError> {
             let state = self.state.lock().expect("chain lock");
             for (height, block) in &state.blocks {
                 for (tx_index, transaction) in block.txdata.iter().enumerate() {
                     for (input_index, input) in transaction.input.iter().enumerate() {
-                        if DeadcatOutPoint::from(input.previous_output) == outpoint {
+                        if input.previous_output == outpoint {
                             return Ok(Some(Outspend {
                                 spending_txid: transaction.txid(),
                                 input_index: u32::try_from(input_index).map_err(|_| {
@@ -910,7 +924,7 @@ mod tests {
                         transaction.input.first().and_then(|input| {
                             context
                                 .store
-                                .outpoint_owner(input.previous_output.into())
+                                .outpoint_owner(input.previous_output)
                                 .ok()
                                 .flatten()
                                 .and_then(|owner| context.store.contract(owner.contract_id).ok())
@@ -940,7 +954,7 @@ mod tests {
     async fn catches_up_in_chain_order_scans_hints_and_restart_is_idempotent() {
         let block0 = test_block(0, BlockHash::all_zeros(), 1, vec![transaction(1, &[])]);
         let create = transaction(100, &[]);
-        let spend = transaction(101, &[DeadcatOutPoint::new(create.txid(), 0)]);
+        let spend = transaction(101, &[OutPoint::new(create.txid(), 0)]);
         let block1 = test_block(
             1,
             block0.block_hash(),
@@ -1115,7 +1129,7 @@ mod tests {
     async fn late_registration_replays_same_block_spend_and_resumes_after_reopen() {
         let block0 = test_block(0, BlockHash::all_zeros(), 70, vec![transaction(1, &[])]);
         let create = transaction(100, &[]);
-        let spend = transaction(101, &[DeadcatOutPoint::new(create.txid(), 0)]);
+        let spend = transaction(101, &[OutPoint::new(create.txid(), 0)]);
         let block1 = test_block(
             1,
             block0.block_hash(),
@@ -1154,7 +1168,8 @@ mod tests {
                 &registered,
                 &RegistrationEvidence {
                     anchor: block_anchor(&block1),
-                    transaction: create,
+                    transaction: Arc::new(create),
+                    associated_hint: None,
                 },
             )
             .expect("register");
@@ -1234,7 +1249,7 @@ mod tests {
             )]
         );
 
-        let spend_again = transaction(101, &[DeadcatOutPoint::new(spend.txid(), 0)]);
+        let spend_again = transaction(101, &[OutPoint::new(spend.txid(), 0)]);
         let replacement2 = test_block(2, block1.block_hash(), 82, vec![spend_again]);
         source.replace(vec![block0, block1, replacement2.clone()]);
         let replacement_interpreter = ReferenceInterpreter::default();
@@ -1307,14 +1322,14 @@ mod tests {
         AssetId::from_slice(&[byte; 32]).expect("asset")
     }
 
-    fn transaction(tag: u32, inputs: &[DeadcatOutPoint]) -> Transaction {
+    fn transaction(tag: u32, inputs: &[OutPoint]) -> Transaction {
         Transaction {
             version: 2,
             lock_time: LockTime::from_consensus(tag),
             input: inputs
                 .iter()
                 .map(|outpoint| TxIn {
-                    previous_output: OutPoint::from(*outpoint),
+                    previous_output: *outpoint,
                     ..TxIn::default()
                 })
                 .collect(),
@@ -1330,10 +1345,7 @@ mod tests {
     ) -> ContractRecord {
         let marker = 0x44;
         ContractRecord {
-            contract_id: ContractId {
-                cmr: [marker; 32],
-                creation_txid: txid,
-            },
+            contract_id: ContractId::new(OutPoint::new(txid, 0)),
             kind: ContractKind::BinaryMarketV1,
             params: ContractParameters::BinaryMarket(BinaryMarketParams {
                 oracle_public_key: [0x45; 32],
@@ -1363,7 +1375,7 @@ mod tests {
             }],
             outpoints: vec![TrackedOutpoint {
                 role: 0,
-                outpoint: DeadcatOutPoint::new(txid, 0),
+                outpoint: OutPoint::new(txid, 0),
             }],
             order_book: None,
         }
@@ -1387,7 +1399,7 @@ mod tests {
                 .collect(),
             new_outpoints: vec![TrackedOutpoint {
                 role: 0,
-                outpoint: DeadcatOutPoint::new(spending_txid, 0),
+                outpoint: OutPoint::new(spending_txid, 0),
             }],
             order_remaining_base: None,
             transition: TransitionRecord {

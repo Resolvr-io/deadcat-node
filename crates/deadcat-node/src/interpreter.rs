@@ -6,6 +6,7 @@
 //! touching several contracts produces one atomic batch or no batch at all.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use deadcat_contracts::binary_market::{BinaryMarketSlot, BinaryMarketTransition, BinaryOutcome};
 use deadcat_contracts::interpret::{
@@ -14,13 +15,15 @@ use deadcat_contracts::interpret::{
 };
 use deadcat_rpc::RecoveryFamily;
 use deadcat_types::{
-    ContractId, ContractKind, ContractSyncState, DeadcatOutPoint, LiquidNetwork, MakerOrderState,
+    ContractDescriptor, ContractId, ContractKind, ContractSyncState, LiquidNetwork, MakerOrderState,
 };
-use elements::{AssetId, Transaction};
+use elements::{AssetId, OutPoint, Transaction};
 use thiserror::Error;
 
 use crate::discovery::scan_transaction_hints;
-use crate::registration::verify_binary_market_creation;
+use crate::registration::{
+    verify_binary_market_creation_shared, verify_maker_order_creation_shared,
+};
 use crate::store::{
     ContractParameters, ContractRecord, ContractState, OutpointOwner, StateUpdate, StoreError,
     TrackedOutpoint, TransitionRecord,
@@ -95,19 +98,65 @@ impl ChainInterpreter for DeadcatInterpreter {
                 })
                 .collect();
 
-            // A valid hint is merely a candidate. Only the fixed standalone
-            // creation shape is globally discoverable; composed creations
-            // continue to require explicit registration parameters.
-            if result
+            let retained = context.retained_declarations;
+            let has_market_hint = result
                 .recovery_hints
                 .iter()
-                .any(|hint| hint.family == RecoveryFamily::BinaryMarketV1)
-                && let Ok(mut verified) = verify_binary_market_creation(
-                    transaction,
+                .any(|hint| hint.family == RecoveryFamily::BinaryMarketV1);
+            let shared_transaction =
+                (!retained.is_empty() || has_market_hint).then(|| Arc::new(transaction.clone()));
+
+            // Explicit declarations are durable watch intent, not authority.
+            // Recompile every retained market against this exact canonical
+            // transaction before considering any retained child orders.
+            for declaration in retained.iter().filter(|declaration| {
+                matches!(
+                    declaration.descriptor,
+                    ContractDescriptor::BinaryMarketV1 { .. }
+                )
+            }) {
+                let ContractDescriptor::BinaryMarketV1 { params } = declaration.descriptor else {
+                    unreachable!("filtered to market declarations")
+                };
+                if let Ok(mut verified) = verify_binary_market_creation_shared(
+                    Arc::clone(
+                        shared_transaction
+                            .as_ref()
+                            .expect("retained declarations allocate shared transaction evidence"),
+                    ),
                     context.position,
                     context.anchor,
                     self.network,
                     self.policy_asset,
+                    Some(params),
+                    Some(declaration.contract_id),
+                ) {
+                    verified.record.sync_state = ContractSyncState::Ready {
+                        synced_through: context.anchor,
+                    };
+                    retain_canonical_creation(
+                        context,
+                        &mut result.created_contracts,
+                        verified.record,
+                    )?;
+                }
+            }
+
+            // A valid hint is merely a candidate. Only the fixed standalone
+            // creation shape is globally discoverable; composed creations
+            // continue to require explicit registration parameters.
+            if has_market_hint
+                && let Ok(mut verified) = verify_binary_market_creation_shared(
+                    Arc::clone(
+                        shared_transaction
+                            .as_ref()
+                            .expect("market hints allocate shared transaction evidence"),
+                    ),
+                    context.position,
+                    context.anchor,
+                    self.network,
+                    self.policy_asset,
+                    None,
                     None,
                 )
             {
@@ -115,17 +164,7 @@ impl ChainInterpreter for DeadcatInterpreter {
                     synced_through: context.anchor,
                 };
                 let contract_id = verified.record.contract_id;
-                match contract_in_context(context, contract_id)? {
-                    Some(existing) => {
-                        if existing.kind != verified.record.kind
-                            || existing.params != verified.record.params
-                            || existing.creation_position != verified.record.creation_position
-                        {
-                            return Err(NodeInterpretError::DiscoveryConflict(contract_id));
-                        }
-                    }
-                    None => result.created_contracts.push(verified.record),
-                }
+                retain_canonical_creation(context, &mut result.created_contracts, verified.record)?;
                 if let Some(location) = verified.associated_hint {
                     let hint = result
                         .recovery_hints
@@ -133,6 +172,62 @@ impl ChainInterpreter for DeadcatInterpreter {
                         .find(|hint| hint.output_index == location.output_index)
                         .ok_or(NodeInterpretError::MissingAssociatedHint)?;
                     hint.associated_contract = Some(contract_id);
+                }
+            }
+
+            // A maker hint is deliberately insufficient for public discovery.
+            // Retained declarations provide the missing semantics, but remain
+            // dormant if their parent or exact canonical output no longer
+            // validates on this branch.
+            for declaration in retained.iter().filter(|declaration| {
+                matches!(
+                    declaration.descriptor,
+                    ContractDescriptor::MakerOrderV1 { .. }
+                )
+            }) {
+                let ContractDescriptor::MakerOrderV1 {
+                    parent_market,
+                    side,
+                    params,
+                } = declaration.descriptor
+                else {
+                    unreachable!("filtered to maker declarations")
+                };
+                let same_transaction_parent = result
+                    .created_contracts
+                    .iter()
+                    .find(|record| record.contract_id == parent_market);
+                let stored_parent;
+                let parent = if let Some(parent) = same_transaction_parent {
+                    parent
+                } else {
+                    let Some(parent) = contract_in_context(context, parent_market)? else {
+                        continue;
+                    };
+                    stored_parent = parent;
+                    &stored_parent
+                };
+                if let Ok(mut verified) = verify_maker_order_creation_shared(
+                    Arc::clone(
+                        shared_transaction
+                            .as_ref()
+                            .expect("retained declarations allocate shared transaction evidence"),
+                    ),
+                    context.position,
+                    context.anchor,
+                    declaration.contract_id,
+                    parent,
+                    side,
+                    params,
+                ) {
+                    verified.record.sync_state = ContractSyncState::Ready {
+                        synced_through: context.anchor,
+                    };
+                    retain_canonical_creation(
+                        context,
+                        &mut result.created_contracts,
+                        verified.record,
+                    )?;
                 }
             }
         }
@@ -145,11 +240,11 @@ impl ChainInterpreter for DeadcatInterpreter {
         };
         let mut touched = Vec::new();
         for input in &transaction.input {
-            match owner_in_context(context, input.previous_output.into())? {
+            match owner_in_context(context, input.previous_output)? {
                 OwnerResolution::Untracked => {}
                 OwnerResolution::SpentEarlier(contract_id) => {
                     return Err(NodeInterpretError::SameBlockDoubleSpend {
-                        outpoint: input.previous_output.into(),
+                        outpoint: input.previous_output,
                         contract_id,
                     });
                 }
@@ -176,6 +271,41 @@ impl ChainInterpreter for DeadcatInterpreter {
         validate_atomic_claims(&result)?;
         Ok(result)
     }
+}
+
+fn retain_canonical_creation(
+    context: &InterpretationContext<'_>,
+    created: &mut Vec<ContractRecord>,
+    candidate: ContractRecord,
+) -> Result<(), NodeInterpretError> {
+    let current_transaction = created
+        .iter()
+        .find(|record| record.contract_id == candidate.contract_id);
+    if let Some(existing) = current_transaction {
+        return ensure_creation_identity(existing, &candidate);
+    }
+    if let Some(existing) = contract_in_context(context, candidate.contract_id)? {
+        return ensure_creation_identity(&existing, &candidate);
+    }
+    created.push(candidate);
+    Ok(())
+}
+
+fn ensure_creation_identity(
+    existing: &ContractRecord,
+    candidate: &ContractRecord,
+) -> Result<(), NodeInterpretError> {
+    if existing.kind != candidate.kind
+        || existing.params != candidate.params
+        || existing.creation_position != candidate.creation_position
+        || existing.parent_market != candidate.parent_market
+        || existing.outcome_side != candidate.outcome_side
+        || existing.scripts != candidate.scripts
+        || existing.assets != candidate.assets
+    {
+        return Err(NodeInterpretError::DiscoveryConflict(candidate.contract_id));
+    }
+    Ok(())
 }
 
 fn validate_atomic_claims(
@@ -224,19 +354,14 @@ fn interpret_contract(
         ) => {
             let live = materialize_market_outputs(context, record)?;
             let interpreted = interpret_binary_market_spend(*params, before, &live, transaction)?;
-            let spent_outpoints = interpreted
-                .spent_outpoints
-                .iter()
-                .copied()
-                .map(DeadcatOutPoint::from)
-                .collect::<Vec<_>>();
+            let spent_outpoints = interpreted.spent_outpoints.to_vec();
             ensure_complete_spend(record, &spent_outpoints)?;
             let new_outpoints = interpreted
                 .continuations
                 .iter()
                 .map(|continuation| TrackedOutpoint {
                     role: continuation.slot as u8,
-                    outpoint: continuation.output.outpoint.into(),
+                    outpoint: continuation.output.outpoint,
                 })
                 .collect();
             Ok(StateUpdate {
@@ -256,7 +381,7 @@ fn interpret_contract(
         ) => {
             let live = materialize_maker_output(context, record)?;
             let interpreted = interpret_maker_order_spend(*params, before, &live, transaction)?;
-            let spent_outpoints = vec![DeadcatOutPoint::from(interpreted.spent_outpoint)];
+            let spent_outpoints = vec![interpreted.spent_outpoint];
             ensure_complete_spend(record, &spent_outpoints)?;
             let new_outpoints = interpreted
                 .continuation
@@ -264,7 +389,7 @@ fn interpret_contract(
                 .map(|continuation| {
                     vec![TrackedOutpoint {
                         role: 0,
-                        outpoint: continuation.outpoint.into(),
+                        outpoint: continuation.outpoint,
                     }]
                 })
                 .unwrap_or_default();
@@ -356,7 +481,7 @@ fn materialize_output(
             .cloned()
             .ok_or(NodeInterpretError::MissingOutput(tracked.outpoint))?;
         return Ok(TrackedContractOutput {
-            outpoint: tracked.outpoint.into(),
+            outpoint: tracked.outpoint,
             txout,
         });
     }
@@ -365,14 +490,14 @@ fn materialize_output(
         .output(tracked.outpoint)?
         .ok_or(NodeInterpretError::MissingOutput(tracked.outpoint))?;
     Ok(TrackedContractOutput {
-        outpoint: stored.outpoint.into(),
+        outpoint: stored.outpoint,
         txout: stored.output,
     })
 }
 
 fn owner_in_context(
     context: &InterpretationContext<'_>,
-    outpoint: DeadcatOutPoint,
+    outpoint: OutPoint,
 ) -> Result<OwnerResolution, NodeInterpretError> {
     for delta in context.prior_transactions.iter().rev() {
         for update in delta.state_updates.iter().rev() {
@@ -466,7 +591,7 @@ fn contract_in_context(
 
 fn ensure_complete_spend(
     record: &ContractRecord,
-    spent: &[DeadcatOutPoint],
+    spent: &[OutPoint],
 ) -> Result<(), NodeInterpretError> {
     let expected = record
         .outpoints
@@ -584,7 +709,7 @@ pub enum NodeInterpretError {
     #[error("tracked contract {0:?} is missing")]
     MissingContract(ContractId),
     #[error("tracked output {0:?} cannot be materialized from canonical evidence")]
-    MissingOutput(DeadcatOutPoint),
+    MissingOutput(OutPoint),
     #[error("tracked contract {0:?} has an invalid live-output set")]
     InvalidLiveSet(ContractId),
     #[error("tracked contract {0:?} has inconsistent kind, parameters, and state")]
@@ -599,7 +724,7 @@ pub enum NodeInterpretError {
         "tracked output {outpoint:?} for {contract_id:?} was already spent earlier in the block"
     )]
     SameBlockDoubleSpend {
-        outpoint: DeadcatOutPoint,
+        outpoint: OutPoint,
         contract_id: ContractId,
     },
     #[error("automatic discovery conflicts with stored contract {0:?}")]

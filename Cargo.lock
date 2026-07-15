@@ -887,6 +887,7 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -897,6 +898,7 @@ dependencies = [
  "bip39",
  "bitcoincore-rpc",
  "deadcat-contracts",
+ "deadcat-node",
  "deadcat-rpc",
  "deadcat-types",
  "elements",
@@ -907,7 +909,9 @@ dependencies = [
  "sha2 0.10.9",
  "smplx-regtest",
  "smplx-std",
+ "tempfile",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

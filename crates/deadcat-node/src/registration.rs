@@ -1,23 +1,26 @@
 //! Evidence-first contract registration and creation-transaction verification.
 
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::str::FromStr as _;
+use std::sync::Arc;
 
 use deadcat_contracts::binary_market::{BinaryMarketSlot, CompiledBinaryMarket};
 use deadcat_contracts::maker_order::{CompiledMakerOrder, create, validate_against_market};
 use deadcat_contracts::market_crypto::derive_issuance_assets;
 use deadcat_contracts::recovery::{
-    MARKET_V1_TAG, MarketCollateral, MarketRecoveryHint, OrderRecoveryHint, validate_recovery_txout,
+    MARKET_V1_TAG, MarketCollateral, MarketRecoveryHint, validate_recovery_txout,
 };
 use deadcat_contracts::rt::{RtLeg, RtSide, commitments, factors};
-use deadcat_rpc::ContractCandidate;
 use deadcat_types::{
-    BinaryMarketParams, BinaryMarketState, ChainAnchor, ChainPosition, ContractKind,
-    ContractSyncState, DeadcatOutPoint, LiquidNetwork, MakerOrderState, OrderDirection,
-    RecoveryHintLocation,
+    BinaryMarketParams, BinaryMarketState, CONTRACT_PACKAGE_FORMAT_VERSION, ChainAnchor,
+    ChainPosition, ContractDeclaration, ContractDescriptor, ContractId, ContractKind,
+    ContractPackage, ContractSyncState, LiquidNetwork, MAX_CONTRACT_PACKAGE_DECLARATIONS,
+    MAX_CONTRACT_PACKAGE_ROOTS, MakerOrderState, OrderDirection, RecoveryHintLocation,
 };
 use elements::confidential::{Asset, Nonce, Value};
 use elements::secp256k1_zkp::ZERO_TWEAK;
-use elements::{AssetId, Transaction, TxOutWitness};
+use elements::{AssetId, BlockHash, OutPoint, Transaction, TxOutWitness, Txid};
 use thiserror::Error;
 
 use crate::chain::{ChainSource, ChainSourceError, TransactionStatus};
@@ -28,12 +31,19 @@ use crate::store::{
 
 const LIQUID_MAINNET_USDT: &str =
     "ce091c998b83c78bb71a632313ba3760f1763d9cfcffae02258ffa9865a37bd2";
+pub const MAX_PACKAGE_DECLARATIONS: usize = MAX_CONTRACT_PACKAGE_DECLARATIONS;
+pub const MAX_PACKAGE_ROOTS: usize = MAX_CONTRACT_PACKAGE_ROOTS;
+/// Maximum cumulative consensus-encoded size of the unique creation
+/// transactions fetched while verifying one package. This matches the 16 MiB
+/// Iroh RPC frame ceiling and bounds server-side work for evidence which is
+/// fetched from the chain source rather than carried in that inbound frame.
+pub const MAX_PACKAGE_CREATION_EVIDENCE_BYTES: usize = deadcat_iroh::wire::MAX_FRAME_BYTES;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedRegistration {
     pub record: ContractRecord,
-    pub creation_anchor: ChainAnchor,
-    pub creation_transaction: Transaction,
+    pub creation_block_anchor: ChainAnchor,
+    pub creation_transaction: Arc<Transaction>,
     pub associated_hint: Option<RecoveryHintLocation>,
 }
 
@@ -41,6 +51,7 @@ pub struct RegistrationVerifier<'a, S> {
     source: &'a S,
     store: &'a Store,
     network: LiquidNetwork,
+    genesis_hash: BlockHash,
     policy_asset: AssetId,
 }
 
@@ -53,82 +64,325 @@ where
         source: &'a S,
         store: &'a Store,
         network: LiquidNetwork,
+        genesis_hash: BlockHash,
         policy_asset: AssetId,
     ) -> Self {
         Self {
             source,
             store,
             network,
+            genesis_hash,
             policy_asset,
         }
     }
 
-    pub async fn verify(
+    /// Verify every declaration from canonical chain evidence. Package order is
+    /// not trusted: dependencies are resolved before their children and each
+    /// creation transaction is fetched at most once.
+    pub async fn verify_package(
         &self,
-        candidate: ContractCandidate,
-    ) -> Result<VerifiedRegistration, RegistrationError> {
-        let creation_txid = match &candidate {
-            ContractCandidate::BinaryMarket { creation_txid, .. }
-            | ContractCandidate::MakerOrder { creation_txid, .. } => *creation_txid,
-        };
-        let transaction = self.source.transaction(creation_txid).await?;
-        let (anchor, tx_index) = match self.source.transaction_status(creation_txid).await? {
-            TransactionStatus::Confirmed { anchor, tx_index } => (anchor, tx_index),
-            TransactionStatus::Unconfirmed => return Err(RegistrationError::UnconfirmedCreation),
-        };
-        let position = ChainPosition {
-            block_height: anchor.height,
-            tx_index,
-        };
+        package: &ContractPackage,
+    ) -> Result<Vec<VerifiedRegistration>, RegistrationError> {
+        let declarations = self.validate_package(package)?;
+        let mut evidence = HashMap::<Txid, CreationEvidence>::new();
+        let mut evidence_bytes = 0_usize;
+        let mut verified = BTreeMap::<ContractId, VerifiedRegistration>::new();
 
-        match candidate {
-            ContractCandidate::BinaryMarket { params, .. } => verify_binary_market_creation(
-                &transaction,
-                position,
-                anchor,
+        // Markets have no dependencies and are verified first regardless of
+        // declaration order.
+        for declaration in declarations.values().filter(|declaration| {
+            matches!(
+                declaration.descriptor,
+                ContractDescriptor::BinaryMarketV1 { .. }
+            )
+        }) {
+            let creation = self
+                .creation_evidence(
+                    declaration.contract_id.txid(),
+                    &mut evidence,
+                    &mut evidence_bytes,
+                )
+                .await?;
+            let ContractDescriptor::BinaryMarketV1 { params } = declaration.descriptor else {
+                unreachable!("filtered to market declarations")
+            };
+            let registration = verify_binary_market_creation_shared(
+                Arc::clone(&creation.transaction),
+                creation.position,
+                creation.anchor,
                 self.network,
                 self.policy_asset,
-                params,
-            ),
-            ContractCandidate::MakerOrder {
+                Some(params),
+                Some(declaration.contract_id),
+            )?;
+            verified.insert(declaration.contract_id, registration);
+        }
+
+        for declaration in declarations.values().filter(|declaration| {
+            matches!(
+                declaration.descriptor,
+                ContractDescriptor::MakerOrderV1 { .. }
+            )
+        }) {
+            let ContractDescriptor::MakerOrderV1 {
                 parent_market,
                 side,
                 params,
-                ..
-            } => {
-                let parent = self
+            } = declaration.descriptor
+            else {
+                unreachable!("filtered to maker-order declarations")
+            };
+            let stored_parent;
+            let parent = if let Some(parent) = verified.get(&parent_market) {
+                &parent.record
+            } else {
+                stored_parent = self
                     .store
                     .contract(parent_market)?
                     .ok_or(RegistrationError::ParentMarketNotFound)?;
-                verify_maker_order_creation(
-                    &transaction,
-                    position,
-                    anchor,
-                    &parent,
-                    side,
-                    params,
-                    self.policy_asset,
+                &stored_parent
+            };
+            let creation = self
+                .creation_evidence(
+                    declaration.contract_id.txid(),
+                    &mut evidence,
+                    &mut evidence_bytes,
                 )
+                .await?;
+            if parent.creation_position > creation.position {
+                return Err(RegistrationError::InvalidPackage(
+                    "maker order precedes its parent market".to_owned(),
+                ));
             }
+            let registration = verify_maker_order_creation_shared(
+                Arc::clone(&creation.transaction),
+                creation.position,
+                creation.anchor,
+                declaration.contract_id,
+                parent,
+                side,
+                params,
+            )?;
+            verified.insert(declaration.contract_id, registration);
         }
+
+        // Receipts and persistence inputs retain the sender's declaration
+        // order even though verification itself is dependency ordered.
+        package
+            .declarations
+            .iter()
+            .map(|declaration| {
+                verified.remove(&declaration.contract_id).ok_or_else(|| {
+                    RegistrationError::InvalidPackage(
+                        "declaration was not verified by a supported family".to_owned(),
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Verify against canonical chain evidence and atomically persist the
-    /// resulting catching-up record. An identical retry is idempotent.
-    pub async fn verify_and_register(
+    /// complete package. An identical retry is idempotent.
+    pub async fn verify_and_register_package(
         &self,
-        candidate: ContractCandidate,
-    ) -> Result<(VerifiedRegistration, bool), RegistrationError> {
-        let verified = self.verify(candidate).await?;
-        let inserted = self.store.register_contract(
-            &verified.record,
-            &RegistrationEvidence {
-                anchor: verified.creation_anchor,
-                transaction: verified.creation_transaction.clone(),
-            },
-        )?;
-        Ok((verified, inserted))
+        package: &ContractPackage,
+    ) -> Result<Vec<(VerifiedRegistration, bool)>, RegistrationError> {
+        let verified = self.verify_package(package).await?;
+        let mut hint_claims = HashMap::<RecoveryHintLocation, usize>::new();
+        for location in verified.iter().filter_map(|item| item.associated_hint) {
+            *hint_claims.entry(location).or_default() += 1;
+        }
+        let registrations = verified
+            .iter()
+            .map(|item| {
+                // Esplora-backed nodes may not have indexed historical hints.
+                // Claim a verified hint atomically when its row exists, but a
+                // missing advisory index row must not invalidate the contract.
+                let associated_hint = match item.associated_hint {
+                    Some(location)
+                        if hint_claims.get(&location) == Some(&1)
+                            && self.store.recovery_hint(location)?.is_some() =>
+                    {
+                        Some(location)
+                    }
+                    _ => None,
+                };
+                Ok((
+                    item.record.clone(),
+                    RegistrationEvidence {
+                        anchor: item.creation_block_anchor,
+                        transaction: Arc::clone(&item.creation_transaction),
+                        associated_hint,
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        let results = self.store.register_contracts(&registrations)?;
+        if results.len() != verified.len() {
+            return Err(RegistrationError::InvalidPackage(
+                "registration store returned the wrong result count".to_owned(),
+            ));
+        }
+        Ok(verified
+            .into_iter()
+            .zip(results)
+            .map(|(mut verified, result)| {
+                verified.record = result.record;
+                (verified, result.inserted)
+            })
+            .collect())
     }
+
+    fn validate_package(
+        &self,
+        package: &ContractPackage,
+    ) -> Result<BTreeMap<ContractId, ContractDeclaration>, RegistrationError> {
+        if package.format_version != CONTRACT_PACKAGE_FORMAT_VERSION {
+            return Err(RegistrationError::InvalidPackage(format!(
+                "unsupported contract package format {}; expected {CONTRACT_PACKAGE_FORMAT_VERSION}",
+                package.format_version
+            )));
+        }
+        if package.chain.network != self.network || package.chain.genesis_hash != self.genesis_hash
+        {
+            return Err(RegistrationError::WrongChain);
+        }
+        if package.declarations.is_empty() || package.declarations.len() > MAX_PACKAGE_DECLARATIONS
+        {
+            return Err(RegistrationError::InvalidPackage(format!(
+                "contract package must contain 1..={MAX_PACKAGE_DECLARATIONS} declarations"
+            )));
+        }
+        if package.roots.is_empty()
+            || package.roots.len() > MAX_PACKAGE_ROOTS
+            || package.roots.len() > package.declarations.len()
+        {
+            return Err(RegistrationError::InvalidPackage(format!(
+                "contract package must contain 1..={MAX_PACKAGE_ROOTS} roots, no more than its declarations"
+            )));
+        }
+
+        let mut declarations = BTreeMap::new();
+        for declaration in &package.declarations {
+            if declaration.descriptor.parent() == Some(declaration.contract_id) {
+                return Err(RegistrationError::InvalidPackage(
+                    "contract declaration depends on itself".to_owned(),
+                ));
+            }
+            if declarations
+                .insert(declaration.contract_id, *declaration)
+                .is_some()
+            {
+                return Err(RegistrationError::InvalidPackage(
+                    "contract package contains duplicate declaration IDs".to_owned(),
+                ));
+            }
+        }
+
+        let roots = package.roots.iter().copied().collect::<BTreeSet<_>>();
+        if roots.len() != package.roots.len() {
+            return Err(RegistrationError::InvalidPackage(
+                "contract package contains duplicate roots".to_owned(),
+            ));
+        }
+        if roots.iter().any(|root| !declarations.contains_key(root)) {
+            return Err(RegistrationError::InvalidPackage(
+                "every package root must have a declaration".to_owned(),
+            ));
+        }
+
+        let mut reachable = BTreeSet::new();
+        let mut pending = package.roots.clone();
+        while let Some(contract_id) = pending.pop() {
+            if !reachable.insert(contract_id) {
+                continue;
+            }
+            if let Some(parent) = declarations
+                .get(&contract_id)
+                .and_then(|declaration| declaration.descriptor.parent())
+                && declarations.contains_key(&parent)
+            {
+                pending.push(parent);
+            }
+        }
+        if reachable.len() != declarations.len() {
+            return Err(RegistrationError::InvalidPackage(
+                "contract package contains declarations unreachable from its roots".to_owned(),
+            ));
+        }
+
+        for declaration in declarations.values() {
+            if let ContractDescriptor::MakerOrderV1 { parent_market, .. } = declaration.descriptor {
+                if let Some(parent) = declarations.get(&parent_market) {
+                    if !matches!(parent.descriptor, ContractDescriptor::BinaryMarketV1 { .. }) {
+                        return Err(RegistrationError::ParentIsNotMarket);
+                    }
+                } else {
+                    let parent = self
+                        .store
+                        .contract(parent_market)?
+                        .ok_or(RegistrationError::ParentMarketNotFound)?;
+                    if parent.kind != ContractKind::BinaryMarketV1 {
+                        return Err(RegistrationError::ParentIsNotMarket);
+                    }
+                }
+            }
+        }
+        Ok(declarations)
+    }
+
+    async fn creation_evidence<'cache>(
+        &self,
+        txid: Txid,
+        cache: &'cache mut HashMap<Txid, CreationEvidence>,
+        cumulative_bytes: &mut usize,
+    ) -> Result<&'cache CreationEvidence, RegistrationError> {
+        if let Entry::Vacant(entry) = cache.entry(txid) {
+            let transaction = self.source.transaction(txid).await?;
+            if transaction.txid() != txid {
+                return Err(RegistrationError::InvalidCreation(
+                    "chain source returned a transaction with the wrong txid".to_owned(),
+                ));
+            }
+            let transaction_bytes = elements::encode::serialize(&transaction).len();
+            *cumulative_bytes =
+                cumulative_bytes
+                    .checked_add(transaction_bytes)
+                    .ok_or_else(|| {
+                        RegistrationError::InvalidPackage(
+                            "creation evidence byte count overflowed usize".to_owned(),
+                        )
+                    })?;
+            if *cumulative_bytes > MAX_PACKAGE_CREATION_EVIDENCE_BYTES {
+                return Err(RegistrationError::InvalidPackage(format!(
+                    "unique creation evidence exceeds the {MAX_PACKAGE_CREATION_EVIDENCE_BYTES}-byte package budget"
+                )));
+            }
+            let (anchor, tx_index) = match self.source.transaction_status(txid).await? {
+                TransactionStatus::Confirmed { anchor, tx_index } => (anchor, tx_index),
+                TransactionStatus::Unconfirmed => {
+                    return Err(RegistrationError::UnconfirmedCreation);
+                }
+            };
+            entry.insert(CreationEvidence {
+                transaction: Arc::new(transaction),
+                anchor,
+                position: ChainPosition {
+                    block_height: anchor.height,
+                    tx_index,
+                },
+            });
+        }
+        cache.get(&txid).ok_or_else(|| {
+            RegistrationError::InvalidCreation("creation evidence cache failure".to_owned())
+        })
+    }
+}
+
+struct CreationEvidence {
+    transaction: Arc<Transaction>,
+    anchor: ChainAnchor,
+    position: ChainPosition,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -139,7 +393,30 @@ pub fn verify_binary_market_creation(
     network: LiquidNetwork,
     policy_asset: AssetId,
     supplied_params: Option<BinaryMarketParams>,
+    expected_contract_id: Option<ContractId>,
 ) -> Result<VerifiedRegistration, RegistrationError> {
+    verify_binary_market_creation_shared(
+        Arc::new(transaction.clone()),
+        position,
+        anchor,
+        network,
+        policy_asset,
+        supplied_params,
+        expected_contract_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_binary_market_creation_shared(
+    creation_transaction: Arc<Transaction>,
+    position: ChainPosition,
+    anchor: ChainAnchor,
+    network: LiquidNetwork,
+    policy_asset: AssetId,
+    supplied_params: Option<BinaryMarketParams>,
+    expected_contract_id: Option<ContractId>,
+) -> Result<VerifiedRegistration, RegistrationError> {
+    let transaction = creation_transaction.as_ref();
     let hints = market_hints(transaction, policy_asset);
     let (params, official_shape) = match supplied_params {
         Some(params) => {
@@ -237,9 +514,6 @@ pub fn verify_binary_market_creation(
         .filter(|(_, hint)| market_hint_matches(*hint, params, network, policy_asset))
         .map(|(index, _)| *index)
         .collect::<Vec<_>>();
-    if matching_hints.len() > 1 {
-        return Err(RegistrationError::AmbiguousRecoveryHint);
-    }
     if supplied_params.is_none() && matching_hints.len() != 1 {
         return Err(RegistrationError::InvalidCreation(
             "standalone recovery hint does not match the derived market".to_owned(),
@@ -247,7 +521,15 @@ pub fn verify_binary_market_creation(
     }
 
     let txid = transaction.txid();
-    let contract_id = compiled.contract_id(txid);
+    let creation_anchor = OutPoint::new(txid, yes_output);
+    if expected_contract_id
+        .is_some_and(|contract_id| contract_id.creation_anchor() != creation_anchor)
+    {
+        return Err(RegistrationError::InvalidCreation(
+            "market ContractId does not nominate its initial dormant YES RT output".to_owned(),
+        ));
+    }
+    let contract_id = expected_contract_id.unwrap_or_else(|| ContractId::new(creation_anchor));
     let scripts = compiled
         .slots()
         .iter()
@@ -300,25 +582,23 @@ pub fn verify_binary_market_creation(
         outpoints: vec![
             TrackedOutpoint {
                 role: BinaryMarketSlot::DormantYesRt as u8,
-                outpoint: DeadcatOutPoint::new(txid, yes_output),
+                outpoint: OutPoint::new(txid, yes_output),
             },
             TrackedOutpoint {
                 role: BinaryMarketSlot::DormantNoRt as u8,
-                outpoint: DeadcatOutPoint::new(txid, no_output),
+                outpoint: OutPoint::new(txid, no_output),
             },
         ],
         order_book: None,
     };
     Ok(VerifiedRegistration {
         record,
-        creation_anchor: anchor,
-        creation_transaction: transaction.clone(),
-        associated_hint: matching_hints
-            .first()
-            .map(|output_index| RecoveryHintLocation {
-                position,
-                output_index: *output_index,
-            }),
+        creation_block_anchor: anchor,
+        creation_transaction,
+        associated_hint: (matching_hints.len() == 1).then(|| RecoveryHintLocation {
+            position,
+            output_index: matching_hints[0],
+        }),
     })
 }
 
@@ -327,11 +607,38 @@ pub fn verify_maker_order_creation(
     transaction: &Transaction,
     position: ChainPosition,
     anchor: ChainAnchor,
+    contract_id: ContractId,
     parent: &ContractRecord,
     side: deadcat_types::OrderSide,
     params: deadcat_types::MakerOrderParams,
-    policy_asset: AssetId,
 ) -> Result<VerifiedRegistration, RegistrationError> {
+    verify_maker_order_creation_shared(
+        Arc::new(transaction.clone()),
+        position,
+        anchor,
+        contract_id,
+        parent,
+        side,
+        params,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_maker_order_creation_shared(
+    creation_transaction: Arc<Transaction>,
+    position: ChainPosition,
+    anchor: ChainAnchor,
+    contract_id: ContractId,
+    parent: &ContractRecord,
+    side: deadcat_types::OrderSide,
+    params: deadcat_types::MakerOrderParams,
+) -> Result<VerifiedRegistration, RegistrationError> {
+    let transaction = creation_transaction.as_ref();
+    if contract_id.txid() != transaction.txid() {
+        return Err(RegistrationError::InvalidCreation(
+            "maker ContractId transaction does not match its creation transaction".to_owned(),
+        ));
+    }
     let ContractParameters::BinaryMarket(parent_params) = &parent.params else {
         return Err(RegistrationError::ParentIsNotMarket);
     };
@@ -351,19 +658,21 @@ pub fn verify_maker_order_creation(
     let compiled = CompiledMakerOrder::new(params)
         .map_err(|error| RegistrationError::Compilation(error.to_string()))?;
 
-    let matches = transaction
+    let output = transaction
         .output
-        .iter()
-        .enumerate()
-        .filter(|(_, output)| output.script_pubkey == *compiled.script_pubkey())
-        .collect::<Vec<_>>();
-    if matches.len() != 1 {
-        return Err(RegistrationError::InvalidCreation(format!(
-            "expected one canonical order output, found {}",
-            matches.len()
-        )));
+        .get(usize::try_from(contract_id.vout()).map_err(|_| {
+            RegistrationError::InvalidCreation("maker output index exceeds usize".to_owned())
+        })?)
+        .ok_or_else(|| {
+            RegistrationError::InvalidCreation(
+                "maker ContractId output does not exist in the creation transaction".to_owned(),
+            )
+        })?;
+    if output.script_pubkey != *compiled.script_pubkey() {
+        return Err(RegistrationError::InvalidCreation(
+            "maker ContractId output does not use the declared canonical order script".to_owned(),
+        ));
     }
-    let (output_index, output) = matches[0];
     if output.nonce != Nonce::Null || output.witness != TxOutWitness::default() {
         return Err(RegistrationError::InvalidCreation(
             "canonical order output has a nonce or confidential proofs".to_owned(),
@@ -406,23 +715,6 @@ pub fn verify_maker_order_creation(
         ));
     }
 
-    let hints = order_hints(transaction, policy_asset);
-    let matching_hints = hints
-        .iter()
-        .filter(|(_, hint)| {
-            hint.market_creation_txid == parent.contract_id.creation_txid
-                && hint.side == side
-                && hint.direction == params.direction
-                && hint.price == params.price
-                && hint.min_active_base == params.min_active_base
-        })
-        .map(|(index, _)| *index)
-        .collect::<Vec<_>>();
-
-    let output_index = u32::try_from(output_index)
-        .map_err(|_| RegistrationError::InvalidCreation("output index exceeds u32".to_owned()))?;
-    let txid = transaction.txid();
-    let contract_id = compiled.contract_id(txid);
     let record = ContractRecord {
         contract_id,
         kind: ContractKind::MakerOrderV1,
@@ -455,7 +747,7 @@ pub fn verify_maker_order_creation(
         ],
         outpoints: vec![TrackedOutpoint {
             role: 0,
-            outpoint: DeadcatOutPoint::new(txid, output_index),
+            outpoint: contract_id.creation_anchor(),
         }],
         order_book: Some(OrderBookEntry {
             market_id: parent.contract_id,
@@ -468,12 +760,12 @@ pub fn verify_maker_order_creation(
     };
     Ok(VerifiedRegistration {
         record,
-        creation_anchor: anchor,
-        creation_transaction: transaction.clone(),
-        associated_hint: (matching_hints.len() == 1).then(|| RecoveryHintLocation {
-            position,
-            output_index: matching_hints[0],
-        }),
+        creation_block_anchor: anchor,
+        creation_transaction,
+        // V1 maker hints intentionally omit the maker key, receive script,
+        // exact output, and parent vout. They are owner-recovery locators, not
+        // a globally unique public contract association.
+        associated_hint: None,
     })
 }
 
@@ -554,19 +846,6 @@ fn market_hints(
         .collect()
 }
 
-fn order_hints(transaction: &Transaction, policy_asset: AssetId) -> Vec<(u32, OrderRecoveryHint)> {
-    transaction
-        .output
-        .iter()
-        .enumerate()
-        .filter_map(|(index, output)| {
-            let payload = validate_recovery_txout(output, policy_asset).ok()?;
-            let hint = OrderRecoveryHint::decode(payload).ok()?;
-            Some((u32::try_from(index).ok()?, hint))
-        })
-        .collect()
-}
-
 fn market_hint_matches(
     hint: MarketRecoveryHint,
     params: BinaryMarketParams,
@@ -607,6 +886,10 @@ pub enum RegistrationError {
     Store(#[from] StoreError),
     #[error("creation transaction is not confirmed")]
     UnconfirmedCreation,
+    #[error("contract package targets a different Liquid chain")]
+    WrongChain,
+    #[error("invalid contract package: {0}")]
+    InvalidPackage(String),
     #[error("parent market is not registered")]
     ParentMarketNotFound,
     #[error("parent contract is not a binary market")]
@@ -615,12 +898,12 @@ pub enum RegistrationError {
     Compilation(String),
     #[error("invalid contract creation: {0}")]
     InvalidCreation(String),
-    #[error("more than one recovery hint can be associated with this contract")]
-    AmbiguousRecoveryHint,
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use deadcat_contracts::maker_order::CompiledMakerOrder;
     use deadcat_contracts::recovery::{OrderRecoveryHint, recovery_txout};
     use deadcat_types::{OrderDirection, OrderSide};
@@ -732,8 +1015,28 @@ mod tests {
     }
 
     struct RegistrationSource {
-        transaction: Transaction,
+        transactions: BTreeMap<Txid, Transaction>,
         status: TransactionStatus,
+        transaction_calls: AtomicUsize,
+        status_calls: AtomicUsize,
+    }
+
+    impl RegistrationSource {
+        fn new(transaction: Transaction, status: TransactionStatus) -> Self {
+            Self::many(vec![transaction], status)
+        }
+
+        fn many(transactions: Vec<Transaction>, status: TransactionStatus) -> Self {
+            Self {
+                transactions: transactions
+                    .into_iter()
+                    .map(|transaction| (transaction.txid(), transaction))
+                    .collect(),
+                status,
+                transaction_calls: AtomicUsize::new(0),
+                status_calls: AtomicUsize::new(0),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -751,21 +1054,29 @@ mod tests {
         }
 
         async fn transaction(&self, txid: Txid) -> Result<Transaction, ChainSourceError> {
-            assert_eq!(txid, self.transaction.txid());
-            Ok(self.transaction.clone())
+            self.transaction_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self
+                .transactions
+                .get(&txid)
+                .unwrap_or_else(|| panic!("unexpected transaction request {txid}"))
+                .clone())
         }
 
         async fn transaction_status(
             &self,
             txid: Txid,
         ) -> Result<TransactionStatus, ChainSourceError> {
-            assert_eq!(txid, self.transaction.txid());
+            self.status_calls.fetch_add(1, Ordering::Relaxed);
+            assert!(
+                self.transactions.contains_key(&txid),
+                "unexpected transaction status request {txid}"
+            );
             Ok(self.status)
         }
 
         async fn outspend(
             &self,
-            _outpoint: DeadcatOutPoint,
+            _outpoint: OutPoint,
         ) -> Result<Option<crate::chain::Outspend>, ChainSourceError> {
             unreachable!("registration reads only transaction evidence and status")
         }
@@ -801,6 +1112,7 @@ mod tests {
             LiquidNetwork::ElementsRegtest,
             policy_asset,
             None,
+            None,
         )
         .expect("verify");
 
@@ -811,6 +1123,36 @@ mod tests {
         assert_eq!(verified.record.scripts.len(), 8);
         assert_eq!(verified.record.outpoints.len(), 2);
         assert_eq!(verified.associated_hint.expect("hint").output_index, 2);
+
+        let expected_id = ContractId::new(OutPoint::new(transaction.txid(), 0));
+        assert_eq!(
+            verify_binary_market_creation(
+                &transaction,
+                position,
+                anchor,
+                LiquidNetwork::ElementsRegtest,
+                policy_asset,
+                Some(expected_params),
+                Some(expected_id),
+            )
+            .expect("exact market anchor")
+            .record
+            .contract_id,
+            expected_id
+        );
+        assert!(matches!(
+            verify_binary_market_creation(
+                &transaction,
+                position,
+                anchor,
+                LiquidNetwork::ElementsRegtest,
+                policy_asset,
+                Some(expected_params),
+                Some(ContractId::new(OutPoint::new(transaction.txid(), 1))),
+            ),
+            Err(RegistrationError::InvalidCreation(message))
+                if message.contains("initial dormant YES RT output")
+        ));
     }
 
     #[tokio::test]
@@ -818,13 +1160,13 @@ mod tests {
         let policy_asset = asset(0x95);
         let (transaction, expected_params, position, creation_anchor) =
             standalone_market(policy_asset);
-        let source = RegistrationSource {
-            transaction: transaction.clone(),
-            status: TransactionStatus::Confirmed {
+        let source = RegistrationSource::new(
+            transaction.clone(),
+            TransactionStatus::Confirmed {
                 anchor: creation_anchor,
                 tx_index: position.tx_index,
             },
-        };
+        );
         let directory = tempfile::tempdir().expect("tempdir");
         let database = directory.path().join("registration.redb");
         let store = Store::open(&database).expect("open store");
@@ -835,17 +1177,30 @@ mod tests {
             &source,
             &store,
             LiquidNetwork::ElementsRegtest,
+            BlockHash::all_zeros(),
             policy_asset,
         );
-        let candidate = ContractCandidate::BinaryMarket {
-            creation_txid: transaction.txid(),
-            params: None,
+        let contract_id = ContractId::new(OutPoint::new(transaction.txid(), 0));
+        let package = ContractPackage {
+            format_version: CONTRACT_PACKAGE_FORMAT_VERSION,
+            chain: deadcat_types::ChainIdentity {
+                network: LiquidNetwork::ElementsRegtest,
+                genesis_hash: BlockHash::all_zeros(),
+            },
+            roots: vec![contract_id],
+            declarations: vec![ContractDeclaration {
+                contract_id,
+                descriptor: ContractDescriptor::BinaryMarketV1 {
+                    params: expected_params,
+                },
+            }],
         };
 
-        let (verified, inserted) = verifier
-            .verify_and_register(candidate.clone())
+        let mut registrations = verifier
+            .verify_and_register_package(&package)
             .await
             .expect("verify and register market");
+        let (verified, inserted) = registrations.pop().expect("one registration");
         assert!(inserted);
         assert_eq!(
             verified.record.params,
@@ -863,10 +1218,11 @@ mod tests {
             1
         );
 
-        let (_, inserted) = verifier
-            .verify_and_register(candidate)
+        let mut registrations = verifier
+            .verify_and_register_package(&package)
             .await
             .expect("idempotent registration retry");
+        let (_, inserted) = registrations.pop().expect("one registration");
         assert!(!inserted);
         drop(store);
 
@@ -889,6 +1245,121 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn reversed_same_transaction_package_registers_market_and_order_atomically() {
+        let policy_asset = asset(0x94);
+        let (mut transaction, market_params, position, creation_anchor) =
+            standalone_market(policy_asset);
+        let order_params = deadcat_types::MakerOrderParams {
+            base_asset_id: market_params.yes_token_asset_id,
+            quote_asset_id: market_params.collateral_asset_id,
+            price: 100,
+            min_active_base: 10,
+            direction: OrderDirection::SellQuote,
+            maker_receive_spk_hash: [0x43; 32],
+            maker_pubkey: VALID_XONLY,
+        };
+        let compiled_order = CompiledMakerOrder::new(order_params).expect("compile order");
+        let order_output = TxOut {
+            asset: Asset::Explicit(order_params.quote_asset_id),
+            value: Value::Explicit(2_000),
+            nonce: Nonce::Null,
+            script_pubkey: compiled_order.script_pubkey().clone(),
+            witness: TxOutWitness::default(),
+        };
+        transaction.output.push(order_output.clone());
+        transaction.output.push(order_output);
+        let market_id = ContractId::new(OutPoint::new(transaction.txid(), 0));
+        let first_order_id = ContractId::new(OutPoint::new(transaction.txid(), 3));
+        let second_order_id = ContractId::new(OutPoint::new(transaction.txid(), 4));
+        let package = ContractPackage {
+            format_version: CONTRACT_PACKAGE_FORMAT_VERSION,
+            chain: deadcat_types::ChainIdentity {
+                network: LiquidNetwork::ElementsRegtest,
+                genesis_hash: BlockHash::all_zeros(),
+            },
+            roots: vec![first_order_id, second_order_id],
+            // Deliberately child-first: package order is not dependency order.
+            declarations: vec![
+                ContractDeclaration {
+                    contract_id: first_order_id,
+                    descriptor: ContractDescriptor::MakerOrderV1 {
+                        parent_market: market_id,
+                        side: OrderSide::Yes,
+                        params: order_params,
+                    },
+                },
+                ContractDeclaration {
+                    contract_id: second_order_id,
+                    descriptor: ContractDescriptor::MakerOrderV1 {
+                        parent_market: market_id,
+                        side: OrderSide::Yes,
+                        params: order_params,
+                    },
+                },
+                ContractDeclaration {
+                    contract_id: market_id,
+                    descriptor: ContractDescriptor::BinaryMarketV1 {
+                        params: market_params,
+                    },
+                },
+            ],
+        };
+        let source = RegistrationSource::new(
+            transaction,
+            TransactionStatus::Confirmed {
+                anchor: creation_anchor,
+                tx_index: position.tx_index,
+            },
+        );
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(directory.path().join("package.redb")).expect("open store");
+        store
+            .initialize_tip(creation_anchor)
+            .expect("initialize tip");
+        let verifier = RegistrationVerifier::new(
+            &source,
+            &store,
+            LiquidNetwork::ElementsRegtest,
+            BlockHash::all_zeros(),
+            policy_asset,
+        );
+
+        let registrations = verifier
+            .verify_and_register_package(&package)
+            .await
+            .expect("register composed package");
+        assert_eq!(source.transaction_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(source.status_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(registrations.len(), 3);
+        assert_eq!(registrations[0].0.record.contract_id, first_order_id);
+        assert_eq!(registrations[1].0.record.contract_id, second_order_id);
+        assert_eq!(registrations[2].0.record.contract_id, market_id);
+        assert!(Arc::ptr_eq(
+            &registrations[0].0.creation_transaction,
+            &registrations[1].0.creation_transaction,
+        ));
+        assert!(Arc::ptr_eq(
+            &registrations[1].0.creation_transaction,
+            &registrations[2].0.creation_transaction,
+        ));
+        assert!(registrations.iter().all(|(_, inserted)| *inserted));
+        assert!(store.contract(market_id).expect("market lookup").is_some());
+        assert!(
+            store
+                .contract(first_order_id)
+                .expect("first order lookup")
+                .is_some()
+        );
+        assert!(
+            store
+                .contract(second_order_id)
+                .expect("second order lookup")
+                .is_some()
+        );
+        assert_eq!(store.pending_backfills().expect("backfills").len(), 3);
+    }
+
     #[test]
     fn duplicate_deterministic_rt_output_is_ambiguous() {
         let policy_asset = asset(0x98);
@@ -902,9 +1373,199 @@ mod tests {
                 LiquidNetwork::ElementsRegtest,
                 policy_asset,
                 Some(params),
+                None,
             ),
             Err(RegistrationError::InvalidCreation(message)) if message.contains("found 2")
         ));
+    }
+
+    #[test]
+    fn duplicate_advisory_hints_do_not_invalidate_a_declared_market() {
+        let policy_asset = asset(0x92);
+        let (mut transaction, params, position, anchor) = standalone_market(policy_asset);
+        transaction.output.push(transaction.output[2].clone());
+
+        let verified = verify_binary_market_creation(
+            &transaction,
+            position,
+            anchor,
+            LiquidNetwork::ElementsRegtest,
+            policy_asset,
+            Some(params),
+            Some(ContractId::new(OutPoint::new(transaction.txid(), 0))),
+        )
+        .expect("full declaration is authoritative over hint association");
+        assert_eq!(verified.associated_hint, None);
+        assert!(
+            verify_binary_market_creation(
+                &transaction,
+                position,
+                anchor,
+                LiquidNetwork::ElementsRegtest,
+                policy_asset,
+                None,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn public_package_path_rejects_shape_and_chain_before_chain_io() {
+        let policy_asset = asset(0x93);
+        let (transaction, params, _, _) = standalone_market(policy_asset);
+        let contract_id = ContractId::new(OutPoint::new(transaction.txid(), 0));
+        let declaration = ContractDeclaration {
+            contract_id,
+            descriptor: ContractDescriptor::BinaryMarketV1 { params },
+        };
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(directory.path().join("shape.redb")).expect("open store");
+        let source = RegistrationSource::new(transaction, TransactionStatus::Unconfirmed);
+        let verifier = RegistrationVerifier::new(
+            &source,
+            &store,
+            LiquidNetwork::ElementsRegtest,
+            BlockHash::all_zeros(),
+            policy_asset,
+        );
+        let package = ContractPackage {
+            format_version: CONTRACT_PACKAGE_FORMAT_VERSION,
+            chain: deadcat_types::ChainIdentity {
+                network: LiquidNetwork::ElementsRegtest,
+                genesis_hash: BlockHash::all_zeros(),
+            },
+            roots: vec![contract_id],
+            declarations: vec![declaration],
+        };
+        let mut wrong_version = package.clone();
+        wrong_version.format_version = CONTRACT_PACKAGE_FORMAT_VERSION + 1;
+        assert!(matches!(
+            verifier.verify_package(&wrong_version).await,
+            Err(RegistrationError::InvalidPackage(message))
+                if message.contains("unsupported contract package format")
+        ));
+
+        let mut wrong_chain = package.clone();
+        wrong_chain.chain.genesis_hash = BlockHash::from_byte_array([0x01; 32]);
+        assert!(matches!(
+            verifier.verify_package(&wrong_chain).await,
+            Err(RegistrationError::WrongChain)
+        ));
+
+        let mut duplicate_root = package.clone();
+        duplicate_root.declarations.push(ContractDeclaration {
+            contract_id: ContractId::new(OutPoint::new(contract_id.txid(), 8)),
+            descriptor: ContractDescriptor::BinaryMarketV1 { params },
+        });
+        duplicate_root.roots.push(contract_id);
+        assert!(matches!(
+            verifier.verify_package(&duplicate_root).await,
+            Err(RegistrationError::InvalidPackage(message)) if message.contains("duplicate roots")
+        ));
+
+        let mut unknown_root = package.clone();
+        unknown_root.roots[0] = ContractId::new(OutPoint::new(contract_id.txid(), 9));
+        assert!(matches!(
+            verifier.verify_package(&unknown_root).await,
+            Err(RegistrationError::InvalidPackage(message))
+                if message.contains("root must have a declaration")
+        ));
+
+        let mut unreachable = package.clone();
+        unreachable.declarations.push(ContractDeclaration {
+            contract_id: ContractId::new(OutPoint::new(contract_id.txid(), 8)),
+            descriptor: ContractDescriptor::BinaryMarketV1 { params },
+        });
+        assert!(matches!(
+            verifier.verify_package(&unreachable).await,
+            Err(RegistrationError::InvalidPackage(message)) if message.contains("unreachable")
+        ));
+
+        let mut oversized = package;
+        oversized.declarations = (0..=MAX_PACKAGE_DECLARATIONS)
+            .map(|vout| ContractDeclaration {
+                contract_id: ContractId::new(OutPoint::new(
+                    contract_id.txid(),
+                    u32::try_from(vout).expect("small vout"),
+                )),
+                descriptor: ContractDescriptor::BinaryMarketV1 { params },
+            })
+            .collect();
+        assert!(matches!(
+            verifier.verify_package(&oversized).await,
+            Err(RegistrationError::InvalidPackage(message)) if message.contains("declarations")
+        ));
+        assert_eq!(source.transaction_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(source.status_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn public_package_path_bounds_cumulative_unique_creation_evidence_bytes() {
+        let policy_asset = asset(0x91);
+        let (mut first, params, position, creation_anchor) = standalone_market(policy_asset);
+        let padded_output = TxOut {
+            asset: Asset::Explicit(policy_asset),
+            value: Value::Explicit(0),
+            nonce: Nonce::Null,
+            script_pubkey: Script::from(vec![
+                0x51;
+                MAX_PACKAGE_CREATION_EVIDENCE_BYTES / 2 + 1_024
+            ]),
+            witness: TxOutWitness::default(),
+        };
+        first.output.push(padded_output);
+        let mut second = first.clone();
+        second.lock_time = LockTime::from_consensus(1);
+        let first_bytes = elements::encode::serialize(&first).len();
+        let second_bytes = elements::encode::serialize(&second).len();
+        assert!(first_bytes < MAX_PACKAGE_CREATION_EVIDENCE_BYTES);
+        assert!(second_bytes < MAX_PACKAGE_CREATION_EVIDENCE_BYTES);
+        assert!(first_bytes + second_bytes > MAX_PACKAGE_CREATION_EVIDENCE_BYTES);
+        let first_id = ContractId::new(OutPoint::new(first.txid(), 0));
+        let second_id = ContractId::new(OutPoint::new(second.txid(), 0));
+        let package = ContractPackage {
+            format_version: CONTRACT_PACKAGE_FORMAT_VERSION,
+            chain: deadcat_types::ChainIdentity {
+                network: LiquidNetwork::ElementsRegtest,
+                genesis_hash: BlockHash::all_zeros(),
+            },
+            roots: vec![first_id, second_id],
+            declarations: vec![
+                ContractDeclaration {
+                    contract_id: first_id,
+                    descriptor: ContractDescriptor::BinaryMarketV1 { params },
+                },
+                ContractDeclaration {
+                    contract_id: second_id,
+                    descriptor: ContractDescriptor::BinaryMarketV1 { params },
+                },
+            ],
+        };
+        let source = RegistrationSource::many(
+            vec![first, second],
+            TransactionStatus::Confirmed {
+                anchor: creation_anchor,
+                tx_index: position.tx_index,
+            },
+        );
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(directory.path().join("evidence-budget.redb")).expect("open store");
+        let verifier = RegistrationVerifier::new(
+            &source,
+            &store,
+            LiquidNetwork::ElementsRegtest,
+            BlockHash::all_zeros(),
+            policy_asset,
+        );
+
+        assert!(matches!(
+            verifier.verify_package(&package).await,
+            Err(RegistrationError::InvalidPackage(message))
+                if message.contains("creation evidence") && message.contains("byte package budget")
+        ));
+        assert_eq!(source.transaction_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(source.status_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -927,6 +1588,7 @@ mod tests {
                 LiquidNetwork::ElementsRegtest,
                 policy_asset,
                 Some(params),
+                None,
             ),
             Err(RegistrationError::InvalidCreation(message)) if message.contains("found 0")
         ));
@@ -942,6 +1604,7 @@ mod tests {
             market_anchor,
             LiquidNetwork::ElementsRegtest,
             policy_asset,
+            None,
             None,
         )
         .expect("parent")
@@ -963,7 +1626,7 @@ mod tests {
             side: OrderSide::Yes,
             direction: params.direction,
             masked_order_index: 0x1234,
-            market_creation_txid: parent.contract_id.creation_txid,
+            market_creation_txid: parent.contract_id.txid(),
             price: params.price,
             min_active_base: params.min_active_base,
         }
@@ -991,10 +1654,10 @@ mod tests {
             &transaction,
             position,
             anchor(101, 0x56),
+            ContractId::new(OutPoint::new(transaction.txid(), 0)),
             &parent,
             OrderSide::Yes,
             params,
-            policy_asset,
         )
         .expect("verify order");
         assert_eq!(
@@ -1004,6 +1667,45 @@ mod tests {
                 total_filled_base: 0,
             })
         );
-        assert_eq!(verified.associated_hint.expect("hint").output_index, 1);
+        assert_eq!(verified.associated_hint, None);
+
+        // Identity nominates an output, so byte-identical orders in the same
+        // transaction remain independently addressable.
+        let mut duplicated = transaction;
+        duplicated.output.insert(1, duplicated.output[0].clone());
+        let first = verify_maker_order_creation(
+            &duplicated,
+            position,
+            anchor(101, 0x56),
+            ContractId::new(OutPoint::new(duplicated.txid(), 0)),
+            &parent,
+            OrderSide::Yes,
+            params,
+        )
+        .expect("first identical order");
+        let second = verify_maker_order_creation(
+            &duplicated,
+            position,
+            anchor(101, 0x56),
+            ContractId::new(OutPoint::new(duplicated.txid(), 1)),
+            &parent,
+            OrderSide::Yes,
+            params,
+        )
+        .expect("second identical order");
+        assert_ne!(first.record.contract_id, second.record.contract_id);
+        assert_eq!(first.record.params, second.record.params);
+        assert!(
+            verify_maker_order_creation(
+                &duplicated,
+                position,
+                anchor(101, 0x56),
+                ContractId::new(OutPoint::new(duplicated.txid(), 2)),
+                &parent,
+                OrderSide::Yes,
+                params,
+            )
+            .is_err()
+        );
     }
 }

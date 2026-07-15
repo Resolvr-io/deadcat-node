@@ -16,7 +16,7 @@ use deadcat_node::sync::{
 };
 use deadcat_types::{
     BinaryMarketParams, BinaryMarketState, ChainAnchor, ChainPosition, ContractId,
-    ContractSyncState, DeadcatOutPoint, LiquidNetwork, RecoveryHintLocation,
+    ContractSyncState, LiquidNetwork, RecoveryHintLocation,
 };
 use elements::confidential::{Asset, Nonce, Value};
 use elements::hashes::Hash as _;
@@ -237,6 +237,7 @@ fn interpret_block(
             anchor,
             position,
             prior_transactions: &relevant,
+            retained_declarations: &[],
             mode: InterpretationMode::Canonical,
         };
         let interpreted = interpreter
@@ -286,11 +287,11 @@ fn assert_markets_issued(
         assert_eq!(record.outpoints.len(), 3);
         let output_base = u32::try_from(market_index * 3).expect("output base");
         let yes = store
-            .output(DeadcatOutPoint::new(issuance.txid(), output_base))
+            .output(OutPoint::new(issuance.txid(), output_base))
             .expect("read YES output")
             .expect("stored YES output");
         let no = store
-            .output(DeadcatOutPoint::new(issuance.txid(), output_base + 1))
+            .output(OutPoint::new(issuance.txid(), output_base + 1))
             .expect("read NO output")
             .expect("stored NO output");
         let deadcat_node::store::ContractParameters::BinaryMarket(params) = record.params else {

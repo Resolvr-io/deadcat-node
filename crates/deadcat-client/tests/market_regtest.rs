@@ -4,7 +4,9 @@
 //! `elementsd` + Electrs pair. It is required by `just ci` through the explicit
 //! `just regtest` suite and can be run alone with `just regtest-market-ab`.
 
-use bitcoincore_rpc::{Client, RpcApi};
+use std::str::FromStr as _;
+
+use bitcoincore_rpc::{Auth, Client, RpcApi};
 use deadcat_client::market_builder::{
     BinaryMarketCreationPlan, BinaryMarketLiveInputs, BinaryMarketTransitionPlan,
     MarketCreationContext, MarketIssuanceEntropies, MarketRtInput, OracleAttestation,
@@ -16,12 +18,23 @@ use deadcat_contracts::market_crypto::{
 };
 use deadcat_contracts::recovery::{MarketCollateral, MarketRecoveryHint};
 use deadcat_contracts::rt::{RtLeg, RtSide, add_mod_order, cbf, factors, infer_side};
-use deadcat_types::{BinaryMarketParams, BinaryMarketState};
+use deadcat_node::chain::elements_rpc::{
+    ElementsRpcAuth, ElementsRpcChainSource, ElementsRpcConfig,
+};
+use deadcat_node::registration::RegistrationVerifier;
+use deadcat_node::store::{ChainIdentity as StoreChainIdentity, ContractParameters, Store};
+use deadcat_types::{
+    BinaryMarketParams, BinaryMarketState, CONTRACT_PACKAGE_FORMAT_VERSION, ChainAnchor,
+    ChainIdentity, ContractDeclaration, ContractDescriptor, ContractId, ContractPackage,
+    LiquidNetwork,
+};
 use elements::confidential::{Asset, AssetBlindingFactor, Nonce, Value, ValueBlindingFactor};
 use elements::pset::{Input as PsetInput, Output as PsetOutput, PartiallySignedTransaction};
 use elements::secp256k1_zkp::rand::thread_rng;
 use elements::secp256k1_zkp::{Keypair, Message, Secp256k1, SecretKey, SurjectionProof, Tweak};
-use elements::{AssetId, OutPoint, Script, Transaction, TxOut, TxOutSecrets, TxOutWitness};
+use elements::{
+    AssetId, BlockHash, OutPoint, Script, Transaction, TxOut, TxOutSecrets, TxOutWitness,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use simplex::provider::ElementsRpc;
@@ -329,6 +342,106 @@ fn create_market(
         transaction,
         accepted,
     }
+}
+
+fn assert_live_elements_package_ingestion(
+    rpc_url: &str,
+    auth: &Auth,
+    rpc: &Client,
+    policy_asset: AssetId,
+    market: &CreatedMarket,
+) {
+    let source_auth = match auth {
+        Auth::None => ElementsRpcAuth::None,
+        Auth::UserPass(username, password) => ElementsRpcAuth::Basic {
+            username: username.clone(),
+            password: password.clone(),
+        },
+        Auth::CookieFile(path) => ElementsRpcAuth::CookieFile(path.clone()),
+    };
+    let source = ElementsRpcChainSource::new(ElementsRpcConfig::new(rpc_url, source_auth))
+        .expect("node Elements RPC source");
+    let genesis_hash = BlockHash::from_str(
+        &rpc.get_block_hash(0)
+            .expect("regtest genesis block")
+            .to_string(),
+    )
+    .expect("Elements genesis hash");
+    let creation_anchor = ChainAnchor {
+        height: u32::try_from(market.accepted.block_height).expect("creation height"),
+        hash: BlockHash::from_str(&market.accepted.block_hash).expect("creation block hash"),
+    };
+    let chain = ChainIdentity {
+        network: LiquidNetwork::ElementsRegtest,
+        genesis_hash,
+    };
+    let contract_id = ContractId::new(OutPoint::new(market.transaction.txid(), 0));
+    let package = ContractPackage {
+        format_version: CONTRACT_PACKAGE_FORMAT_VERSION,
+        chain,
+        roots: vec![contract_id],
+        declarations: vec![ContractDeclaration {
+            contract_id,
+            descriptor: ContractDescriptor::BinaryMarketV1 {
+                params: market.params,
+            },
+        }],
+    };
+
+    let directory = tempfile::tempdir().expect("package-ingestion database directory");
+    let store = Store::open(directory.path().join("deadcat.redb")).expect("open store");
+    store
+        .bind_chain(StoreChainIdentity {
+            network: chain.network,
+            genesis_hash: chain.genesis_hash,
+            policy_asset,
+        })
+        .expect("bind store chain");
+    store
+        .initialize_tip(creation_anchor)
+        .expect("initialize indexed tip");
+    let verifier = RegistrationVerifier::new(
+        &source,
+        &store,
+        LiquidNetwork::ElementsRegtest,
+        genesis_hash,
+        policy_asset,
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("registration runtime");
+
+    let registered = runtime
+        .block_on(verifier.verify_and_register_package(&package))
+        .expect("verify live creation through the Elements backend");
+    assert_eq!(registered.len(), 1);
+    assert!(registered[0].1);
+    assert_eq!(registered[0].0.record.contract_id, contract_id);
+    assert_eq!(
+        registered[0].0.record.params,
+        ContractParameters::BinaryMarket(market.params)
+    );
+    let persisted = store
+        .contract(contract_id)
+        .expect("read registered contract")
+        .expect("registered market");
+    assert_eq!(persisted, registered[0].0.record);
+    let evidence = store
+        .transaction(persisted.creation_position)
+        .expect("read creation evidence")
+        .expect("persisted creation evidence");
+    assert_eq!(
+        elements::encode::deserialize::<Transaction>(&evidence.raw_tx)
+            .expect("decode creation evidence"),
+        market.transaction
+    );
+
+    let repeated = runtime
+        .block_on(verifier.verify_and_register_package(&package))
+        .expect("idempotent live registration retry");
+    assert_eq!(repeated.len(), 1);
+    assert!(!repeated[0].1);
 }
 
 fn dormant_live(transaction: &Transaction) -> BinaryMarketLiveInputs {
@@ -1011,6 +1124,13 @@ fn binary_market_ab_lifecycle_is_accepted_by_elementsd() {
         &funding[0],
         &funding[1],
         expiry_height,
+    );
+    assert_live_elements_package_ingestion(
+        &client.rpc_url(),
+        &client.auth(),
+        &rpc,
+        policy_asset,
+        &market_one,
     );
     let params = market_one.params;
     transactions.push(metrics(

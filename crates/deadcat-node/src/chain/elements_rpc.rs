@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use deadcat_types::{ChainAnchor, DeadcatOutPoint};
+use deadcat_types::ChainAnchor;
 use elements::encode::{deserialize, serialize};
-use elements::{AssetId, Block, BlockHash, Script, Transaction, Txid};
+use elements::{AssetId, Block, BlockHash, OutPoint, Script, Transaction, Txid};
 use reqwest::{Method, RequestBuilder, StatusCode, Url};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -358,10 +358,7 @@ impl ChainSource for ElementsRpcChainSource {
         }
     }
 
-    async fn outspend(
-        &self,
-        outpoint: DeadcatOutPoint,
-    ) -> Result<Option<Outspend>, ChainSourceError> {
+    async fn outspend(&self, outpoint: OutPoint) -> Result<Option<Outspend>, ChainSourceError> {
         let source = self.transaction(outpoint.txid).await?;
         let output_index = usize::try_from(outpoint.vout)
             .map_err(|_| ChainSourceError::NotFound(format!("output {outpoint:?}")))?;

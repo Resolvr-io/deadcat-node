@@ -2,25 +2,32 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use deadcat_contracts::maker_order::CompiledMakerOrder;
 use deadcat_iroh::{RequestHandler as _, SubscriptionItem};
 use deadcat_node::chain::{ChainSource, ChainSourceError, Outspend, TransactionStatus};
 use deadcat_node::rpc_handler::{NodeRpcHandler, RpcHandlerConfig};
 use deadcat_node::store::{
     AssetBinding, AssetRelationKind as StoreAssetRelationKind, BlockDelta, ChainTxDelta,
     ContractParameters, ContractRecord, ContractState, OrderBookEntry, RecoveryHintDelta,
-    ScriptBinding, StateUpdate, Store, TrackedOutpoint, TransitionRecord,
+    RegistrationEvidence, ScriptBinding, StateUpdate, Store, TrackedOutpoint, TransitionRecord,
 };
 use deadcat_rpc::{
     AssetRelationKind, BackendKind, Capability, Event, EventFilter, PageRequest, RecoveryFamily,
     Request, Response, RpcErrorCode,
 };
 use deadcat_types::{
-    BinaryMarketParams, BinaryMarketState, ChainAnchor, ChainPosition, ContractId, ContractKind,
-    ContractSyncState, DeadcatOutPoint, DiscoveryCoverage, DiscoveryMode, LiquidNetwork,
-    MakerOrderParams, MakerOrderState, OrderDirection, OrderSide, RecoveryHintLocation,
+    BinaryMarketParams, BinaryMarketState, CONTRACT_PACKAGE_FORMAT_VERSION, ChainAnchor,
+    ChainIdentity, ChainPosition, ContractDeclaration, ContractDescriptor, ContractId,
+    ContractKind, ContractPackage, ContractSyncState, DiscoveryCoverage, DiscoveryMode,
+    LiquidNetwork, MakerOrderParams, MakerOrderState, OrderDirection, OrderSide,
+    RecoveryHintLocation,
 };
+use elements::confidential::{Asset, Nonce, Value};
 use elements::hashes::Hash as _;
-use elements::{AssetId, Block, BlockHash, LockTime, Script, Transaction, TxIn, TxOut, Txid};
+use elements::{
+    AssetId, Block, BlockHash, LockTime, OutPoint, Script, Transaction, TxIn, TxOut, TxOutWitness,
+    Txid,
+};
 
 #[derive(Clone, Copy)]
 struct MockSource {
@@ -51,10 +58,67 @@ impl ChainSource for MockSource {
         Err(unused_backend_call())
     }
 
-    async fn outspend(
+    async fn outspend(&self, _outpoint: OutPoint) -> Result<Option<Outspend>, ChainSourceError> {
+        Err(unused_backend_call())
+    }
+
+    async fn script_history(&self, _script: &Script) -> Result<Vec<Txid>, ChainSourceError> {
+        Err(unused_backend_call())
+    }
+
+    async fn issuance_transaction(
         &self,
-        _outpoint: DeadcatOutPoint,
-    ) -> Result<Option<Outspend>, ChainSourceError> {
+        _asset_id: AssetId,
+    ) -> Result<Option<Txid>, ChainSourceError> {
+        Err(unused_backend_call())
+    }
+
+    async fn estimate_fee_rate(&self, _target_blocks: u16) -> Result<f64, ChainSourceError> {
+        Err(unused_backend_call())
+    }
+
+    async fn broadcast(&self, _transaction: &Transaction) -> Result<Txid, ChainSourceError> {
+        Err(unused_backend_call())
+    }
+}
+
+#[derive(Clone)]
+struct RegistrationSource {
+    transaction: Transaction,
+    status: TransactionStatus,
+}
+
+#[async_trait]
+impl ChainSource for RegistrationSource {
+    async fn tip(&self) -> Result<ChainAnchor, ChainSourceError> {
+        Ok(anchor(1))
+    }
+
+    async fn block_hash(&self, _height: u32) -> Result<BlockHash, ChainSourceError> {
+        Err(unused_backend_call())
+    }
+
+    async fn block(&self, _hash: BlockHash) -> Result<Block, ChainSourceError> {
+        Err(unused_backend_call())
+    }
+
+    async fn transaction(&self, txid: Txid) -> Result<Transaction, ChainSourceError> {
+        if txid == self.transaction.txid() {
+            Ok(self.transaction.clone())
+        } else {
+            Err(ChainSourceError::NotFound(txid.to_string()))
+        }
+    }
+
+    async fn transaction_status(&self, txid: Txid) -> Result<TransactionStatus, ChainSourceError> {
+        if txid == self.transaction.txid() {
+            Ok(self.status)
+        } else {
+            Err(ChainSourceError::NotFound(txid.to_string()))
+        }
+    }
+
+    async fn outspend(&self, _outpoint: OutPoint) -> Result<Option<Outspend>, ChainSourceError> {
         Err(unused_backend_call())
     }
 
@@ -129,10 +193,7 @@ fn market_record(marker: u8, transaction: &Transaction, tx_index: u32) -> Contra
         base_payout: 100,
         expiry_height: 500,
     };
-    let contract_id = ContractId {
-        cmr: [marker; 32],
-        creation_txid: transaction.txid(),
-    };
+    let contract_id = ContractId::new(OutPoint::new(transaction.txid(), 0));
     ContractRecord {
         contract_id,
         kind: ContractKind::BinaryMarketV1,
@@ -167,7 +228,7 @@ fn market_record(marker: u8, transaction: &Transaction, tx_index: u32) -> Contra
         ],
         outpoints: vec![TrackedOutpoint {
             role: 0,
-            outpoint: DeadcatOutPoint::new(transaction.txid(), 0),
+            outpoint: OutPoint::new(transaction.txid(), 0),
         }],
         order_book: None,
     }
@@ -209,10 +270,7 @@ fn order_record(
         block_height: 1,
         tx_index,
     };
-    let contract_id = ContractId {
-        cmr: [spec.marker; 32],
-        creation_txid: transaction.txid(),
-    };
+    let contract_id = ContractId::new(OutPoint::new(transaction.txid(), 0));
     ContractRecord {
         contract_id,
         kind: ContractKind::MakerOrderV1,
@@ -245,7 +303,7 @@ fn order_record(
         ],
         outpoints: vec![TrackedOutpoint {
             role: 0,
-            outpoint: DeadcatOutPoint::new(transaction.txid(), 0),
+            outpoint: OutPoint::new(transaction.txid(), 0),
         }],
         order_book: Some(OrderBookEntry {
             market_id: market.contract_id,
@@ -387,7 +445,7 @@ fn fixture() -> Fixture {
                     creation_txid: transactions[2].txid(),
                     family: RecoveryFamily::MakerOrderV1,
                     payload: vec![0xdc, 2],
-                    associated_contract: Some(orders[0].contract_id),
+                    associated_contract: None,
                 },
             ],
         })
@@ -519,6 +577,57 @@ async fn materialized_list_book_hint_and_asset_queries_match_the_canonical_store
             && order.outcome_side == Some(OrderSide::Yes)
     }));
 
+    let Response::Orders { page: first } = request(
+        &fixture.handler,
+        Request::ListOrders {
+            market_id: fixture.market.contract_id,
+            side: Some(OrderSide::Yes),
+            direction: Some(OrderDirection::SellBase),
+            page: PageRequest {
+                cursor: None,
+                limit: 1,
+            },
+        },
+    )
+    .await
+    .expect("first order page") else {
+        panic!("unexpected response")
+    };
+    let next = first.next.expect("second order cursor");
+    let error = request(
+        &fixture.handler,
+        Request::ListOrders {
+            market_id: fixture.market.contract_id,
+            side: Some(OrderSide::Yes),
+            direction: Some(OrderDirection::SellQuote),
+            page: PageRequest {
+                cursor: Some(next.clone()),
+                limit: 1,
+            },
+        },
+    )
+    .await
+    .expect_err("changing a cursor's order filter");
+    assert_eq!(error.code, RpcErrorCode::SnapshotInvalidated);
+    let Response::Orders { page: second } = request(
+        &fixture.handler,
+        Request::ListOrders {
+            market_id: fixture.market.contract_id,
+            side: Some(OrderSide::Yes),
+            direction: Some(OrderDirection::SellBase),
+            page: PageRequest {
+                cursor: Some(next),
+                limit: 1,
+            },
+        },
+    )
+    .await
+    .expect("second order page") else {
+        panic!("unexpected response")
+    };
+    assert_eq!(second.contracts.len(), 1);
+    assert!(second.next.is_none());
+
     let Response::OrderBook { book } = request(
         &fixture.handler,
         Request::GetOrderBook {
@@ -548,34 +657,50 @@ async fn materialized_list_book_hint_and_asset_queries_match_the_canonical_store
         &fixture.handler,
         Request::ListRecoveryHints {
             family: None,
-            after: None,
-            limit: 1,
+            page: PageRequest {
+                cursor: None,
+                limit: 1,
+            },
         },
     )
     .await
     .expect("recovery hints") else {
         panic!("unexpected response")
     };
-    assert_eq!(hints.as_of, anchor(1));
+    assert_eq!(hints.snapshot.as_of, anchor(1));
     assert_eq!(hints.hints.len(), 1);
     let next = hints.next.expect("second hint cursor");
-    let Response::RecoveryHints { page: hints } = request(
+    let error = request(
         &fixture.handler,
         Request::ListRecoveryHints {
             family: Some(RecoveryFamily::MakerOrderV1),
-            after: Some(next),
-            limit: 10,
+            page: PageRequest {
+                cursor: Some(next.clone()),
+                limit: 10,
+            },
         },
     )
     .await
-    .expect("filtered recovery hints") else {
+    .expect_err("changing a cursor's recovery-hint filter");
+    assert_eq!(error.code, RpcErrorCode::SnapshotInvalidated);
+
+    let Response::RecoveryHints { page: hints } = request(
+        &fixture.handler,
+        Request::ListRecoveryHints {
+            family: None,
+            page: PageRequest {
+                cursor: Some(next),
+                limit: 10,
+            },
+        },
+    )
+    .await
+    .expect("continued recovery hints") else {
         panic!("unexpected response")
     };
     assert_eq!(hints.hints.len(), 1);
-    assert_eq!(
-        hints.hints[0].associated_contract,
-        Some(fixture.orders[0].contract_id)
-    );
+    assert_eq!(hints.hints[0].family, RecoveryFamily::MakerOrderV1);
+    assert_eq!(hints.hints[0].associated_contract, None);
 
     let Response::Asset { lookup } = request(
         &fixture.handler,
@@ -695,7 +820,7 @@ async fn advisory_routes_use_best_prices_respect_minimums_and_stop_after_resolut
 fn resolve_market(fixture: &Fixture) {
     let mut resolution = transaction(100);
     resolution.input = vec![TxIn {
-        previous_output: fixture.market.outpoints[0].outpoint.into(),
+        previous_output: fixture.market.outpoints[0].outpoint,
         ..TxIn::default()
     }];
     let position = ChainPosition {
@@ -728,7 +853,7 @@ fn resolve_market(fixture: &Fixture) {
                         .collect(),
                     new_outpoints: vec![TrackedOutpoint {
                         role: 0,
-                        outpoint: DeadcatOutPoint::new(resolution.txid(), 0),
+                        outpoint: OutPoint::new(resolution.txid(), 0),
                     }],
                     order_remaining_base: None,
                     transition: TransitionRecord {
@@ -775,19 +900,163 @@ async fn get_info_keeps_index_evidence_when_backend_is_unavailable() {
 #[tokio::test]
 async fn registration_auth_is_checked_before_touching_the_backend() {
     let fixture = fixture();
+    let package = ContractPackage {
+        format_version: CONTRACT_PACKAGE_FORMAT_VERSION,
+        chain: ChainIdentity {
+            network: LiquidNetwork::ElementsRegtest,
+            genesis_hash: block_hash(0),
+        },
+        roots: Vec::new(),
+        declarations: Vec::new(),
+    };
     let error = request(
         &fixture.handler,
-        Request::RegisterContract {
-            candidate: deadcat_rpc::ContractCandidate::BinaryMarket {
-                creation_txid: fixture.transactions[0].txid(),
-                params: None,
-            },
+        Request::RegisterContractPackage {
+            package: package.clone(),
             bearer_token: Some("wrong-secret".to_owned()),
         },
     )
     .await
     .expect_err("incorrect token");
     assert_eq!(error.code, RpcErrorCode::Unauthorized);
+
+    let error = request(
+        &fixture.handler,
+        Request::RegisterContractPackage {
+            package,
+            bearer_token: Some("registration-secret".to_owned()),
+        },
+    )
+    .await
+    .expect_err("empty package");
+    assert_eq!(error.code, RpcErrorCode::InvalidRegistration);
+}
+
+#[tokio::test]
+async fn registration_package_rpc_returns_ordered_idempotent_receipts() {
+    const VALID_XONLY: [u8; 32] = [
+        0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a,
+        0x5e, 0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80,
+        0x3a, 0xc0,
+    ];
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let store = Arc::new(
+        Store::open(directory.path().join("registration.redb")).expect("open registration store"),
+    );
+    store.initialize_tip(anchor(1)).expect("initialize tip");
+
+    // Seed an already verified parent market without a full block row so the
+    // RPC test can focus on the package boundary and exact maker anchor.
+    let parent_transaction = transaction(90);
+    let mut parent = market_record(0x31, &parent_transaction, 0);
+    parent.sync_state = ContractSyncState::CatchingUp {
+        synced_through: anchor(1),
+    };
+    store
+        .register_contract(
+            &parent,
+            &RegistrationEvidence {
+                anchor: anchor(1),
+                transaction: Arc::new(parent_transaction),
+                associated_hint: None,
+            },
+        )
+        .expect("register parent fixture");
+    let ContractParameters::BinaryMarket(parent_params) = parent.params else {
+        panic!("parent market params")
+    };
+
+    let params = MakerOrderParams {
+        base_asset_id: parent_params.yes_token_asset_id,
+        quote_asset_id: parent_params.collateral_asset_id,
+        price: 5,
+        min_active_base: 3,
+        direction: OrderDirection::SellBase,
+        maker_receive_spk_hash: [0x42; 32],
+        maker_pubkey: VALID_XONLY,
+    };
+    let compiled = CompiledMakerOrder::new(params).expect("compile maker order");
+    let creation = Transaction {
+        version: 2,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn::default()],
+        output: vec![TxOut {
+            asset: Asset::Explicit(params.base_asset_id),
+            value: Value::Explicit(10),
+            nonce: Nonce::Null,
+            script_pubkey: compiled.script_pubkey().clone(),
+            witness: TxOutWitness::default(),
+        }],
+    };
+    let contract_id = ContractId::new(OutPoint::new(creation.txid(), 0));
+    let package = ContractPackage {
+        format_version: CONTRACT_PACKAGE_FORMAT_VERSION,
+        chain: ChainIdentity {
+            network: LiquidNetwork::ElementsRegtest,
+            genesis_hash: block_hash(0),
+        },
+        roots: vec![contract_id],
+        declarations: vec![ContractDeclaration {
+            contract_id,
+            descriptor: ContractDescriptor::MakerOrderV1 {
+                parent_market: parent.contract_id,
+                side: OrderSide::Yes,
+                params,
+            },
+        }],
+    };
+    let source = RegistrationSource {
+        transaction: creation,
+        status: TransactionStatus::Confirmed {
+            anchor: anchor(1),
+            tx_index: 1,
+        },
+    };
+    let discovery = DiscoveryCoverage {
+        mode: DiscoveryMode::AdvisoryOnly,
+        from: anchor(1),
+        scanned_through: anchor(1),
+        target_tip: anchor(1),
+        canonical_market_complete: false,
+    };
+    let handler = NodeRpcHandler::new(Arc::new(source), Arc::clone(&store), rpc_config(discovery))
+        .expect("registration handler");
+
+    for already_registered in [false, true] {
+        let response = handler
+            .handle(
+                [0x55; 32],
+                Request::RegisterContractPackage {
+                    package: package.clone(),
+                    bearer_token: Some("registration-secret".to_owned()),
+                },
+            )
+            .await
+            .expect("package registration RPC");
+        let Response::RegistrationAccepted { registration } = response else {
+            panic!("unexpected registration response")
+        };
+        assert_eq!(registration.roots, vec![contract_id]);
+        assert_eq!(registration.contracts.len(), 1);
+        assert_eq!(registration.contracts[0].contract_id, contract_id);
+        assert_eq!(
+            registration.contracts[0].sync_state,
+            ContractSyncState::CatchingUp {
+                synced_through: anchor(1),
+            }
+        );
+        assert_eq!(
+            registration.contracts[0].already_registered,
+            already_registered
+        );
+    }
+    assert!(
+        store
+            .contract(contract_id)
+            .expect("registered order lookup")
+            .is_some()
+    );
 }
 
 #[tokio::test]

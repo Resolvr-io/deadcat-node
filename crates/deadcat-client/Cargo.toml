@@ -22,6 +22,9 @@ thiserror.workspace = true
 
 [dev-dependencies]
 bitcoincore-rpc = "0.19"
+deadcat-node = { path = "../deadcat-node" }
 serde.workspace = true
 serde_json.workspace = true
 smplx-regtest.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

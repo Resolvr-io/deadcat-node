@@ -46,9 +46,10 @@ const TRANSITION_V1_MAKER_CANCELLED: u16 = 0x1102;
 
 /// A structurally validated contract view.
 ///
-/// This proves that the parameters compile to the reported identity and that
-/// the state/live-output shape is coherent. Use [`replay_contract_history`]
-/// to prove the state and live outpoints from canonical transaction evidence.
+/// This proves that the parameters compile and that the state/live-output
+/// shape is coherent. Use [`replay_contract_history`] to prove that the
+/// creation-anchor identity, state, and live outpoints follow from canonical
+/// transaction evidence.
 #[derive(Clone, Debug)]
 pub struct ValidatedContractView {
     view: ContractView,
@@ -99,11 +100,6 @@ pub struct RouteIntent {
 pub fn validate_contract_view(
     view: &ContractView,
 ) -> Result<ValidatedContractView, ValidationError> {
-    if view.creation_txid != view.contract_id.creation_txid {
-        return Err(ValidationError::ContractIdentity(
-            "creation_txid disagrees with the contract ID",
-        ));
-    }
     if sync_anchor(view.sync_state).height < view.creation_position.block_height {
         return Err(ValidationError::ContractShape(
             "sync anchor predates contract creation",
@@ -125,13 +121,8 @@ pub fn validate_contract_view(
             None,
             None,
         ) => {
-            let compiled = CompiledBinaryMarket::new(*params)
+            CompiledBinaryMarket::new(*params)
                 .map_err(|error| ValidationError::Compilation(error.to_string()))?;
-            if compiled.contract_id(view.creation_txid) != view.contract_id {
-                return Err(ValidationError::ContractIdentity(
-                    "binary-market CMR does not compile from the reported parameters",
-                ));
-            }
             BinaryMarketEconomics::new(params.base_payout)
                 .and_then(|economics| economics.validate_state(state))
                 .map_err(|error| ValidationError::Economics(error.to_string()))?;
@@ -144,13 +135,8 @@ pub fn validate_contract_view(
             Some(_),
             Some(_),
         ) => {
-            let compiled = CompiledMakerOrder::new(*params)
+            CompiledMakerOrder::new(*params)
                 .map_err(|error| ValidationError::Compilation(error.to_string()))?;
-            if compiled.contract_id(view.creation_txid) != view.contract_id {
-                return Err(ValidationError::ContractIdentity(
-                    "maker-order CMR does not compile from the reported parameters",
-                ));
-            }
             validate_maker_state(*params, state)?;
             validate_maker_live_shape(state, &view.live_outpoints)?;
         }
@@ -191,9 +177,9 @@ pub fn validate_order_against_parent(
             "order points to a different parent market",
         ));
     }
-    if order.creation_position <= market.creation_position {
+    if order.creation_position < market.creation_position {
         return Err(ValidationError::ParentRelation(
-            "order creation does not follow parent market creation",
+            "order creation precedes parent market creation",
         ));
     }
     let side = order
@@ -412,9 +398,14 @@ pub fn validate_route_suggestion(
 /// Replay a complete ordered history through the canonical contract
 /// interpreters and compare the resulting state and live outpoints with the
 /// reported view. `trusted_snapshot_anchor` and `is_canonical` must come from
-/// a chain source independent of the node response. This detects alteration
-/// of supplied evidence; proving that a remote node did not omit a relevant
-/// transaction still requires a local scan of the contract scripts/outpoints.
+/// a chain source independent of the node response. The callback must verify
+/// that the exact consensus transaction, including all input and output
+/// witnesses, occupies the reported position in the canonical block. Comparing
+/// only the block hash or transaction ID is insufficient because an Elements
+/// transaction ID does not commit to witness data, while contract
+/// interpretation does. Proving that a remote node did not omit another
+/// relevant transaction still requires a local scan of the contract
+/// scripts/outpoints.
 pub fn replay_contract_history<F>(
     expected: &ContractView,
     parent_market: Option<&ContractView>,
@@ -425,7 +416,7 @@ pub fn replay_contract_history<F>(
     mut is_canonical: F,
 ) -> Result<ValidatedContractReplay, ValidationError>
 where
-    F: FnMut(ChainPosition, BlockHash) -> bool,
+    F: FnMut(ChainPosition, BlockHash, &Transaction) -> bool,
 {
     validate_contract_view(expected)?;
     if history.contract_id != expected.contract_id {
@@ -441,8 +432,8 @@ where
     validate_evidence(creation, expected.contract_id, &mut is_canonical)?;
     validate_evidence_snapshot_bound(creation, trusted_snapshot_anchor)?;
     if creation.position != expected.creation_position
-        || creation.txid != expected.creation_txid
-        || creation.transaction.txid() != expected.creation_txid
+        || creation.txid != expected.contract_id.txid()
+        || creation.transaction.txid() != expected.contract_id.txid()
     {
         return Err(ValidationError::CreationMismatch(
             "creation evidence position or txid is wrong",
@@ -525,18 +516,21 @@ fn replay_maker(
 ) -> Result<(), ValidationError> {
     let compiled = CompiledMakerOrder::new(params)
         .map_err(|error| ValidationError::Compilation(error.to_string()))?;
-    let matching = creation
-        .transaction
-        .output
-        .iter()
-        .enumerate()
-        .filter(|(_, output)| output.script_pubkey == *compiled.script_pubkey())
-        .collect::<Vec<_>>();
-    let [(index, output)] = matching.as_slice() else {
+    let index =
+        usize::try_from(expected.contract_id.vout()).map_err(|_| ValidationError::IndexOverflow)?;
+    let output =
+        creation
+            .transaction
+            .output
+            .get(index)
+            .ok_or(ValidationError::CreationMismatch(
+                "maker ContractId output does not exist",
+            ))?;
+    if output.script_pubkey != *compiled.script_pubkey() {
         return Err(ValidationError::CreationMismatch(
-            "maker creation must contain exactly one compiled order output",
+            "maker ContractId output does not use the compiled order script",
         ));
-    };
+    }
     if output.nonce != Nonce::Null || output.witness != TxOutWitness::default() {
         return Err(ValidationError::CreationMismatch(
             "maker creation output is not canonical explicit form",
@@ -578,7 +572,7 @@ fn replay_maker(
             "maker creation capacity is below its minimum",
         ));
     }
-    let index = u32::try_from(*index).map_err(|_| ValidationError::IndexOverflow)?;
+    let index = u32::try_from(index).map_err(|_| ValidationError::IndexOverflow)?;
     let mut state = MakerOrderState::Active {
         remaining_base,
         total_filled_base: 0,
@@ -605,7 +599,7 @@ fn replay_maker(
     let live = live
         .map(|output| LiveOutpoint {
             role: 0,
-            outpoint: output.outpoint.into(),
+            outpoint: output.outpoint,
         })
         .into_iter()
         .collect::<Vec<_>>();
@@ -659,6 +653,11 @@ fn replay_market(
         compiled.slot(BinaryMarketSlot::DormantNoRt).script_pubkey(),
         no_commitments,
     )?;
+    if expected.contract_id.creation_anchor() != OutPoint::new(creation.txid, yes) {
+        return Err(ValidationError::CreationMismatch(
+            "market ContractId does not nominate its initial dormant YES RT output",
+        ));
+    }
     let mut state = BinaryMarketState::Trading {
         outstanding_pairs: 0,
     };
@@ -692,7 +691,7 @@ fn validate_evidence<F>(
     is_canonical: &mut F,
 ) -> Result<(), ValidationError>
 where
-    F: FnMut(ChainPosition, BlockHash) -> bool,
+    F: FnMut(ChainPosition, BlockHash, &Transaction) -> bool,
 {
     if evidence.transaction.txid() != evidence.txid {
         return Err(ValidationError::EvidenceTxidMismatch);
@@ -700,7 +699,11 @@ where
     if !evidence.affected_contract_ids.contains(&contract_id) {
         return Err(ValidationError::EvidenceContractMissing(contract_id));
     }
-    if !(is_canonical)(evidence.position, evidence.block_hash) {
+    if !(is_canonical)(
+        evidence.position,
+        evidence.block_hash,
+        &evidence.transaction,
+    ) {
         return Err(ValidationError::NonCanonicalEvidence {
             position: evidence.position,
             block_hash: evidence.block_hash,
@@ -971,7 +974,7 @@ const fn feasible_route_fill(capacity: u64, minimum: u64, requested: u64) -> Opt
     }
 }
 
-fn ask_key(level: &OrderBookLevel) -> (u8, u32, ChainPosition, [u8; 64]) {
+fn ask_key(level: &OrderBookLevel) -> (u8, u32, ChainPosition, [u8; 36]) {
     (
         side_byte(level.side),
         level.price,
@@ -980,7 +983,7 @@ fn ask_key(level: &OrderBookLevel) -> (u8, u32, ChainPosition, [u8; 64]) {
     )
 }
 
-fn bid_key(level: &OrderBookLevel) -> (u8, Reverse<u32>, ChainPosition, [u8; 64]) {
+fn bid_key(level: &OrderBookLevel) -> (u8, Reverse<u32>, ChainPosition, [u8; 36]) {
     (
         side_byte(level.side),
         Reverse(level.price),
@@ -1121,19 +1124,19 @@ fn market_live_outpoints(
     if let Some(item) = &live.yes_rt {
         output.push(LiveOutpoint {
             role: market_slot_from_script(compiled, item)?,
-            outpoint: item.outpoint.into(),
+            outpoint: item.outpoint,
         });
     }
     if let Some(item) = &live.no_rt {
         output.push(LiveOutpoint {
             role: market_slot_from_script(compiled, item)?,
-            outpoint: item.outpoint.into(),
+            outpoint: item.outpoint,
         });
     }
     if let Some(item) = &live.collateral {
         output.push(LiveOutpoint {
             role: market_slot_from_script(compiled, item)?,
-            outpoint: item.outpoint.into(),
+            outpoint: item.outpoint,
         });
     }
     Ok(output)
@@ -1269,8 +1272,6 @@ const fn outcome_byte(outcome: BinaryOutcome) -> u8 {
 pub enum ValidationError {
     #[error("unsupported contract kind")]
     UnsupportedContractKind,
-    #[error("invalid contract identity: {0}")]
-    ContractIdentity(&'static str),
     #[error("invalid contract shape: {0}")]
     ContractShape(&'static str),
     #[error("contract compilation failed: {0}")]
@@ -1347,13 +1348,13 @@ mod tests {
     use deadcat_contracts::recovery::{MarketCollateral, MarketRecoveryHint};
     use deadcat_contracts::rt::{RtLeg, RtSide, commitments, factors};
     use deadcat_rpc::{ContractParametersView, ContractStateView};
-    use deadcat_types::DeadcatOutPoint;
     use elements::confidential::{Asset, Nonce, Value};
     use elements::hashes::Hash as _;
     use elements::pset::{Input as PsetInput, Output as PsetOutput};
     use elements::secp256k1_zkp::{Keypair, Secp256k1, Tweak};
     use elements::{
-        AssetId, AssetIssuance, LockTime, Script, Sequence, Transaction, TxIn, TxOut, Txid,
+        AssetId, AssetIssuance, LockTime, OutPoint, Script, Sequence, Transaction, TxIn, TxOut,
+        Txid,
     };
     use sha2::{Digest as _, Sha256};
 
@@ -1422,14 +1423,12 @@ mod tests {
     fn market_view(at: ChainAnchor) -> ContractView {
         let params = base_market_params();
         let creation_txid = txid(0x21);
-        let contract_id = CompiledBinaryMarket::new(params)
-            .expect("compile")
-            .contract_id(creation_txid);
+        CompiledBinaryMarket::new(params).expect("compile");
+        let contract_id = ContractId::new(OutPoint::new(creation_txid, 0));
         ContractView {
             contract_id,
             kind: ContractKind::BinaryMarketV1,
             sync_state: ContractSyncState::Ready { synced_through: at },
-            creation_txid,
             creation_position: position(1, 0),
             parameters: ContractParametersView::BinaryMarket { params },
             state: ContractStateView::BinaryMarket {
@@ -1442,11 +1441,11 @@ mod tests {
             live_outpoints: vec![
                 LiveOutpoint {
                     role: BinaryMarketSlot::DormantYesRt as u8,
-                    outpoint: DeadcatOutPoint::new(creation_txid, 0),
+                    outpoint: OutPoint::new(creation_txid, 0),
                 },
                 LiveOutpoint {
                     role: BinaryMarketSlot::DormantNoRt as u8,
-                    outpoint: DeadcatOutPoint::new(creation_txid, 1),
+                    outpoint: OutPoint::new(creation_txid, 1),
                 },
             ],
         }
@@ -1484,14 +1483,12 @@ mod tests {
             maker_pubkey: key(0x41),
         };
         let creation_txid = txid(creation_byte);
-        let contract_id = CompiledMakerOrder::new(params)
-            .expect("compile")
-            .contract_id(creation_txid);
+        CompiledMakerOrder::new(params).expect("compile");
+        let contract_id = ContractId::new(OutPoint::new(creation_txid, 0));
         ContractView {
             contract_id,
             kind: ContractKind::MakerOrderV1,
             sync_state: ContractSyncState::Ready { synced_through: at },
-            creation_txid,
             creation_position: position(2, u32::from(creation_byte)),
             parameters: ContractParametersView::MakerOrder { params },
             state: ContractStateView::MakerOrder {
@@ -1504,7 +1501,7 @@ mod tests {
             outcome_side: Some(OrderSide::Yes),
             live_outpoints: vec![LiveOutpoint {
                 role: 0,
-                outpoint: DeadcatOutPoint::new(creation_txid, 0),
+                outpoint: OutPoint::new(creation_txid, 0),
             }],
         }
     }
@@ -1547,19 +1544,12 @@ mod tests {
     }
 
     #[test]
-    fn contract_identity_shape_and_snapshot_anchor_fail_closed() {
+    fn contract_shape_and_snapshot_anchor_fail_closed() {
         let tip = anchor(8, 0x80);
         let market = market_view(tip);
         validate_contract_view(&market).expect("valid market");
         validate_market_snapshot(&market_snapshot(market.clone(), tip), tip)
             .expect("trusted snapshot");
-
-        let mut bad_cmr = market.clone();
-        bad_cmr.contract_id.cmr[0] ^= 1;
-        assert!(matches!(
-            validate_contract_view(&bad_cmr),
-            Err(ValidationError::ContractIdentity(_))
-        ));
 
         let mut bad_live = market.clone();
         bad_live.live_outpoints[0].role = BinaryMarketSlot::UnresolvedYesRt as u8;
@@ -1606,9 +1596,6 @@ mod tests {
             .into_binary_market()
             .expect("market")
             .no_token_asset_id;
-        wrong_asset.contract_id = CompiledMakerOrder::new(*params)
-            .expect("compile")
-            .contract_id(wrong_asset.creation_txid);
         assert!(matches!(
             validate_order_against_parent(&wrong_asset, &market),
             Err(ValidationError::ParentEconomics(_))
@@ -1670,8 +1657,7 @@ mod tests {
                 compiled.script_pubkey().clone(),
             )],
         };
-        expected.creation_txid = creation_tx.txid();
-        expected.contract_id = compiled.contract_id(creation_tx.txid());
+        expected.contract_id = ContractId::new(OutPoint::new(creation_tx.txid(), 0));
         expected.creation_position = position(2, 0);
         expected.state = ContractStateView::MakerOrder {
             state: MakerOrderState::Cancelled,
@@ -1721,9 +1707,13 @@ mod tests {
             }],
             next: None,
         };
-        let canonical = |pos: ChainPosition, hash: BlockHash| {
-            (pos == position(2, 0) && hash == block(0x82))
-                || (pos == position(3, 0) && hash == final_tip.hash)
+        let creation_wtxid = creation.transaction.wtxid();
+        let cancellation_wtxid = cancellation.transaction.wtxid();
+        let canonical = |pos: ChainPosition, hash: BlockHash, transaction: &Transaction| {
+            (pos == position(2, 0) && hash == block(0x82) && transaction.wtxid() == creation_wtxid)
+                || (pos == position(3, 0)
+                    && hash == final_tip.hash
+                    && transaction.wtxid() == cancellation_wtxid)
         };
         let replay = replay_contract_history(
             &expected,
@@ -1759,7 +1749,27 @@ mod tests {
                 &creation,
                 std::slice::from_ref(&cancellation),
                 final_tip,
-                |_, _| false
+                |_, _, _| false
+            ),
+            Err(ValidationError::NonCanonicalEvidence { .. })
+        ));
+
+        let mut witness_mutated = cancellation.clone();
+        witness_mutated.transaction.input[0].witness.script_witness[0][0] ^= 1;
+        assert_eq!(witness_mutated.transaction.txid(), cancellation.txid);
+        assert_ne!(
+            witness_mutated.transaction.wtxid(),
+            cancellation.transaction.wtxid()
+        );
+        assert!(matches!(
+            replay_contract_history(
+                &expected,
+                Some(&market),
+                &history,
+                &creation,
+                &[witness_mutated],
+                final_tip,
+                canonical,
             ),
             Err(ValidationError::NonCanonicalEvidence { .. })
         ));
@@ -1777,6 +1787,142 @@ mod tests {
                 canonical
             ),
             Err(ValidationError::EvidenceContractMissing(id)) if id == expected.contract_id
+        ));
+    }
+
+    #[test]
+    fn maker_creation_replay_uses_the_exact_nominated_output() {
+        let tip = anchor(2, 0x82);
+        let market = market_view(tip);
+        let template = order_view(&market, tip, 0x31, 5, OrderDirection::SellBase);
+        let ContractParametersView::MakerOrder { params } = template.parameters else {
+            unreachable!()
+        };
+        let compiled = CompiledMakerOrder::new(params).expect("compile");
+        let order_output =
+            explicit_output(params.base_asset_id, 10, compiled.script_pubkey().clone());
+        let creation_tx = Transaction {
+            version: 2,
+            lock_time: LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![
+                order_output.clone(),
+                order_output,
+                explicit_output(params.base_asset_id, 10, Script::new()),
+            ],
+        };
+        let ids = [
+            ContractId::new(OutPoint::new(creation_tx.txid(), 0)),
+            ContractId::new(OutPoint::new(creation_tx.txid(), 1)),
+            ContractId::new(OutPoint::new(creation_tx.txid(), 2)),
+        ];
+        let evidence = TransactionEvidence {
+            position: position(2, 0),
+            block_hash: tip.hash,
+            txid: creation_tx.txid(),
+            transaction: creation_tx,
+            affected_contract_ids: ids.to_vec(),
+        };
+        let evidence_wtxid = evidence.transaction.wtxid();
+
+        for (vout, contract_id) in ids[..2].iter().copied().enumerate() {
+            let mut expected = template.clone();
+            expected.contract_id = contract_id;
+            expected.creation_position = evidence.position;
+            expected.state = ContractStateView::MakerOrder {
+                state: MakerOrderState::Active {
+                    remaining_base: 10,
+                    total_filled_base: 0,
+                },
+            };
+            expected.live_outpoints = vec![LiveOutpoint {
+                role: 0,
+                outpoint: OutPoint::new(evidence.txid, u32::try_from(vout).expect("vout")),
+            }];
+            let history = ContractHistoryPage {
+                snapshot: SnapshotMetadata {
+                    as_of: tip,
+                    event_high_watermark: deadcat_types::EventCursor {
+                        epoch: [0x82; 16],
+                        sequence: 1,
+                    },
+                },
+                contract_id,
+                entries: Vec::new(),
+                next: None,
+            };
+            replay_contract_history(
+                &expected,
+                Some(&market),
+                &history,
+                &evidence,
+                &[],
+                tip,
+                |position, hash, transaction| {
+                    position == evidence.position
+                        && hash == tip.hash
+                        && transaction.wtxid() == evidence_wtxid
+                },
+            )
+            .expect("identical maker output has an independent exact-vout identity");
+        }
+
+        let mut wrong_script = template;
+        wrong_script.contract_id = ids[2];
+        wrong_script.creation_position = evidence.position;
+        let history = ContractHistoryPage {
+            snapshot: SnapshotMetadata {
+                as_of: tip,
+                event_high_watermark: deadcat_types::EventCursor {
+                    epoch: [0x82; 16],
+                    sequence: 1,
+                },
+            },
+            contract_id: ids[2],
+            entries: Vec::new(),
+            next: None,
+        };
+        assert!(matches!(
+            replay_contract_history(
+                &wrong_script,
+                Some(&market),
+                &history,
+                &evidence,
+                &[],
+                tip,
+                |position, hash, transaction| {
+                    position == evidence.position
+                        && hash == tip.hash
+                        && transaction.wtxid() == evidence_wtxid
+                },
+            ),
+            Err(ValidationError::CreationMismatch(message))
+                if message.contains("compiled order script")
+        ));
+
+        let missing_id = ContractId::new(OutPoint::new(evidence.txid, 3));
+        let mut missing = wrong_script;
+        missing.contract_id = missing_id;
+        let mut missing_evidence = evidence;
+        missing_evidence.affected_contract_ids.push(missing_id);
+        let mut missing_history = history;
+        missing_history.contract_id = missing_id;
+        assert!(matches!(
+            replay_contract_history(
+                &missing,
+                Some(&market),
+                &missing_history,
+                &missing_evidence,
+                &[],
+                tip,
+                |position, hash, transaction| {
+                    position == missing_evidence.position
+                        && hash == tip.hash
+                        && transaction.wtxid() == missing_evidence.transaction.wtxid()
+                },
+            ),
+            Err(ValidationError::CreationMismatch(message))
+                if message.contains("does not exist")
         ));
     }
 
@@ -1840,14 +1986,13 @@ mod tests {
             ],
         };
         let tip = anchor(4, 0x84);
-        let id = compiled.contract_id(creation_tx.txid());
+        let id = ContractId::new(OutPoint::new(creation_tx.txid(), 0));
         let expected = ContractView {
             contract_id: id,
             kind: ContractKind::BinaryMarketV1,
             sync_state: ContractSyncState::Ready {
                 synced_through: tip,
             },
-            creation_txid: creation_tx.txid(),
             creation_position: position(4, 0),
             parameters: ContractParametersView::BinaryMarket { params },
             state: ContractStateView::BinaryMarket {
@@ -1860,11 +2005,11 @@ mod tests {
             live_outpoints: vec![
                 LiveOutpoint {
                     role: BinaryMarketSlot::DormantYesRt as u8,
-                    outpoint: DeadcatOutPoint::new(creation_tx.txid(), 0),
+                    outpoint: OutPoint::new(creation_tx.txid(), 0),
                 },
                 LiveOutpoint {
                     role: BinaryMarketSlot::DormantNoRt as u8,
-                    outpoint: DeadcatOutPoint::new(creation_tx.txid(), 1),
+                    outpoint: OutPoint::new(creation_tx.txid(), 1),
                 },
             ],
         };
@@ -1887,6 +2032,7 @@ mod tests {
             entries: Vec::new(),
             next: None,
         };
+        let evidence_wtxid = evidence.transaction.wtxid();
         replay_contract_history(
             &expected,
             None,
@@ -1894,9 +2040,36 @@ mod tests {
             &evidence,
             &[],
             tip,
-            |pos, hash| pos == position(4, 0) && hash == tip.hash,
+            |pos, hash, transaction| {
+                pos == position(4, 0) && hash == tip.hash && transaction.wtxid() == evidence_wtxid
+            },
         )
         .expect("market creation replay");
+
+        let wrong_anchor_id = ContractId::new(OutPoint::new(evidence.txid, 1));
+        let mut wrong_anchor_view = expected.clone();
+        wrong_anchor_view.contract_id = wrong_anchor_id;
+        let mut wrong_anchor_evidence = evidence.clone();
+        wrong_anchor_evidence.affected_contract_ids = vec![wrong_anchor_id];
+        let mut wrong_anchor_history = history.clone();
+        wrong_anchor_history.contract_id = wrong_anchor_id;
+        assert!(matches!(
+            replay_contract_history(
+                &wrong_anchor_view,
+                None,
+                &wrong_anchor_history,
+                &wrong_anchor_evidence,
+                &[],
+                tip,
+                |pos, hash, transaction| {
+                    pos == position(4, 0)
+                        && hash == tip.hash
+                        && transaction.wtxid() == evidence_wtxid
+                },
+            ),
+            Err(ValidationError::CreationMismatch(message))
+                if message.contains("initial dormant YES RT output")
+        ));
 
         let mut bad_evidence = evidence;
         let (asset, value) = commitments(
@@ -1907,15 +2080,14 @@ mod tests {
         bad_evidence.transaction.output[0].asset = asset;
         bad_evidence.transaction.output[0].value = value;
         let bad_txid = bad_evidence.transaction.txid();
-        let bad_id = compiled.contract_id(bad_txid);
+        let bad_id = ContractId::new(OutPoint::new(bad_txid, 0));
         bad_evidence.txid = bad_txid;
         bad_evidence.affected_contract_ids = vec![bad_id];
 
         let mut bad_expected = expected;
         bad_expected.contract_id = bad_id;
-        bad_expected.creation_txid = bad_txid;
-        bad_expected.live_outpoints[0].outpoint = DeadcatOutPoint::new(bad_txid, 0);
-        bad_expected.live_outpoints[1].outpoint = DeadcatOutPoint::new(bad_txid, 1);
+        bad_expected.live_outpoints[0].outpoint = OutPoint::new(bad_txid, 0);
+        bad_expected.live_outpoints[1].outpoint = OutPoint::new(bad_txid, 1);
         let mut bad_history = history;
         bad_history.contract_id = bad_id;
 
@@ -1927,7 +2099,11 @@ mod tests {
                 &bad_evidence,
                 &[],
                 tip,
-                |pos, hash| pos == position(4, 0) && hash == tip.hash,
+                |pos, hash, transaction| {
+                    pos == position(4, 0)
+                        && hash == tip.hash
+                        && transaction.wtxid() == bad_evidence.transaction.wtxid()
+                },
             ),
             Err(ValidationError::CreationMismatchOwned(message)) if message.contains("found 0")
         ));
@@ -2026,8 +2202,7 @@ mod tests {
             .expect("official A-to-B issuance");
         let issuance_tx = issuance_pset.extract_tx().expect("issuance transaction");
 
-        let compiled = CompiledBinaryMarket::new(params).expect("compile market");
-        let contract_id = compiled.contract_id(creation_tx.txid());
+        let contract_id = ContractId::new(OutPoint::new(creation_tx.txid(), 0));
         let creation_position = position(1, 0);
         let issuance_position = position(2, 0);
         let creation_block = block(0x81);
@@ -2038,7 +2213,6 @@ mod tests {
             sync_state: ContractSyncState::Ready {
                 synced_through: tip,
             },
-            creation_txid: creation_tx.txid(),
             creation_position,
             parameters: ContractParametersView::BinaryMarket { params },
             state: ContractStateView::BinaryMarket {
@@ -2051,15 +2225,15 @@ mod tests {
             live_outpoints: vec![
                 LiveOutpoint {
                     role: BinaryMarketSlot::UnresolvedYesRt as u8,
-                    outpoint: DeadcatOutPoint::new(issuance_tx.txid(), 0),
+                    outpoint: OutPoint::new(issuance_tx.txid(), 0),
                 },
                 LiveOutpoint {
                     role: BinaryMarketSlot::UnresolvedNoRt as u8,
-                    outpoint: DeadcatOutPoint::new(issuance_tx.txid(), 1),
+                    outpoint: OutPoint::new(issuance_tx.txid(), 1),
                 },
                 LiveOutpoint {
                     role: BinaryMarketSlot::UnresolvedCollateral as u8,
-                    outpoint: DeadcatOutPoint::new(issuance_tx.txid(), 2),
+                    outpoint: OutPoint::new(issuance_tx.txid(), 2),
                 },
             ],
         };
@@ -2105,9 +2279,15 @@ mod tests {
             }],
             next: None,
         };
-        let canonical = |position, hash| {
-            (position == creation_position && hash == creation_block)
-                || (position == issuance_position && hash == tip.hash)
+        let creation_wtxid = creation.transaction.wtxid();
+        let issuance_wtxid = issuance.transaction.wtxid();
+        let canonical = |position, hash, transaction: &Transaction| {
+            (position == creation_position
+                && hash == creation_block
+                && transaction.wtxid() == creation_wtxid)
+                || (position == issuance_position
+                    && hash == tip.hash
+                    && transaction.wtxid() == issuance_wtxid)
         };
 
         let replay = replay_contract_history(
@@ -2131,6 +2311,7 @@ mod tests {
         wrong_side.transaction.output[0].asset = asset;
         wrong_side.transaction.output[0].value = value;
         wrong_side.txid = wrong_side.transaction.txid();
+        let wrong_side_wtxid = wrong_side.transaction.wtxid();
         let mut wrong_side_history = history.clone();
         wrong_side_history.entries[0].txid = wrong_side.txid;
         assert!(matches!(
@@ -2141,7 +2322,14 @@ mod tests {
                 &creation,
                 &[wrong_side],
                 tip,
-                canonical,
+                |position, hash, transaction| {
+                    (position == creation_position
+                        && hash == creation_block
+                        && transaction.wtxid() == creation_wtxid)
+                        || (position == issuance_position
+                            && hash == tip.hash
+                            && transaction.wtxid() == wrong_side_wtxid)
+                },
             ),
             Err(ValidationError::Interpretation(_))
         ));
@@ -2152,6 +2340,7 @@ mod tests {
             .asset_blinding_nonce =
             Tweak::from_inner(RtSide::B.abf()).expect("opposite public ABF");
         wrong_nonce.txid = wrong_nonce.transaction.txid();
+        let wrong_nonce_wtxid = wrong_nonce.transaction.wtxid();
         let mut wrong_nonce_history = history.clone();
         wrong_nonce_history.entries[0].txid = wrong_nonce.txid;
         assert!(matches!(
@@ -2162,7 +2351,14 @@ mod tests {
                 &creation,
                 &[wrong_nonce],
                 tip,
-                canonical,
+                |position, hash, transaction| {
+                    (position == creation_position
+                        && hash == creation_block
+                        && transaction.wtxid() == creation_wtxid)
+                        || (position == issuance_position
+                            && hash == tip.hash
+                            && transaction.wtxid() == wrong_nonce_wtxid)
+                },
             ),
             Err(ValidationError::Interpretation(_))
         ));
