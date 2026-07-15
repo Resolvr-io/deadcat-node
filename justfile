@@ -38,8 +38,15 @@ regtest-maker-orders: generate
         maker_order_lifecycle_is_accepted_by_elementsd \
         -- --ignored --nocapture --test-threads=1
 
+# Run one real transaction that advances multiple covenant instances, then
+# prove transaction-atomic indexing and canonical replay on liquidregtest.
+regtest-multi-contract: generate
+    cargo test --locked -p deadcat-client --test market_regtest \
+        multi_contract_transaction_is_accepted_and_indexed_by_elementsd \
+        -- --ignored --nocapture --test-threads=1
+
 # Every isolated live-chain protocol gate required before CI succeeds.
-regtest: regtest-market-ab regtest-maker-orders
+regtest: regtest-market-ab regtest-maker-orders regtest-multi-contract
 
 wasm-check:
     NIX_HARDENING_ENABLE=pic cargo check --locked -p deadcat-iroh --lib --target wasm32-unknown-unknown

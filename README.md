@@ -46,6 +46,11 @@ key cancellation, package registration and historical backfill, independent
 client replay, restart, and real alternate-hash one-/two-block reorgs. The gate
 also proves the intentional post-resolution split: Elements still accepts a
 custom fill while official node routing refuses it.
+The mandatory multi-contract liquidregtest gate extends protocol assurance from
+isolated covenant lifecycles to composed chain ingestion. One real consensus
+transaction advances a market and two maker orders, then is interpreted,
+indexed, restarted, reorganized, and independently replayed as one atomic
+transaction.
 
 This is not yet a production release. Public Liquid testnet shakedowns,
 operational backup/restore tooling, Nostr announcement ingestion, browser
@@ -80,6 +85,7 @@ The focused live-chain gates can be run independently:
 ```sh
 just regtest-market-ab
 just regtest-maker-orders
+just regtest-multi-contract
 ```
 
 Run against Elements Core:
@@ -139,3 +145,4 @@ Start with:
 - [Architecture decisions](docs/adr/README.md)
 - [Binary-market A/B acceptance packet](docs/acceptance/binary-market-ab-v1.md)
 - [Maker-order live acceptance packet](docs/acceptance/maker-orders-v1.md)
+- [Multi-contract live acceptance packet](docs/acceptance/multi-contract-v1.md)
