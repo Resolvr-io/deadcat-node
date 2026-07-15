@@ -1,37 +1,66 @@
-//! Serial, production-shaped A/B binary-market lifecycle on liquidregtest.
+//! Serial, production-shaped Deadcat protocol lifecycles on liquidregtest.
 //!
 //! This test is ignored by ordinary `cargo test` because it starts an isolated
 //! `elementsd` + Electrs pair. It is required by `just ci` through the explicit
-//! `just regtest` suite and can be run alone with `just regtest-market-ab`.
+//! `just regtest` suite. Its focused recipes are `just regtest-market-ab` and
+//! `just regtest-maker-orders`.
 
+use std::collections::HashMap;
 use std::str::FromStr as _;
+use std::sync::Arc;
+use std::time::Duration;
 
 use bitcoincore_rpc::{Auth, Client, RpcApi};
+use deadcat_client::keys::{DeadcatKeychain, DerivedOwnedOrder, MakerOrderTerms};
+use deadcat_client::maker_builder::{MakerFillPlan, maker_order_creation_outputs};
 use deadcat_client::market_builder::{
     BinaryMarketCreationPlan, BinaryMarketLiveInputs, BinaryMarketTransitionPlan,
     MarketCreationContext, MarketIssuanceEntropies, MarketRtInput, OracleAttestation,
 };
+use deadcat_client::recover_order_candidate_index;
+use deadcat_client::validation::replay_contract_history;
 use deadcat_contracts::SimplicityNetwork;
 use deadcat_contracts::binary_market::{BinaryMarketAction, BinaryMarketEconomics, BinaryOutcome};
+use deadcat_contracts::maker_order::CompiledMakerOrder;
 use deadcat_contracts::market_crypto::{
     BinaryOutcome as OracleOutcome, derive_issuance_assets, oracle_message,
 };
-use deadcat_contracts::recovery::{MarketCollateral, MarketRecoveryHint};
+use deadcat_contracts::recovery::{
+    MarketCollateral, MarketRecoveryHint, OrderRecoveryHint, validate_recovery_txout,
+};
 use deadcat_contracts::rt::{RtLeg, RtSide, add_mod_order, cbf, factors, infer_side};
+use deadcat_iroh::RequestHandler as _;
+use deadcat_node::chain::ChainSource as _;
 use deadcat_node::chain::elements_rpc::{
     ElementsRpcAuth, ElementsRpcChainSource, ElementsRpcConfig,
 };
+use deadcat_node::interpreter::{
+    DeadcatInterpreter, TRANSITION_V1_MAKER_CANCELLED, TRANSITION_V1_MAKER_FILLED,
+};
 use deadcat_node::registration::RegistrationVerifier;
-use deadcat_node::store::{ChainIdentity as StoreChainIdentity, ContractParameters, Store};
+use deadcat_node::rpc_handler::{NodeRpcHandler, RpcHandlerConfig};
+use deadcat_node::store::{
+    ChainIdentity as StoreChainIdentity, ContractParameters, ContractState, Store,
+};
+use deadcat_node::sync::{SyncCoordinator, SyncOutcome};
+use deadcat_rpc::{
+    BackendKind, ContractHistoryPage, ContractStateView, ContractView, PageRequest, RecoveryFamily,
+    Request, Response, RpcErrorCode, TransactionEvidence,
+};
 use deadcat_types::{
     BinaryMarketParams, BinaryMarketState, CONTRACT_PACKAGE_FORMAT_VERSION, ChainAnchor,
-    ChainIdentity, ContractDeclaration, ContractDescriptor, ContractId, ContractPackage,
-    LiquidNetwork,
+    ChainIdentity, ChainPosition, ContractDeclaration, ContractDescriptor, ContractId,
+    ContractPackage, ContractSyncState, DiscoveryCoverage, DiscoveryMode, LiquidNetwork,
+    MakerOrderParams, MakerOrderState, OrderDirection, OrderSide,
 };
 use elements::confidential::{Asset, AssetBlindingFactor, Nonce, Value, ValueBlindingFactor};
+use elements::hashes::Hash as _;
 use elements::pset::{Input as PsetInput, Output as PsetOutput, PartiallySignedTransaction};
+use elements::schnorr::TapTweak as _;
 use elements::secp256k1_zkp::rand::thread_rng;
 use elements::secp256k1_zkp::{Keypair, Message, Secp256k1, SecretKey, SurjectionProof, Tweak};
+use elements::sighash::{Prevouts, SchnorrSighashType, SighashCache};
+use elements::taproot::{TapLeafHash, TapNodeHash};
 use elements::{
     AssetId, BlockHash, OutPoint, Script, Transaction, TxOut, TxOutSecrets, TxOutWitness,
 };
@@ -638,6 +667,616 @@ fn build_issuance(
 struct WalletUtxo {
     outpoint: OutPoint,
     txout: TxOut,
+}
+
+const MAKER_MNEMONIC: &str =
+    "exist carry drive collect lend cereal occur much tiger just involve mean";
+const MAKER_PRICE: u32 = 7;
+const MAKER_MINIMUM: u32 = 3;
+const MAKER_CAPACITY: u64 = 10;
+
+struct LiveMakerOrder {
+    order_index: u16,
+    side: OrderSide,
+    owned: DerivedOwnedOrder,
+    contract_id: ContractId,
+    output: WalletUtxo,
+    hint_vout: u32,
+}
+
+fn explicit_value(txout: &TxOut) -> u64 {
+    let Value::Explicit(value) = txout.value else {
+        panic!("test wallet output value must be explicit")
+    };
+    value
+}
+
+fn maker_terms(
+    market: BinaryMarketParams,
+    side: OrderSide,
+    direction: OrderDirection,
+) -> MakerOrderTerms {
+    MakerOrderTerms {
+        base_asset_id: match side {
+            OrderSide::Yes => market.yes_token_asset_id,
+            OrderSide::No => market.no_token_asset_id,
+        },
+        quote_asset_id: market.collateral_asset_id,
+        price: MAKER_PRICE,
+        min_active_base: MAKER_MINIMUM,
+        direction,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_maker_orders(
+    signer: &Signer,
+    rpc: &Client,
+    miner: &ElementsRpc,
+    keychain: &DeadcatKeychain,
+    market: &CreatedMarket,
+    yes_tokens: &WalletUtxo,
+    no_tokens: &WalletUtxo,
+    funding: &Funding,
+) -> (
+    Transaction,
+    AcceptedTx,
+    Vec<LiveMakerOrder>,
+    WalletUtxo,
+    WalletUtxo,
+) {
+    let definitions = [
+        (0_u16, OrderSide::Yes, OrderDirection::SellBase),
+        (1, OrderSide::No, OrderDirection::SellQuote),
+        (2, OrderSide::No, OrderDirection::SellBase),
+        (3, OrderSide::Yes, OrderDirection::SellBase),
+    ];
+    let owned = definitions
+        .into_iter()
+        .map(|(index, side, direction)| {
+            let terms = maker_terms(market.params, side, direction);
+            let owned = keychain
+                .derive_owned_order(index, market.transaction.txid(), side, terms)
+                .expect("derive mnemonic-owned maker order");
+            (index, side, owned)
+        })
+        .collect::<Vec<_>>();
+
+    let mut pset = PartiallySignedTransaction::new_v2();
+    pset.add_input(pset_input(yes_tokens.outpoint, yes_tokens.txout.clone()));
+    pset.add_input(pset_input(no_tokens.outpoint, no_tokens.txout.clone()));
+    pset.add_input(pset_input(funding.outpoint, funding.txout.clone()));
+
+    let mut positions = Vec::with_capacity(owned.len());
+    for (index, side, owned) in owned {
+        let creation = maker_order_creation_outputs(
+            market.params.collateral_asset_id,
+            owned.params,
+            MAKER_CAPACITY,
+            &owned.keys.maker_receive_spk,
+            owned.recovery_hint,
+        )
+        .expect("canonical maker-order outputs");
+        let order_vout = u32::try_from(pset.outputs().len()).expect("order vout");
+        pset.add_output(PsetOutput::from_txout(creation.order));
+        let hint_vout = u32::try_from(pset.outputs().len()).expect("hint vout");
+        pset.add_output(PsetOutput::from_txout(creation.recovery_hint));
+        positions.push((index, side, owned, order_vout, hint_vout));
+    }
+
+    pset.add_output(PsetOutput::from_txout(explicit_txout(
+        market.params.yes_token_asset_id,
+        explicit_value(&yes_tokens.txout) - MAKER_CAPACITY * 2,
+        signer.get_address().script_pubkey(),
+    )));
+    pset.add_output(PsetOutput::from_txout(explicit_txout(
+        market.params.no_token_asset_id,
+        explicit_value(&no_tokens.txout) - MAKER_CAPACITY,
+        signer.get_address().script_pubkey(),
+    )));
+    pset.add_output(PsetOutput::from_txout(explicit_txout(
+        market.params.collateral_asset_id,
+        FUNDING_VALUE - MAKER_CAPACITY * u64::from(MAKER_PRICE) - FEE,
+        signer.get_address().script_pubkey(),
+    )));
+    pset.add_output(PsetOutput::from_txout(TxOut::new_fee(
+        FEE,
+        market.params.collateral_asset_id,
+    )));
+    sign_input(signer, &mut pset, 0);
+    sign_input(signer, &mut pset, 1);
+    sign_input(signer, &mut pset, 2);
+    let transaction = pset.extract_tx().expect("maker creation transaction");
+
+    for (_, _, owned, order_vout, hint_vout) in &positions {
+        let capacity = MAKER_CAPACITY;
+        let expected = maker_order_creation_outputs(
+            market.params.collateral_asset_id,
+            owned.params,
+            capacity,
+            &owned.keys.maker_receive_spk,
+            owned.recovery_hint,
+        )
+        .expect("rebuild canonical maker outputs");
+        assert_eq!(transaction.output[*order_vout as usize], expected.order);
+        assert_eq!(
+            transaction.output[*hint_vout as usize],
+            expected.recovery_hint
+        );
+    }
+
+    let accepted = accept_broadcast_mine(rpc, miner, &transaction);
+    let orders = positions
+        .into_iter()
+        .map(
+            |(order_index, side, owned, order_vout, hint_vout)| LiveMakerOrder {
+                order_index,
+                side,
+                owned,
+                contract_id: ContractId::new(OutPoint::new(transaction.txid(), order_vout)),
+                output: wallet_utxo(&transaction, order_vout as usize),
+                hint_vout,
+            },
+        )
+        .collect();
+    (
+        transaction.clone(),
+        accepted,
+        orders,
+        wallet_utxo(&transaction, 8),
+        wallet_utxo(&transaction, 9),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_sell_base_fill(
+    signer: &Signer,
+    network: &SimplicityNetwork,
+    params: MakerOrderParams,
+    maker_receive_spk: &Script,
+    order: &WalletUtxo,
+    funding: &Funding,
+    fill_base: u64,
+    prior_total_filled_base: u64,
+) -> (PartiallySignedTransaction, MakerFillPlan) {
+    let input_locked = explicit_value(&order.txout);
+    let plan = MakerFillPlan::new(
+        params,
+        maker_receive_spk.clone(),
+        input_locked,
+        fill_base,
+        prior_total_filled_base,
+    )
+    .expect("SellBase fill plan");
+    let remainder_index = plan.remainder_locked().map(|_| 1);
+    let mut pset = PartiallySignedTransaction::new_v2();
+    pset.add_input(pset_input(order.outpoint, order.txout.clone()));
+    pset.add_input(pset_input(funding.outpoint, funding.txout.clone()));
+    for (_, output) in plan
+        .mandatory_outputs(0, remainder_index)
+        .expect("SellBase mandatory outputs")
+    {
+        pset.add_output(PsetOutput::from_txout(output));
+    }
+    pset.add_output(PsetOutput::from_txout(explicit_txout(
+        params.base_asset_id,
+        fill_base,
+        signer.get_address().script_pubkey(),
+    )));
+    pset.add_output(PsetOutput::from_txout(explicit_txout(
+        params.quote_asset_id,
+        FUNDING_VALUE - plan.maker_payment() - FEE,
+        signer.get_address().script_pubkey(),
+    )));
+    pset.add_output(PsetOutput::from_txout(TxOut::new_fee(
+        FEE,
+        params.quote_asset_id,
+    )));
+    plan.finalize(&mut pset, 0, remainder_index, network)
+        .expect("finalize SellBase covenant");
+    (pset, plan)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_sell_quote_fill(
+    signer: &Signer,
+    network: &SimplicityNetwork,
+    params: MakerOrderParams,
+    maker_receive_spk: &Script,
+    order: &WalletUtxo,
+    taker_base: &WalletUtxo,
+    funding: &Funding,
+    fill_base: u64,
+    prior_total_filled_base: u64,
+) -> (PartiallySignedTransaction, MakerFillPlan) {
+    let input_locked = explicit_value(&order.txout);
+    let taker_base_value = explicit_value(&taker_base.txout);
+    assert!(taker_base_value >= fill_base);
+    let plan = MakerFillPlan::new(
+        params,
+        maker_receive_spk.clone(),
+        input_locked,
+        fill_base,
+        prior_total_filled_base,
+    )
+    .expect("SellQuote fill plan");
+    let remainder_index = plan.remainder_locked().map(|_| 1);
+    let mut pset = PartiallySignedTransaction::new_v2();
+    pset.add_input(pset_input(order.outpoint, order.txout.clone()));
+    pset.add_input(pset_input(taker_base.outpoint, taker_base.txout.clone()));
+    pset.add_input(pset_input(funding.outpoint, funding.txout.clone()));
+    for (_, output) in plan
+        .mandatory_outputs(0, remainder_index)
+        .expect("SellQuote mandatory outputs")
+    {
+        pset.add_output(PsetOutput::from_txout(output));
+    }
+    pset.add_output(PsetOutput::from_txout(explicit_txout(
+        params.quote_asset_id,
+        fill_base * u64::from(params.price),
+        signer.get_address().script_pubkey(),
+    )));
+    if taker_base_value > fill_base {
+        pset.add_output(PsetOutput::from_txout(explicit_txout(
+            params.base_asset_id,
+            taker_base_value - fill_base,
+            signer.get_address().script_pubkey(),
+        )));
+    }
+    pset.add_output(PsetOutput::from_txout(explicit_txout(
+        params.quote_asset_id,
+        FUNDING_VALUE - FEE,
+        signer.get_address().script_pubkey(),
+    )));
+    pset.add_output(PsetOutput::from_txout(TxOut::new_fee(
+        FEE,
+        params.quote_asset_id,
+    )));
+    plan.finalize(&mut pset, 0, remainder_index, network)
+        .expect("finalize SellQuote covenant");
+    (pset, plan)
+}
+
+fn build_maker_cancellation(
+    signer: &Signer,
+    params: MakerOrderParams,
+    order: &WalletUtxo,
+    funding: &Funding,
+) -> PartiallySignedTransaction {
+    let mut pset = PartiallySignedTransaction::new_v2();
+    pset.add_input(pset_input(order.outpoint, order.txout.clone()));
+    pset.add_input(pset_input(funding.outpoint, funding.txout.clone()));
+    pset.add_output(PsetOutput::from_txout(explicit_txout(
+        params.base_asset_id,
+        explicit_value(&order.txout),
+        signer.get_address().script_pubkey(),
+    )));
+    pset.add_output(PsetOutput::from_txout(explicit_txout(
+        params.quote_asset_id,
+        FUNDING_VALUE - FEE,
+        signer.get_address().script_pubkey(),
+    )));
+    pset.add_output(PsetOutput::from_txout(TxOut::new_fee(
+        FEE,
+        params.quote_asset_id,
+    )));
+    pset
+}
+
+fn sign_maker_cancellation(
+    pset: &mut PartiallySignedTransaction,
+    order_input_index: usize,
+    owned: &DerivedOwnedOrder,
+    genesis_hash: BlockHash,
+    apply_tap_tweak: bool,
+) {
+    let compiled = CompiledMakerOrder::new(owned.params).expect("compile cancellation order");
+    assert!(compiled.control_block().merkle_branch.as_inner().is_empty());
+    let leaf = TapLeafHash::from_script(
+        &Script::from(compiled.cmr().to_vec()),
+        compiled.control_block().leaf_version,
+    );
+    let root = TapNodeHash::from_byte_array(leaf.to_byte_array());
+    let secp = Secp256k1::new();
+    let maker_keypair = Keypair::from_seckey_slice(&secp, owned.keys.maker_secret_key())
+        .expect("mnemonic-derived maker keypair");
+    assert_eq!(
+        maker_keypair.x_only_public_key().0.serialize(),
+        owned.params.maker_pubkey
+    );
+
+    let signing_keypair = if apply_tap_tweak {
+        let tweaked = maker_keypair.tap_tweak(&secp, Some(root));
+        assert_eq!(
+            Script::new_v1_p2tr_tweaked(tweaked.public_parts().0),
+            *compiled.script_pubkey()
+        );
+        tweaked.to_inner()
+    } else {
+        maker_keypair
+    };
+    let unsigned = pset
+        .extract_tx()
+        .expect("cancellation unsigned transaction");
+    let prevouts = pset
+        .inputs()
+        .iter()
+        .map(|input| input.witness_utxo.clone().expect("cancellation prevout"))
+        .collect::<Vec<_>>();
+    let sighash = SighashCache::new(&unsigned)
+        .taproot_key_spend_signature_hash(
+            order_input_index,
+            &Prevouts::All(&prevouts),
+            SchnorrSighashType::Default,
+            genesis_hash,
+        )
+        .expect("Elements Taproot key-spend sighash");
+    let signature = secp.sign_schnorr_no_aux_rand(
+        &Message::from_digest(sighash.to_byte_array()),
+        &signing_keypair,
+    );
+    pset.inputs_mut()[order_input_index].final_script_witness =
+        Some(vec![signature.as_ref().to_vec()]);
+}
+
+fn assert_mnemonic_order_recovery(
+    keychain: &DeadcatKeychain,
+    market: &CreatedMarket,
+    creation: &Transaction,
+    order: &LiveMakerOrder,
+) {
+    let payload = validate_recovery_txout(
+        &creation.output[order.hint_vout as usize],
+        market.params.collateral_asset_id,
+    )
+    .expect("canonical order recovery envelope");
+    let hint = OrderRecoveryHint::decode(payload).expect("decode order recovery hint");
+    assert_eq!(hint, order.owned.recovery_hint);
+    assert_eq!(hint.market_creation_txid, market.transaction.txid());
+    let deadcat_secret = keychain.deadcat_secret_key().expect("Deadcat secret");
+    let candidate = recover_order_candidate_index(payload, &deadcat_secret)
+        .expect("recover candidate order index");
+    assert_eq!(candidate, order.order_index);
+    let terms = maker_terms(market.params, hint.side, hint.direction);
+    let recovered = keychain
+        .derive_owned_order(candidate, hint.market_creation_txid, hint.side, terms)
+        .expect("rederive recovered order");
+    let compiled = CompiledMakerOrder::new(recovered.params).expect("compile recovered order");
+    let held_asset = match recovered.params.direction {
+        OrderDirection::SellBase => recovered.params.base_asset_id,
+        OrderDirection::SellQuote => recovered.params.quote_asset_id,
+    };
+    let matches = creation
+        .output
+        .iter()
+        .enumerate()
+        .filter_map(|(index, output)| {
+            if output.script_pubkey != *compiled.script_pubkey()
+                || output.asset != Asset::Explicit(held_asset)
+                || output.nonce != Nonce::Null
+                || output.witness != TxOutWitness::default()
+            {
+                return None;
+            }
+            let Value::Explicit(locked) = output.value else {
+                return None;
+            };
+            let capacity = match recovered.params.direction {
+                OrderDirection::SellBase => locked,
+                OrderDirection::SellQuote => {
+                    let price = u64::from(recovered.params.price);
+                    if !locked.is_multiple_of(price) {
+                        return None;
+                    }
+                    locked / price
+                }
+            };
+            if capacity < u64::from(recovered.params.min_active_base) {
+                return None;
+            }
+            let expected = maker_order_creation_outputs(
+                market.params.collateral_asset_id,
+                recovered.params,
+                capacity,
+                &recovered.keys.maker_receive_spk,
+                hint,
+            )
+            .ok()?;
+            (output == &expected.order).then_some((index, capacity, expected))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matches.len(), 1);
+    let (matched_vout, recovered_capacity, expected) = &matches[0];
+    assert_eq!(*matched_vout, order.contract_id.vout() as usize);
+    assert_eq!(*recovered_capacity, MAKER_CAPACITY);
+    assert_eq!(
+        creation.output[order.hint_vout as usize],
+        expected.recovery_hint
+    );
+
+    let foreign = DeadcatKeychain::from_mnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        "",
+    )
+    .expect("foreign mnemonic");
+    let foreign_secret = foreign.deadcat_secret_key().expect("foreign secret");
+    let foreign_candidate = recover_order_candidate_index(payload, &foreign_secret)
+        .expect("foreign hint still unmasks to a candidate");
+    let foreign_order = foreign
+        .derive_owned_order(
+            foreign_candidate,
+            hint.market_creation_txid,
+            hint.side,
+            terms,
+        )
+        .expect("derive foreign candidate");
+    let foreign_compiled =
+        CompiledMakerOrder::new(foreign_order.params).expect("compile foreign candidate");
+    assert!(
+        creation
+            .output
+            .iter()
+            .all(|output| output.script_pubkey != *foreign_compiled.script_pubkey())
+    );
+}
+
+fn node_elements_auth(auth: &Auth) -> ElementsRpcAuth {
+    match auth {
+        Auth::None => ElementsRpcAuth::None,
+        Auth::UserPass(username, password) => ElementsRpcAuth::Basic {
+            username: username.clone(),
+            password: password.clone(),
+        },
+        Auth::CookieFile(path) => ElementsRpcAuth::CookieFile(path.clone()),
+    }
+}
+
+fn maker_rpc_config(
+    genesis_hash: BlockHash,
+    policy_asset: AssetId,
+    baseline: ChainAnchor,
+    tip: ChainAnchor,
+) -> RpcHandlerConfig {
+    RpcHandlerConfig {
+        network: LiquidNetwork::ElementsRegtest,
+        genesis_hash,
+        policy_asset,
+        backend: BackendKind::ElementsRpc,
+        discovery: DiscoveryCoverage {
+            mode: DiscoveryMode::FullHintScan,
+            from: baseline,
+            scanned_through: tip,
+            target_tip: tip,
+            canonical_market_complete: true,
+        },
+        registration_bearer_token: None,
+        max_concurrent_registrations: 1,
+        max_concurrent_broadcasts: 1,
+        subscription_buffer: 16,
+        subscription_poll_interval: Duration::from_millis(1),
+    }
+}
+
+async fn node_response(
+    handler: &NodeRpcHandler<ElementsRpcChainSource>,
+    request: Request,
+) -> Response {
+    handler
+        .handle([0x55; 32], request)
+        .await
+        .expect("node RPC response")
+}
+
+async fn rpc_contract_view(
+    handler: &NodeRpcHandler<ElementsRpcChainSource>,
+    contract_id: ContractId,
+) -> ContractView {
+    let Response::Contract {
+        contract: Some(contract),
+    } = node_response(handler, Request::GetContract { contract_id }).await
+    else {
+        panic!("GetContract returned the wrong response")
+    };
+    contract
+}
+
+async fn rpc_contract_history(
+    handler: &NodeRpcHandler<ElementsRpcChainSource>,
+    contract_id: ContractId,
+) -> ContractHistoryPage {
+    let Response::ContractHistory { page } = node_response(
+        handler,
+        Request::GetContractHistory {
+            contract_id,
+            after: None,
+            limit: 1_000,
+        },
+    )
+    .await
+    else {
+        panic!("GetContractHistory returned the wrong response")
+    };
+    assert!(page.next.is_none());
+    page
+}
+
+async fn rpc_transaction_evidence(
+    handler: &NodeRpcHandler<ElementsRpcChainSource>,
+    position: ChainPosition,
+) -> TransactionEvidence {
+    let Response::Transaction {
+        evidence: Some(evidence),
+    } = node_response(handler, Request::GetTransaction { position }).await
+    else {
+        panic!("GetTransaction returned the wrong response")
+    };
+    evidence
+}
+
+async fn assert_rpc_contract_replay(
+    handler: &NodeRpcHandler<ElementsRpcChainSource>,
+    source: &ElementsRpcChainSource,
+    contract_id: ContractId,
+    parent_market: Option<&ContractView>,
+) -> (ContractView, ContractHistoryPage) {
+    let view = rpc_contract_view(handler, contract_id).await;
+    let history = rpc_contract_history(handler, contract_id).await;
+    let creation = rpc_transaction_evidence(handler, view.creation_position).await;
+    let mut transitions = Vec::with_capacity(history.entries.len());
+    for entry in &history.entries {
+        transitions.push(rpc_transaction_evidence(handler, entry.position).await);
+    }
+    let mut canonical = HashMap::new();
+    for evidence in std::iter::once(&creation).chain(transitions.iter()) {
+        let canonical_hash = source
+            .block_hash(evidence.position.block_height)
+            .await
+            .expect("independent canonical block hash");
+        assert_eq!(canonical_hash, evidence.block_hash);
+        let block = source
+            .block(evidence.block_hash)
+            .await
+            .expect("independent canonical block");
+        let transaction = block
+            .txdata
+            .get(evidence.position.tx_index as usize)
+            .expect("evidence transaction index");
+        assert_eq!(transaction, &evidence.transaction);
+        canonical.insert(
+            (evidence.position, evidence.block_hash),
+            transaction.clone(),
+        );
+    }
+    let trusted_tip = source.tip().await.expect("independent canonical tip");
+    let replay = replay_contract_history(
+        &view,
+        parent_market,
+        &history,
+        &creation,
+        &transitions,
+        trusted_tip,
+        |position, block_hash, transaction| {
+            canonical
+                .get(&(position, block_hash))
+                .is_some_and(|expected| expected == transaction)
+        },
+    )
+    .expect("independent client history replay");
+    assert_eq!(replay.contract().contract_id(), contract_id);
+    assert_eq!(replay.transition_count(), history.entries.len());
+    (view, history)
+}
+
+fn stored_maker_state(store: &Store, contract_id: ContractId) -> MakerOrderState {
+    let record = store
+        .contract(contract_id)
+        .expect("read maker contract")
+        .expect("registered maker contract");
+    assert!(matches!(record.sync_state, ContractSyncState::Ready { .. }));
+    let ContractState::MakerOrder(state) = record.state else {
+        panic!("maker ContractId resolved to non-maker state")
+    };
+    state
 }
 
 struct TokenPair {
@@ -1573,5 +2212,808 @@ fn binary_market_ab_lifecycle_is_accepted_by_elementsd() {
     eprintln!(
         "DEADCAT_MARKET_AB_METRICS={}",
         serde_json::to_string(&report).expect("serialize market metrics")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "starts elementsd and liquid-enabled Electrs from the Nix development shell"]
+async fn maker_order_lifecycle_is_accepted_by_elementsd() {
+    let (client, signer) =
+        Regtest::from_config(&RegtestConfig::default()).expect("regtest environment");
+    let network = SimplicityNetwork::default_regtest();
+    let policy_asset = network.policy_asset();
+    let miner = ElementsRpc::new(client.rpc_url(), client.auth()).expect("Elements RPC");
+    let rpc = Client::new(&client.rpc_url(), client.auth()).expect("raw Elements RPC");
+    let genesis_hash = BlockHash::from_str(
+        &rpc.get_block_hash(0)
+            .expect("regtest genesis block")
+            .to_string(),
+    )
+    .expect("Elements genesis hash");
+    let (_funding_tx, funding_accepted, funding) =
+        prepare_funding(&signer, &rpc, &miner, policy_asset);
+    let baseline = ChainAnchor {
+        height: u32::try_from(funding_accepted.block_height).expect("baseline height"),
+        hash: BlockHash::from_str(&funding_accepted.block_hash).expect("baseline hash"),
+    };
+    let expiry_height = baseline.height.checked_add(1_000).expect("future expiry");
+    let market = create_market(
+        &signer,
+        &rpc,
+        &miner,
+        policy_asset,
+        &funding[0],
+        &funding[1],
+        expiry_height,
+    );
+    let (issuance, trading) = build_issuance(
+        &signer,
+        &network,
+        market.params,
+        market.entropies,
+        BinaryMarketState::Trading {
+            outstanding_pairs: 0,
+        },
+        &dormant_live(&market.transaction),
+        None,
+        &funding[2],
+        30,
+        RtSide::A,
+        false,
+    );
+    assert_eq!(
+        trading,
+        BinaryMarketState::Trading {
+            outstanding_pairs: 30
+        }
+    );
+    accept_broadcast_mine(&rpc, &miner, &issuance);
+
+    let keychain =
+        DeadcatKeychain::from_mnemonic(MAKER_MNEMONIC, "").expect("test Deadcat keychain");
+    let (order_creation, _, orders, _yes_change, no_change) = create_maker_orders(
+        &signer,
+        &rpc,
+        &miner,
+        &keychain,
+        &market,
+        &wallet_utxo(&issuance, 3),
+        &wallet_utxo(&issuance, 4),
+        &funding[3],
+    );
+    assert_eq!(
+        orders
+            .iter()
+            .map(|order| order.contract_id.vout())
+            .collect::<Vec<_>>(),
+        vec![0, 2, 4, 6]
+    );
+    for order in &orders {
+        assert_mnemonic_order_recovery(&keychain, &market, &order_creation, order);
+    }
+
+    let sell_base = &orders[0];
+    let (sell_base_partial_pset, sell_base_partial_plan) = build_sell_base_fill(
+        &signer,
+        &network,
+        sell_base.owned.params,
+        &sell_base.owned.keys.maker_receive_spk,
+        &sell_base.output,
+        &funding[4],
+        3,
+        0,
+    );
+    assert_eq!(
+        sell_base_partial_plan.next_state(),
+        MakerOrderState::Active {
+            remaining_base: 7,
+            total_filled_base: 3,
+        }
+    );
+    let mut wrong_payment = sell_base_partial_pset.clone();
+    wrong_payment.outputs_mut()[0].amount = Some(22);
+    wrong_payment.outputs_mut()[3].amount = Some(FUNDING_VALUE - 22 - FEE);
+    sign_input(&signer, &mut wrong_payment, 1);
+    let wrong_payment = wrong_payment
+        .extract_tx()
+        .expect("wrong-payment transaction");
+    let wrong_payment_rejection =
+        assert_mempool_rejects(&rpc, &wrong_payment, "maker_wrong_payment_amount");
+
+    let mut wrong_receive_script = sell_base_partial_pset.clone();
+    wrong_receive_script.outputs_mut()[0].script_pubkey = signer.get_address().script_pubkey();
+    sign_input(&signer, &mut wrong_receive_script, 1);
+    let wrong_receive_script = wrong_receive_script
+        .extract_tx()
+        .expect("wrong receive-script transaction");
+    let wrong_receive_rejection =
+        assert_mempool_rejects(&rpc, &wrong_receive_script, "maker_wrong_receive_script");
+
+    let mut below_minimum = sell_base_partial_pset.clone();
+    below_minimum.outputs_mut()[0].amount = Some(14);
+    below_minimum.outputs_mut()[1].amount = Some(8);
+    below_minimum.outputs_mut()[2].amount = Some(2);
+    below_minimum.outputs_mut()[3].amount = Some(FUNDING_VALUE - 14 - FEE);
+    sign_input(&signer, &mut below_minimum, 1);
+    let below_minimum = below_minimum
+        .extract_tx()
+        .expect("below-minimum transaction");
+    let below_minimum_rejection =
+        assert_mempool_rejects(&rpc, &below_minimum, "maker_fill_below_minimum");
+
+    let mut sell_base_partial_pset = sell_base_partial_pset;
+    sign_input(&signer, &mut sell_base_partial_pset, 1);
+    let sell_base_partial = sell_base_partial_pset
+        .extract_tx()
+        .expect("SellBase partial transaction");
+    accept_broadcast_mine(&rpc, &miner, &sell_base_partial);
+    let (mut sell_base_full_pset, sell_base_full_plan) = build_sell_base_fill(
+        &signer,
+        &network,
+        sell_base.owned.params,
+        &sell_base.owned.keys.maker_receive_spk,
+        &wallet_utxo(&sell_base_partial, 1),
+        &funding[5],
+        7,
+        3,
+    );
+    assert_eq!(sell_base_full_plan.next_state(), MakerOrderState::Consumed);
+    sign_input(&signer, &mut sell_base_full_pset, 1);
+    let sell_base_full = sell_base_full_pset
+        .extract_tx()
+        .expect("SellBase full transaction");
+    accept_broadcast_mine(&rpc, &miner, &sell_base_full);
+
+    let sell_quote = &orders[1];
+    let (sell_quote_partial_pset, sell_quote_partial_plan) = build_sell_quote_fill(
+        &signer,
+        &network,
+        sell_quote.owned.params,
+        &sell_quote.owned.keys.maker_receive_spk,
+        &sell_quote.output,
+        &no_change,
+        &funding[6],
+        3,
+        0,
+    );
+    assert_eq!(
+        sell_quote_partial_plan.next_state(),
+        MakerOrderState::Active {
+            remaining_base: 7,
+            total_filled_base: 3,
+        }
+    );
+    let mut wrong_remainder = sell_quote_partial_pset.clone();
+    wrong_remainder.outputs_mut()[1].amount = Some(48);
+    wrong_remainder.outputs_mut()[2].amount = Some(22);
+    sign_input(&signer, &mut wrong_remainder, 1);
+    sign_input(&signer, &mut wrong_remainder, 2);
+    let wrong_remainder = wrong_remainder
+        .extract_tx()
+        .expect("wrong-remainder transaction");
+    let wrong_remainder_rejection =
+        assert_mempool_rejects(&rpc, &wrong_remainder, "maker_wrong_remainder_amount");
+
+    let mut wrong_remainder_script = sell_quote_partial_pset.clone();
+    wrong_remainder_script.outputs_mut()[1].script_pubkey = signer.get_address().script_pubkey();
+    sign_input(&signer, &mut wrong_remainder_script, 1);
+    sign_input(&signer, &mut wrong_remainder_script, 2);
+    let wrong_remainder_script = wrong_remainder_script
+        .extract_tx()
+        .expect("wrong-remainder-script transaction");
+    let wrong_remainder_script_rejection = assert_mempool_rejects(
+        &rpc,
+        &wrong_remainder_script,
+        "maker_wrong_remainder_script",
+    );
+
+    let mut sell_quote_partial_pset = sell_quote_partial_pset;
+    sign_input(&signer, &mut sell_quote_partial_pset, 1);
+    sign_input(&signer, &mut sell_quote_partial_pset, 2);
+    let sell_quote_partial = sell_quote_partial_pset
+        .extract_tx()
+        .expect("SellQuote partial transaction");
+    accept_broadcast_mine(&rpc, &miner, &sell_quote_partial);
+    let (mut sell_quote_full_pset, sell_quote_full_plan) = build_sell_quote_fill(
+        &signer,
+        &network,
+        sell_quote.owned.params,
+        &sell_quote.owned.keys.maker_receive_spk,
+        &wallet_utxo(&sell_quote_partial, 1),
+        &wallet_utxo(&sell_quote_partial, 3),
+        &funding[7],
+        7,
+        3,
+    );
+    assert_eq!(sell_quote_full_plan.next_state(), MakerOrderState::Consumed);
+    sign_input(&signer, &mut sell_quote_full_pset, 1);
+    sign_input(&signer, &mut sell_quote_full_pset, 2);
+    let sell_quote_full = sell_quote_full_pset
+        .extract_tx()
+        .expect("SellQuote full transaction");
+    accept_broadcast_mine(&rpc, &miner, &sell_quote_full);
+
+    let cancelled = &orders[2];
+    let cancellation_pset = build_maker_cancellation(
+        &signer,
+        cancelled.owned.params,
+        &cancelled.output,
+        &funding[8],
+    );
+    let mut untweaked_cancel = cancellation_pset.clone();
+    sign_input(&signer, &mut untweaked_cancel, 1);
+    sign_maker_cancellation(
+        &mut untweaked_cancel,
+        0,
+        &cancelled.owned,
+        genesis_hash,
+        false,
+    );
+    let untweaked_cancel = untweaked_cancel
+        .extract_tx()
+        .expect("untweaked cancellation transaction");
+    let untweaked_cancel_rejection =
+        assert_mempool_rejects(&rpc, &untweaked_cancel, "maker_untweaked_cancellation_key");
+    let mut cancellation_pset = cancellation_pset;
+    sign_input(&signer, &mut cancellation_pset, 1);
+    sign_maker_cancellation(
+        &mut cancellation_pset,
+        0,
+        &cancelled.owned,
+        genesis_hash,
+        true,
+    );
+    let cancellation = cancellation_pset
+        .extract_tx()
+        .expect("maker cancellation transaction");
+    accept_broadcast_mine(&rpc, &miner, &cancellation);
+
+    let (resolution, resolved_state) = build_active_resolution(
+        &signer,
+        &network,
+        market.params,
+        trading,
+        &active_live(&issuance),
+        &issuance.output[2],
+        &funding[9],
+        BinaryOutcome::Yes,
+        RtSide::B,
+    );
+    assert!(matches!(
+        resolved_state,
+        BinaryMarketState::ResolvedYes { .. }
+    ));
+    let resolution_accepted = accept_broadcast_mine(&rpc, &miner, &resolution);
+
+    // Feed the exact same chain through the production node path. The store
+    // starts before market creation, scans the parent from its public hint,
+    // then accepts all four maker declarations late and backfills their full
+    // histories before any order becomes routable.
+    let source = Arc::new(
+        ElementsRpcChainSource::new(ElementsRpcConfig::new(
+            client.rpc_url(),
+            node_elements_auth(&client.auth()),
+        ))
+        .expect("production Elements chain source"),
+    );
+    let database_directory = tempfile::tempdir().expect("maker node database directory");
+    let database_path = database_directory.path().join("deadcat.redb");
+    let store = Arc::new(Store::open(&database_path).expect("open maker node store"));
+    store
+        .bind_chain(StoreChainIdentity {
+            network: LiquidNetwork::ElementsRegtest,
+            genesis_hash,
+            policy_asset,
+        })
+        .expect("bind maker node chain");
+    store.initialize_tip(baseline).expect("initialize baseline");
+    let interpreter = DeadcatInterpreter::new(LiquidNetwork::ElementsRegtest, policy_asset);
+    eprintln!("DEADCAT_MAKER_REGTEST_PHASE=initial_sync");
+    let SyncOutcome::Ready(initial_sync) =
+        SyncCoordinator::new(source.as_ref(), store.as_ref(), &interpreter)
+            .sync_to_tip()
+            .await
+            .expect("initial production node sync")
+    else {
+        panic!("live maker chain unexpectedly required a rescan")
+    };
+    assert!(initial_sync.blocks_applied >= 9);
+    let resolution_tip = source.tip().await.expect("resolution tip");
+    let market_id = ContractId::new(OutPoint::new(market.transaction.txid(), 0));
+    let discovered_market = store
+        .contract(market_id)
+        .expect("read discovered market")
+        .expect("market auto-discovered from its canonical hint");
+    assert_eq!(
+        discovered_market.state,
+        ContractState::BinaryMarket(resolved_state)
+    );
+    assert!(orders.iter().all(|order| {
+        store
+            .contract(order.contract_id)
+            .expect("order lookup")
+            .is_none()
+    }));
+
+    let package = ContractPackage {
+        format_version: CONTRACT_PACKAGE_FORMAT_VERSION,
+        chain: ChainIdentity {
+            network: LiquidNetwork::ElementsRegtest,
+            genesis_hash,
+        },
+        roots: orders.iter().map(|order| order.contract_id).collect(),
+        declarations: orders
+            .iter()
+            .map(|order| ContractDeclaration {
+                contract_id: order.contract_id,
+                descriptor: ContractDescriptor::MakerOrderV1 {
+                    parent_market: market_id,
+                    side: order.side,
+                    params: order.owned.params,
+                },
+            })
+            .chain(std::iter::once(ContractDeclaration {
+                contract_id: market_id,
+                descriptor: ContractDescriptor::BinaryMarketV1 {
+                    params: market.params,
+                },
+            }))
+            .collect(),
+    };
+    let handler = NodeRpcHandler::new(
+        Arc::clone(&source),
+        Arc::clone(&store),
+        maker_rpc_config(genesis_hash, policy_asset, baseline, resolution_tip),
+    )
+    .expect("production node RPC handler");
+    eprintln!("DEADCAT_MAKER_REGTEST_PHASE=package_registration");
+    let Response::RegistrationAccepted { registration } = node_response(
+        &handler,
+        Request::RegisterContractPackage {
+            package: package.clone(),
+            bearer_token: None,
+        },
+    )
+    .await
+    else {
+        panic!("registration returned the wrong response")
+    };
+    assert_eq!(registration.roots, package.roots);
+    assert_eq!(registration.contracts.len(), 5);
+    for receipt in &registration.contracts {
+        assert_eq!(
+            receipt.already_registered,
+            receipt.contract_id == market_id,
+            "only the hint-discovered market should predate package registration"
+        );
+    }
+    eprintln!("DEADCAT_MAKER_REGTEST_PHASE=late_backfill");
+    let SyncOutcome::Ready(backfill) =
+        SyncCoordinator::new(source.as_ref(), store.as_ref(), &interpreter)
+            .sync_to_tip()
+            .await
+            .expect("maker late-registration backfill")
+    else {
+        panic!("maker backfill unexpectedly required a rescan")
+    };
+    assert!(backfill.backfill_blocks_applied > 0);
+    assert_eq!(
+        stored_maker_state(&store, orders[0].contract_id),
+        MakerOrderState::Consumed
+    );
+    assert_eq!(
+        stored_maker_state(&store, orders[1].contract_id),
+        MakerOrderState::Consumed
+    );
+    assert_eq!(
+        stored_maker_state(&store, orders[2].contract_id),
+        MakerOrderState::Cancelled
+    );
+    assert_eq!(
+        stored_maker_state(&store, orders[3].contract_id),
+        MakerOrderState::Active {
+            remaining_base: MAKER_CAPACITY,
+            total_filled_base: 0,
+        }
+    );
+    for (order, expected_kinds) in orders.iter().zip([
+        vec![TRANSITION_V1_MAKER_FILLED, TRANSITION_V1_MAKER_FILLED],
+        vec![TRANSITION_V1_MAKER_FILLED, TRANSITION_V1_MAKER_FILLED],
+        vec![TRANSITION_V1_MAKER_CANCELLED],
+        vec![],
+    ]) {
+        let history = store
+            .contract_history(order.contract_id)
+            .expect("maker history after backfill");
+        assert_eq!(
+            history
+                .iter()
+                .map(|entry| entry.transition.kind)
+                .collect::<Vec<_>>(),
+            expected_kinds
+        );
+    }
+    let active_orders = store
+        .ready_orders(market_id, None, None, None, 10)
+        .expect("ready maker orders");
+    assert_eq!(active_orders.items.len(), 1);
+    assert_eq!(
+        active_orders.items[0].contract.contract_id,
+        orders[3].contract_id
+    );
+
+    let Response::RecoveryHints { page: hints } = node_response(
+        &handler,
+        Request::ListRecoveryHints {
+            family: Some(RecoveryFamily::MakerOrderV1),
+            page: PageRequest {
+                cursor: None,
+                limit: 100,
+            },
+        },
+    )
+    .await
+    else {
+        panic!("recovery-hint query returned the wrong response")
+    };
+    let creation_hints = hints
+        .hints
+        .iter()
+        .filter(|hint| hint.creation_txid == order_creation.txid())
+        .collect::<Vec<_>>();
+    assert_eq!(creation_hints.len(), 4);
+    assert!(
+        creation_hints
+            .iter()
+            .all(|hint| hint.associated_contract.is_none())
+    );
+    assert_eq!(
+        creation_hints
+            .iter()
+            .map(|hint| hint.location.output_index)
+            .collect::<Vec<_>>(),
+        vec![1, 3, 5, 7]
+    );
+    for order in &orders {
+        let record = creation_hints
+            .iter()
+            .find(|record| record.location.output_index == order.hint_vout)
+            .expect("RPC recovery record for every created order");
+        let on_chain_payload = validate_recovery_txout(
+            &order_creation.output[order.hint_vout as usize],
+            policy_asset,
+        )
+        .expect("on-chain recovery hint payload");
+        assert_eq!(record.payload, on_chain_payload);
+        assert_eq!(record.payload, order.owned.recovery_hint.encode());
+    }
+
+    let route_error = handler
+        .handle(
+            [0x55; 32],
+            Request::SuggestRoute {
+                market_id,
+                side: orders[3].side,
+                direction: orders[3].owned.params.direction,
+                base_amount: MAKER_CAPACITY,
+                max_orders: 1,
+            },
+        )
+        .await
+        .expect_err("official routing must stop after parent resolution");
+    assert_eq!(route_error.code, RpcErrorCode::CovenantInvariantViolation);
+
+    let post_resolution = &orders[3];
+    let (mut post_resolution_fill_pset, post_resolution_plan) = build_sell_base_fill(
+        &signer,
+        &network,
+        post_resolution.owned.params,
+        &post_resolution.owned.keys.maker_receive_spk,
+        &post_resolution.output,
+        &funding[10],
+        MAKER_CAPACITY,
+        0,
+    );
+    assert_eq!(post_resolution_plan.next_state(), MakerOrderState::Consumed);
+    sign_input(&signer, &mut post_resolution_fill_pset, 1);
+    let post_resolution_fill = post_resolution_fill_pset
+        .extract_tx()
+        .expect("post-resolution maker fill");
+    assert_eq!(
+        test_mempool_accept(&rpc, &post_resolution_fill).allowed,
+        Some(true),
+        "maker covenant intentionally remains consensus-fillable after parent resolution"
+    );
+    let post_resolution_accepted = accept_broadcast_mine(&rpc, &miner, &post_resolution_fill);
+
+    eprintln!("DEADCAT_MAKER_REGTEST_PHASE=post_fill_sync");
+    let SyncOutcome::Ready(post_fill_sync) =
+        SyncCoordinator::new(source.as_ref(), store.as_ref(), &interpreter)
+            .sync_to_tip()
+            .await
+            .expect("index post-resolution custom fill")
+    else {
+        panic!("post-resolution fill unexpectedly required a rescan")
+    };
+    assert_eq!(post_fill_sync.blocks_applied, 1);
+    assert_eq!(
+        stored_maker_state(&store, post_resolution.contract_id),
+        MakerOrderState::Consumed
+    );
+    assert_eq!(
+        store
+            .contract_history(post_resolution.contract_id)
+            .expect("post-resolution order history")
+            .iter()
+            .map(|entry| entry.transition.kind)
+            .collect::<Vec<_>>(),
+        vec![TRANSITION_V1_MAKER_FILLED]
+    );
+    assert!(
+        store
+            .ready_orders(market_id, None, None, None, 10)
+            .expect("empty terminal order book")
+            .items
+            .is_empty()
+    );
+
+    // Replace the final two blocks with a different canonical branch while
+    // explicitly controlling which mempool transactions enter each block.
+    // This exercises the production coordinator's full two-block rollback and
+    // replay boundary with the same semantic state on different block hashes.
+    let mining_address = signer.get_address().to_unconfidential().to_string();
+    let mine_exact = |txids: Vec<String>| -> String {
+        let result: JsonValue = rpc
+            .call(
+                "generateblock",
+                &[json!(mining_address.clone()), json!(txids)],
+            )
+            .expect("mine exact regtest block");
+        result["hash"]
+            .as_str()
+            .expect("generateblock hash")
+            .to_owned()
+    };
+    let invalidated: JsonValue = rpc
+        .call(
+            "invalidateblock",
+            &[json!(resolution_accepted.block_hash.clone())],
+        )
+        .expect("invalidate resolution block");
+    assert!(invalidated.is_null());
+    let replacement_resolution_hash = mine_exact(vec![resolution.txid().to_string()]);
+    let replacement_post_fill_hash = mine_exact(vec![post_resolution_fill.txid().to_string()]);
+    assert_ne!(replacement_resolution_hash, resolution_accepted.block_hash);
+    assert_ne!(
+        replacement_post_fill_hash,
+        post_resolution_accepted.block_hash
+    );
+    eprintln!("DEADCAT_MAKER_REGTEST_PHASE=two_block_reorg");
+    let SyncOutcome::Ready(two_block_reorg) =
+        SyncCoordinator::new(source.as_ref(), store.as_ref(), &interpreter)
+            .sync_to_tip()
+            .await
+            .expect("two-block live reorg")
+    else {
+        panic!("two-block live reorg exceeded retention")
+    };
+    assert_eq!(two_block_reorg.blocks_rolled_back, 2);
+    assert_eq!(two_block_reorg.blocks_applied, 2);
+    assert_eq!(
+        stored_maker_state(&store, post_resolution.contract_id),
+        MakerOrderState::Consumed
+    );
+
+    // Replace only the post-resolution fill block with an empty block. The
+    // parent remains resolved while the maker order returns to Active, proving
+    // that official routing still refuses it. Mine the still-valid custom fill
+    // one block later and index it again.
+    let invalidated: JsonValue = rpc
+        .call(
+            "invalidateblock",
+            &[json!(replacement_post_fill_hash.clone())],
+        )
+        .expect("invalidate post-resolution fill block");
+    assert!(invalidated.is_null());
+    let empty_replacement_hash = mine_exact(vec![]);
+    assert_ne!(empty_replacement_hash, replacement_post_fill_hash);
+    eprintln!("DEADCAT_MAKER_REGTEST_PHASE=one_block_reorg");
+    let SyncOutcome::Ready(one_block_reorg) =
+        SyncCoordinator::new(source.as_ref(), store.as_ref(), &interpreter)
+            .sync_to_tip()
+            .await
+            .expect("one-block live reorg")
+    else {
+        panic!("one-block live reorg exceeded retention")
+    };
+    assert_eq!(one_block_reorg.blocks_rolled_back, 1);
+    assert_eq!(one_block_reorg.blocks_applied, 1);
+    assert_eq!(
+        store
+            .contract(market_id)
+            .expect("resolved market after one-block reorg")
+            .expect("resolved market after one-block reorg")
+            .state,
+        ContractState::BinaryMarket(resolved_state)
+    );
+    assert_eq!(
+        stored_maker_state(&store, post_resolution.contract_id),
+        MakerOrderState::Active {
+            remaining_base: MAKER_CAPACITY,
+            total_filled_base: 0,
+        }
+    );
+    let restored_record = store
+        .contract(post_resolution.contract_id)
+        .expect("restored order lookup")
+        .expect("restored active order");
+    assert_eq!(restored_record.outpoints.len(), 1);
+    assert_eq!(
+        restored_record.outpoints[0].outpoint,
+        post_resolution.output.outpoint
+    );
+    assert!(
+        store
+            .contract_history(post_resolution.contract_id)
+            .expect("rolled-back order history")
+            .is_empty()
+    );
+    let restored_book = store
+        .ready_orders(market_id, None, None, None, 10)
+        .expect("restored active order index");
+    assert_eq!(restored_book.items.len(), 1);
+    assert_eq!(
+        restored_book.items[0].contract.contract_id,
+        post_resolution.contract_id
+    );
+    assert_eq!(restored_book.items[0].entry.remaining_base, MAKER_CAPACITY);
+    let route_error = handler
+        .handle(
+            [0x55; 32],
+            Request::SuggestRoute {
+                market_id,
+                side: post_resolution.side,
+                direction: post_resolution.owned.params.direction,
+                base_amount: MAKER_CAPACITY,
+                max_orders: 1,
+            },
+        )
+        .await
+        .expect_err("routing stays disabled while the custom fill is rolled back");
+    assert_eq!(route_error.code, RpcErrorCode::CovenantInvariantViolation);
+
+    let final_post_fill_hash = mine_exact(vec![post_resolution_fill.txid().to_string()]);
+    assert_ne!(final_post_fill_hash, post_resolution_accepted.block_hash);
+    eprintln!("DEADCAT_MAKER_REGTEST_PHASE=post_reorg_fill_replay");
+    let SyncOutcome::Ready(post_reorg_fill_replay) =
+        SyncCoordinator::new(source.as_ref(), store.as_ref(), &interpreter)
+            .sync_to_tip()
+            .await
+            .expect("index post-reorg custom fill")
+    else {
+        panic!("post-reorg fill unexpectedly required a rescan")
+    };
+    assert_eq!(post_reorg_fill_replay.blocks_applied, 1);
+    assert_eq!(
+        stored_maker_state(&store, post_resolution.contract_id),
+        MakerOrderState::Consumed
+    );
+
+    // Close every redb handle, reopen the database, retry the package and sync,
+    // then independently replay RPC history/evidence through client logic.
+    drop(handler);
+    drop(store);
+    eprintln!("DEADCAT_MAKER_REGTEST_PHASE=restart");
+    let reopened = Arc::new(Store::open(&database_path).expect("reopen maker node store"));
+    let SyncOutcome::Ready(restart_sync) =
+        SyncCoordinator::new(source.as_ref(), reopened.as_ref(), &interpreter)
+            .sync_to_tip()
+            .await
+            .expect("idempotent sync after restart")
+    else {
+        panic!("restarted live maker node unexpectedly required a rescan")
+    };
+    assert_eq!(restart_sync.blocks_applied, 0);
+    assert_eq!(restart_sync.blocks_rolled_back, 0);
+    assert_eq!(restart_sync.backfill_blocks_applied, 0);
+    let final_tip = source.tip().await.expect("final canonical tip");
+    let reopened_handler = NodeRpcHandler::new(
+        Arc::clone(&source),
+        Arc::clone(&reopened),
+        maker_rpc_config(genesis_hash, policy_asset, baseline, final_tip),
+    )
+    .expect("reopened production node RPC handler");
+    let Response::RegistrationAccepted {
+        registration: repeated,
+    } = node_response(
+        &reopened_handler,
+        Request::RegisterContractPackage {
+            package: package.clone(),
+            bearer_token: None,
+        },
+    )
+    .await
+    else {
+        panic!("idempotent registration returned the wrong response")
+    };
+    assert_eq!(repeated.roots, package.roots);
+    assert_eq!(repeated.contracts.len(), package.declarations.len());
+    for declaration in &package.declarations {
+        let receipt = repeated
+            .contracts
+            .iter()
+            .find(|receipt| receipt.contract_id == declaration.contract_id)
+            .expect("idempotent receipt for every declared contract");
+        assert!(receipt.already_registered);
+    }
+
+    eprintln!("DEADCAT_MAKER_REGTEST_PHASE=client_replay");
+    let (parent_view, parent_history) =
+        assert_rpc_contract_replay(&reopened_handler, source.as_ref(), market_id, None).await;
+    assert!(matches!(
+        parent_view.state,
+        ContractStateView::BinaryMarket {
+            state: BinaryMarketState::ResolvedYes { .. }
+        }
+    ));
+    assert!(
+        parent_history
+            .entries
+            .iter()
+            .any(|entry| entry.txid == resolution.txid())
+    );
+    for (index, order) in orders.iter().enumerate() {
+        let (view, history) = assert_rpc_contract_replay(
+            &reopened_handler,
+            source.as_ref(),
+            order.contract_id,
+            Some(&parent_view),
+        )
+        .await;
+        let expected_state = match index {
+            0 | 1 | 3 => MakerOrderState::Consumed,
+            2 => MakerOrderState::Cancelled,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            view.state,
+            ContractStateView::MakerOrder {
+                state: expected_state,
+            }
+        );
+        let expected_kinds = match index {
+            0 | 1 => vec![TRANSITION_V1_MAKER_FILLED, TRANSITION_V1_MAKER_FILLED],
+            2 => vec![TRANSITION_V1_MAKER_CANCELLED],
+            3 => vec![TRANSITION_V1_MAKER_FILLED],
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            history
+                .entries
+                .iter()
+                .map(|entry| entry.transition_kind)
+                .collect::<Vec<_>>(),
+            expected_kinds
+        );
+    }
+
+    let report = json!({
+        "schema": "deadcat.maker-regtest.v1",
+        "market_id": ContractId::new(OutPoint::new(market.transaction.txid(), 0)).to_string(),
+        "order_ids": orders.iter().map(|order| order.contract_id.to_string()).collect::<Vec<_>>(),
+        "canonical_resolution_block": replacement_resolution_hash,
+        "canonical_post_resolution_fill_block": final_post_fill_hash,
+        "negative_tests": [
+            wrong_payment_rejection,
+            wrong_receive_rejection,
+            below_minimum_rejection,
+            wrong_remainder_rejection,
+            wrong_remainder_script_rejection,
+            untweaked_cancel_rejection,
+        ],
+    });
+    eprintln!(
+        "DEADCAT_MAKER_REGTEST_METRICS={}",
+        serde_json::to_string(&report).expect("serialize maker metrics")
     );
 }

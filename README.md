@@ -40,11 +40,17 @@ awaits focused external review; protocol-owner approval was recorded on
 2026-07-14. Its exhaustive
 dual-side corpus, full-market measurements, live Elements lifecycle, recovery,
 restart, and one-/two-block reorg gates are complete.
+The maker-order candidate now has the same live Elements boundary: both order
+directions execute partial and full covenant fills, mnemonic-derived Taproot
+key cancellation, package registration and historical backfill, independent
+client replay, restart, and real alternate-hash one-/two-block reorgs. The gate
+also proves the intentional post-resolution split: Elements still accepts a
+custom fill while official node routing refuses it.
 
-This is not yet a production release. A live maker-order Elements regtest,
-public Liquid testnet shakedowns, operational backup/restore tooling, Nostr
-announcement ingestion, browser packaging of the full validator, and an external
-security review remain. Public operators should currently protect package
+This is not yet a production release. Public Liquid testnet shakedowns,
+operational backup/restore tooling, Nostr announcement ingestion, browser
+packaging of the full validator, and an external security review remain. Public
+operators should currently protect package
 registration with `--registration-bearer-token` or an edge rate limiter: the
 alpha bounds package size and concurrent verification, but per-peer admission,
 a process-wide weighted evidence budget, and a stored-evidence fast path for
@@ -68,6 +74,13 @@ just ci
 
 Before the repository has an initial commit, use `nix develop path:.#default`
 so Nix includes the untracked workspace files.
+
+The focused live-chain gates can be run independently:
+
+```sh
+just regtest-market-ab
+just regtest-maker-orders
+```
 
 Run against Elements Core:
 
@@ -125,3 +138,4 @@ Start with:
 - [Implementation plan](docs/implementation-plan.md)
 - [Architecture decisions](docs/adr/README.md)
 - [Binary-market A/B acceptance packet](docs/acceptance/binary-market-ab-v1.md)
+- [Maker-order live acceptance packet](docs/acceptance/maker-orders-v1.md)

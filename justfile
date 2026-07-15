@@ -31,8 +31,15 @@ regtest-market-ab: generate
         binary_market_ab_lifecycle_is_accepted_by_elementsd \
         -- --ignored --nocapture --test-threads=1
 
+# Run the real maker-order lifecycle, package/backfill, restart, client replay,
+# and one-/two-block branch replacement gate against isolated liquidregtest.
+regtest-maker-orders: generate
+    cargo test --locked -p deadcat-client --test market_regtest \
+        maker_order_lifecycle_is_accepted_by_elementsd \
+        -- --ignored --nocapture --test-threads=1
+
 # Every isolated live-chain protocol gate required before CI succeeds.
-regtest: regtest-market-ab
+regtest: regtest-market-ab regtest-maker-orders
 
 wasm-check:
     NIX_HARDENING_ENABLE=pic cargo check --locked -p deadcat-iroh --lib --target wasm32-unknown-unknown

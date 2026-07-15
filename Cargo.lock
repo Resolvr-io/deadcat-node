@@ -898,6 +898,7 @@ dependencies = [
  "bip39",
  "bitcoincore-rpc",
  "deadcat-contracts",
+ "deadcat-iroh",
  "deadcat-node",
  "deadcat-rpc",
  "deadcat-types",
