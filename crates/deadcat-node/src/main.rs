@@ -7,7 +7,9 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use deadcat_iroh::{DiscoveryMode as IrohDiscoveryMode, SecretKey, Server, ServerConfig};
-use deadcat_node::activation::resolve_activation_anchor;
+use deadcat_node::activation::{
+    resolve_activation_anchor, resolve_policy_asset, validate_policy_asset,
+};
 use deadcat_node::chain::ChainSource;
 use deadcat_node::chain::elements_rpc::{
     ElementsRpcAuth, ElementsRpcChainSource, ElementsRpcConfig,
@@ -60,8 +62,9 @@ struct RunArgs {
     iroh_secret: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = CliNetwork::ElementsRegtest)]
     network: CliNetwork,
+    /// Required for Elements regtest; optional and immutable on production networks.
     #[arg(long)]
-    policy_asset: AssetId,
+    policy_asset: Option<AssetId>,
     /// Elements-regtest-only checkpoint immediately before the desired scan range.
     #[arg(long)]
     baseline_height: Option<u32>,
@@ -174,8 +177,12 @@ where
     if args.sync_interval_seconds == 0 {
         bail!("sync interval must be nonzero");
     }
-    let source = Arc::new(source);
     let network = LiquidNetwork::from(args.network);
+    // Resolve operator input before consulting the backend or creating the
+    // database directory, so a policy mismatch is wholly non-mutating.
+    let policy_asset =
+        resolve_policy_asset(network, args.policy_asset).context("resolve network policy asset")?;
+    let source = Arc::new(source);
     let activation_anchor =
         resolve_activation_anchor(source.as_ref(), network, args.baseline_height)
             .await
@@ -186,7 +193,7 @@ where
             .block_hash(0)
             .await
             .context("fetch and verify chain genesis")?,
-        policy_asset: args.policy_asset,
+        policy_asset,
     };
     if let Some(parent) = args.database.parent() {
         fs::create_dir_all(parent)
@@ -285,6 +292,8 @@ where
     let identity = store
         .chain_identity()?
         .ok_or_else(|| anyhow::anyhow!("database chain identity is not initialized"))?;
+    validate_policy_asset(identity.network, identity.policy_asset)
+        .context("verify database network policy asset")?;
     let activation = store
         .activation_anchor()?
         .ok_or_else(|| anyhow::anyhow!("database v1 activation checkpoint is not initialized"))?;
@@ -526,6 +535,60 @@ mod tests {
                 rpc_password: None,
             } if url == "http://127.0.0.1:7041"
         ));
+    }
+
+    #[test]
+    fn production_run_cli_does_not_require_a_policy_asset_override() {
+        let cli = Cli::try_parse_from([
+            "deadcat-node",
+            "run",
+            "--network",
+            "liquid",
+            "elements",
+            "--url",
+            "http://127.0.0.1:7041",
+        ])
+        .expect("parse production run command");
+        let Command::Run { common, .. } = cli.command else {
+            panic!("expected run command")
+        };
+        assert!(matches!(common.network, CliNetwork::Liquid));
+        assert_eq!(common.policy_asset, None);
+    }
+
+    #[tokio::test]
+    async fn run_rejects_policy_misconfiguration_before_database_creation() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let source = TipOnlySource {
+            tip: test_anchor(0x11),
+        };
+
+        for (network, policy_asset, name) in [
+            (CliNetwork::Liquid, Some(test_asset(0x22)), "liquid"),
+            (CliNetwork::ElementsRegtest, None, "regtest"),
+        ] {
+            let database = directory.path().join(name).join("deadcat.redb");
+            let error = run(
+                RunArgs {
+                    database: database.clone(),
+                    iroh_secret: None,
+                    network,
+                    policy_asset,
+                    baseline_height: None,
+                    sync_interval_seconds: 1,
+                    registration_bearer_token: None,
+                    direct_only: true,
+                },
+                source,
+                BackendKind::ElementsRpc,
+            )
+            .await
+            .expect_err("invalid policy asset configuration");
+            let error = format!("{error:#}");
+            assert!(error.contains("policy asset"), "unexpected error: {error}");
+            assert!(!database.exists());
+            assert!(!database.parent().expect("database parent").exists());
+        }
     }
 
     #[tokio::test]

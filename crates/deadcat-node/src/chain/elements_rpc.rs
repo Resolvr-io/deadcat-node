@@ -181,7 +181,7 @@ impl ElementsRpcChainSource {
             ))
             .into());
         }
-        if !status.is_success() && !status.is_server_error() {
+        if !status.is_success() && !status.is_server_error() && !looks_like_json(&body) {
             return Err(ChainSourceError::InvalidData(format!(
                 "Elements RPC HTTP {status}: {}",
                 error_excerpt(&body)

@@ -209,16 +209,21 @@ Each protocol release defines a network-specific activation anchor. The anchor
 is an exclusive checkpoint: valid v1 creation and scanning begin at
 `anchor.height + 1`. V1 fixes these production checkpoints:
 
-| Network | Height | Block hash |
-|---|---:|---|
-| Liquid | 3,974,391 | `705d699fe1d7f9433837f5f8fec9347c2d5f25aebec5c70ce838db50db890c35` |
-| Liquid testnet | 2,529,866 | `78fe3d5ce6a0df49e7f41adf2e20e610f34f2813dfeaaf50be869ad0e32f510e` |
+| Network | Height | Block hash | Native policy asset |
+|---|---:|---|---|
+| Liquid | 3,974,391 | `705d699fe1d7f9433837f5f8fec9347c2d5f25aebec5c70ce838db50db890c35` | `6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d` |
+| Liquid testnet | 2,529,866 | `78fe3d5ce6a0df49e7f41adf2e20e610f34f2813dfeaaf50be869ad0e32f510e` | `144c654344aa716d6f3abcc1ca90e5641e4e2a7f633bc09fe3baf64585819a49` |
 
 Elements regtest uses its dynamically selected checkpoint, genesis by default.
-The node verifies the exact height/hash against its backend before creating or
-opening the database and atomically binds chain identity, activation, and the
-initial tip. Package registration rejects every creation at or before the
-checkpoint, which makes activation-forward retained-declaration replay
+It also requires its dynamic policy asset explicitly. For production networks,
+the node derives the policy asset from the selected network; a matching CLI
+override is accepted, but a conflict is rejected before backend access or
+database creation. The node verifies the exact checkpoint height/hash against
+its backend and atomically binds chain identity, activation, and the initial
+tip. Store initialization revalidates policy before starting a write, and RPC
+handler construction validates persisted policy before it can advertise
+discovery coverage. Package registration rejects every creation at or before
+the checkpoint, which makes activation-forward retained-declaration replay
 complete.
 
 An archival Elements Core backend scans complete blocks once from immediately

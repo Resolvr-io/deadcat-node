@@ -3,7 +3,11 @@
 //! This test is ignored by ordinary `cargo test` because it starts an isolated
 //! `elementsd` + Electrs pair. It is required by `just ci` through the explicit
 //! `just regtest` suite. Its focused recipes are `just regtest-market-ab` and
-//! `just regtest-maker-orders`, and `just regtest-multi-contract`.
+//! `just regtest-maker-orders`, `just regtest-multi-contract`,
+//! `just regtest-backend-equivalence`, and `just regtest-process-boundary`.
+
+#[path = "support/process.rs"]
+mod process_support;
 
 use std::collections::HashMap;
 use std::str::FromStr as _;
@@ -33,10 +37,11 @@ use deadcat_contracts::recovery::{
 };
 use deadcat_contracts::rt::{RtLeg, RtSide, add_mod_order, cbf, factors, infer_side};
 use deadcat_iroh::RequestHandler as _;
-use deadcat_node::chain::ChainSource as _;
 use deadcat_node::chain::elements_rpc::{
     ElementsRpcAuth, ElementsRpcChainSource, ElementsRpcConfig,
 };
+use deadcat_node::chain::esplora::{EsploraChainSource, EsploraConfig};
+use deadcat_node::chain::{ChainSource as _, ChainSourceError, TransactionStatus};
 use deadcat_node::interpreter::{
     DeadcatInterpreter, TRANSITION_V1_MAKER_CANCELLED, TRANSITION_V1_MAKER_FILLED,
     TRANSITION_V1_MARKET_ISSUED,
@@ -49,8 +54,8 @@ use deadcat_node::store::{
 };
 use deadcat_node::sync::{SyncCoordinator, SyncOutcome};
 use deadcat_rpc::{
-    BackendKind, ContractHistoryPage, ContractStateView, ContractView, PageRequest, RecoveryFamily,
-    Request, Response, RpcErrorCode, TransactionEvidence,
+    BackendKind, ContractHistoryPage, ContractStateView, ContractView, Event, EventEnvelope,
+    PageRequest, RecoveryFamily, Request, Response, RpcErrorCode, SyncStatus, TransactionEvidence,
 };
 use deadcat_types::{
     BinaryMarketParams, BinaryMarketState, CONTRACT_PACKAGE_FORMAT_VERSION, ChainAnchor,
@@ -1948,6 +1953,217 @@ fn accept_broadcast_mine(
     }
 }
 
+const ELECTRS_SYNC_TIMEOUT: Duration = Duration::from_secs(20);
+
+async fn wait_for_esplora_tip(source: &EsploraChainSource, expected: ChainAnchor) {
+    let deadline = tokio::time::Instant::now() + ELECTRS_SYNC_TIMEOUT;
+    loop {
+        let latest = source.tip().await;
+        if latest.as_ref().is_ok_and(|actual| *actual == expected) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Electrs did not reach {expected:?} within {ELECTRS_SYNC_TIMEOUT:?}; latest={latest:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_esplora_status(
+    source: &EsploraChainSource,
+    txid: elements::Txid,
+    expected: TransactionStatus,
+) {
+    let deadline = tokio::time::Instant::now() + ELECTRS_SYNC_TIMEOUT;
+    loop {
+        let latest = source.transaction_status(txid).await;
+        if latest.as_ref().is_ok_and(|actual| *actual == expected) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Electrs did not report {txid} as {expected:?} within {ELECTRS_SYNC_TIMEOUT:?}; latest={latest:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_esplora_issuance(
+    source: &EsploraChainSource,
+    asset_id: AssetId,
+    expected: elements::Txid,
+) {
+    let deadline = tokio::time::Instant::now() + ELECTRS_SYNC_TIMEOUT;
+    loop {
+        let latest = source.issuance_transaction(asset_id).await;
+        if latest
+            .as_ref()
+            .is_ok_and(|actual| *actual == Some(expected))
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Electrs did not index asset {asset_id} from {expected} within {ELECTRS_SYNC_TIMEOUT:?}; latest={latest:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_esplora_history(
+    source: &EsploraChainSource,
+    script: &Script,
+    expected: &[elements::Txid],
+) -> Vec<elements::Txid> {
+    let deadline = tokio::time::Instant::now() + ELECTRS_SYNC_TIMEOUT;
+    loop {
+        let latest = source.script_history(script).await;
+        if let Ok(history) = &latest
+            && expected.iter().all(|txid| history.contains(txid))
+        {
+            return history.clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Electrs did not index expected script history within {ELECTRS_SYNC_TIMEOUT:?}; expected={expected:?}; latest={latest:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn assert_live_chain_equivalence(
+    elements: &ElementsRpcChainSource,
+    esplora: &EsploraChainSource,
+    first_height: u32,
+) -> ChainAnchor {
+    let expected_tip = elements.tip().await.expect("Elements canonical tip");
+    wait_for_esplora_tip(esplora, expected_tip).await;
+    assert_eq!(
+        esplora.tip().await.expect("Esplora canonical tip"),
+        expected_tip
+    );
+
+    let mut heights = vec![0];
+    heights.extend(first_height..=expected_tip.height);
+    heights.sort_unstable();
+    heights.dedup();
+    for height in heights {
+        let elements_hash = elements
+            .block_hash(height)
+            .await
+            .expect("Elements block hash");
+        let esplora_hash = esplora
+            .block_hash(height)
+            .await
+            .expect("Esplora block hash");
+        assert_eq!(esplora_hash, elements_hash, "block hash at height {height}");
+
+        let elements_block = elements
+            .block(elements_hash)
+            .await
+            .expect("Elements raw block");
+        let esplora_block = esplora
+            .block(esplora_hash)
+            .await
+            .expect("Esplora raw block");
+        assert_eq!(
+            elements::encode::serialize(&esplora_block),
+            elements::encode::serialize(&elements_block),
+            "raw block at height {height}"
+        );
+    }
+    expected_tip
+}
+
+async fn assert_live_fee_path(label: &str, source: &impl deadcat_node::chain::ChainSource) {
+    match source.estimate_fee_rate(2).await {
+        Ok(rate) => assert!(
+            rate.is_finite() && rate > 0.0,
+            "{label} returned invalid fee rate {rate}"
+        ),
+        Err(ChainSourceError::Unavailable(_)) => {
+            // A fresh deterministic regtest does not necessarily have enough
+            // fee history. Reaching this typed result still exercises the
+            // production endpoint and its no-estimate semantics.
+        }
+        Err(error) => panic!("{label} fee path failed unexpectedly: {error}"),
+    }
+}
+
+fn assert_market_store_equivalence(
+    elements_store: &Store,
+    esplora_store: &Store,
+    market_id: ContractId,
+) {
+    assert_eq!(
+        esplora_store.tip().expect("Esplora-backed store tip"),
+        elements_store.tip().expect("Elements-backed store tip")
+    );
+    assert_eq!(
+        esplora_store
+            .sync_status()
+            .expect("Esplora-backed sync status"),
+        elements_store
+            .sync_status()
+            .expect("Elements-backed sync status")
+    );
+
+    let elements_record = elements_store
+        .contract(market_id)
+        .expect("Elements-backed market lookup")
+        .expect("Elements-backed market");
+    let esplora_record = esplora_store
+        .contract(market_id)
+        .expect("Esplora-backed market lookup")
+        .expect("Esplora-backed market");
+    assert_eq!(esplora_record, elements_record);
+
+    let elements_history = elements_store
+        .contract_history(market_id)
+        .expect("Elements-backed market history");
+    let esplora_history = esplora_store
+        .contract_history(market_id)
+        .expect("Esplora-backed market history");
+    assert_eq!(esplora_history, elements_history);
+
+    let positions = std::iter::once(elements_record.creation_position)
+        .chain(elements_history.iter().map(|entry| entry.position));
+    for position in positions {
+        assert_eq!(
+            esplora_store
+                .transaction(position)
+                .expect("Esplora-backed transaction evidence"),
+            elements_store
+                .transaction(position)
+                .expect("Elements-backed transaction evidence"),
+            "transaction evidence at {position:?}"
+        );
+    }
+    for tracked in elements_record.outpoints {
+        assert_eq!(
+            esplora_store
+                .output(tracked.outpoint)
+                .expect("Esplora-backed output evidence"),
+            elements_store
+                .output(tracked.outpoint)
+                .expect("Elements-backed output evidence"),
+            "output evidence for {:?}",
+            tracked.outpoint
+        );
+        assert_eq!(
+            esplora_store
+                .outpoint_owner(tracked.outpoint)
+                .expect("Esplora-backed outpoint owner"),
+            elements_store
+                .outpoint_owner(tracked.outpoint)
+                .expect("Elements-backed outpoint owner"),
+            "outpoint owner for {:?}",
+            tracked.outpoint
+        );
+    }
+}
+
 fn metrics(
     chain: &'static str,
     stage: &'static str,
@@ -2484,6 +2700,384 @@ fn binary_market_ab_lifecycle_is_accepted_by_elementsd() {
         "DEADCAT_MARKET_AB_METRICS={}",
         serde_json::to_string(&report).expect("serialize market metrics")
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "starts elementsd and liquid-enabled Electrs from the Nix development shell"]
+async fn elements_and_esplora_backends_index_the_same_live_chain() {
+    let (client, signer) =
+        Regtest::from_config(&RegtestConfig::default()).expect("regtest environment");
+    let network = SimplicityNetwork::default_regtest();
+    let policy_asset = network.policy_asset();
+    let miner = ElementsRpc::new(client.rpc_url(), client.auth()).expect("Elements RPC");
+    let rpc = Client::new(&client.rpc_url(), client.auth()).expect("raw Elements RPC");
+    let genesis_hash = BlockHash::from_str(
+        &rpc.get_block_hash(0)
+            .expect("regtest genesis block")
+            .to_string(),
+    )
+    .expect("Elements genesis hash");
+    let elements_source = ElementsRpcChainSource::new(ElementsRpcConfig::new(
+        client.rpc_url(),
+        node_elements_auth(&client.auth()),
+    ))
+    .expect("production Elements chain source");
+    let esplora_source = EsploraChainSource::new(EsploraConfig::new(client.esplora_url()))
+        .expect("production Esplora chain source");
+
+    let (funding_tx, funding_accepted, funding) =
+        prepare_funding(&signer, &rpc, &miner, policy_asset);
+    let baseline = ChainAnchor {
+        height: u32::try_from(funding_accepted.block_height).expect("baseline height"),
+        hash: BlockHash::from_str(&funding_accepted.block_hash).expect("baseline hash"),
+    };
+    assert_eq!(
+        assert_live_chain_equivalence(&elements_source, &esplora_source, baseline.height).await,
+        baseline
+    );
+
+    let market = create_market(
+        &signer,
+        &rpc,
+        &miner,
+        policy_asset,
+        &funding[0],
+        &funding[1],
+        baseline.height.checked_add(1_000).expect("future expiry"),
+    );
+    let market_id = ContractId::new(OutPoint::new(market.transaction.txid(), 0));
+    let (issuance, trading_state) = build_issuance(
+        &signer,
+        &network,
+        market.params,
+        market.entropies,
+        BinaryMarketState::Trading {
+            outstanding_pairs: 0,
+        },
+        &dormant_live(&market.transaction),
+        None,
+        &funding[2],
+        INITIAL_PAIRS,
+        RtSide::A,
+        false,
+    );
+    assert_eq!(
+        trading_state,
+        BinaryMarketState::Trading {
+            outstanding_pairs: INITIAL_PAIRS,
+        }
+    );
+
+    let acceptance = test_mempool_accept(&rpc, &issuance);
+    assert_eq!(
+        acceptance.allowed,
+        Some(true),
+        "elementsd rejected Esplora broadcast fixture: {:?}",
+        acceptance.reject_reason
+    );
+    assert_eq!(
+        esplora_source
+            .broadcast(&issuance)
+            .await
+            .expect("broadcast issuance through production Esplora source"),
+        issuance.txid()
+    );
+    wait_for_esplora_status(
+        &esplora_source,
+        issuance.txid(),
+        TransactionStatus::Unconfirmed,
+    )
+    .await;
+    assert_eq!(
+        elements_source
+            .transaction_status(issuance.txid())
+            .await
+            .expect("Elements unconfirmed issuance status"),
+        TransactionStatus::Unconfirmed
+    );
+    assert_eq!(
+        esplora_source
+            .transaction(issuance.txid())
+            .await
+            .expect("Esplora unconfirmed issuance transaction"),
+        elements_source
+            .transaction(issuance.txid())
+            .await
+            .expect("Elements unconfirmed issuance transaction")
+    );
+
+    let mining_address = signer.get_address().to_unconfidential().to_string();
+    let mine_exact = |txids: Vec<String>| -> String {
+        let result: JsonValue = rpc
+            .call(
+                "generateblock",
+                &[json!(mining_address.clone()), json!(txids)],
+            )
+            .expect("mine exact backend-equivalence block");
+        result["hash"]
+            .as_str()
+            .expect("generateblock hash")
+            .to_owned()
+    };
+    let original_issuance_hash = mine_exact(vec![issuance.txid().to_string()]);
+    let initial_tip =
+        assert_live_chain_equivalence(&elements_source, &esplora_source, baseline.height).await;
+    assert_eq!(initial_tip.hash.to_string(), original_issuance_hash);
+
+    for transaction in [&market.transaction, &issuance] {
+        let txid = transaction.txid();
+        assert_eq!(
+            elements_source
+                .transaction(txid)
+                .await
+                .expect("Elements canonical transaction"),
+            *transaction
+        );
+        assert_eq!(
+            esplora_source
+                .transaction(txid)
+                .await
+                .expect("Esplora canonical transaction"),
+            *transaction
+        );
+        let elements_status = elements_source
+            .transaction_status(txid)
+            .await
+            .expect("Elements canonical transaction status");
+        wait_for_esplora_status(&esplora_source, txid, elements_status).await;
+        assert_eq!(
+            esplora_source
+                .transaction_status(txid)
+                .await
+                .expect("Esplora canonical transaction status"),
+            elements_status
+        );
+    }
+
+    let spent_market_outpoint = OutPoint::new(market.transaction.txid(), 0);
+    let esplora_outspend = esplora_source
+        .outspend(spent_market_outpoint)
+        .await
+        .expect("Esplora confirmed outspend")
+        .expect("spent market RT");
+    assert_eq!(esplora_outspend.spending_txid, issuance.txid());
+    assert!(matches!(
+        esplora_outspend.status,
+        TransactionStatus::Confirmed { .. }
+    ));
+    assert!(matches!(
+        elements_source.outspend(spent_market_outpoint).await,
+        Err(ChainSourceError::Unsupported(_))
+    ));
+    let unspent_issuance_outpoint = OutPoint::new(issuance.txid(), 0);
+    assert_eq!(
+        esplora_source
+            .outspend(unspent_issuance_outpoint)
+            .await
+            .expect("Esplora unspent output"),
+        elements_source
+            .outspend(unspent_issuance_outpoint)
+            .await
+            .expect("Elements unspent output")
+    );
+
+    for asset_id in [
+        market.params.yes_token_asset_id,
+        market.params.no_token_asset_id,
+    ] {
+        wait_for_esplora_issuance(&esplora_source, asset_id, market.transaction.txid()).await;
+    }
+    let expected_wallet_history = [
+        funding_tx.txid(),
+        market.transaction.txid(),
+        issuance.txid(),
+    ];
+    let wallet_history = wait_for_esplora_history(
+        &esplora_source,
+        &signer.get_address().script_pubkey(),
+        &expected_wallet_history,
+    )
+    .await;
+    let wallet_positions = expected_wallet_history.map(|txid| {
+        wallet_history
+            .iter()
+            .position(|candidate| *candidate == txid)
+            .expect("expected wallet transaction in Esplora history")
+    });
+    assert!(wallet_positions.windows(2).all(|pair| pair[0] < pair[1]));
+    assert_live_fee_path("Elements RPC", &elements_source).await;
+    assert_live_fee_path("Esplora", &esplora_source).await;
+
+    let elements_directory = tempfile::tempdir().expect("Elements-backed database directory");
+    let esplora_directory = tempfile::tempdir().expect("Esplora-backed database directory");
+    let elements_store = Store::open(elements_directory.path().join("deadcat.redb"))
+        .expect("open Elements-backed store");
+    let esplora_store = Store::open(esplora_directory.path().join("deadcat.redb"))
+        .expect("open Esplora-backed store");
+    let identity = StoreChainIdentity {
+        network: LiquidNetwork::ElementsRegtest,
+        genesis_hash,
+        policy_asset,
+    };
+    elements_store
+        .initialize_chain(identity, baseline)
+        .expect("initialize Elements-backed store");
+    esplora_store
+        .initialize_chain(identity, baseline)
+        .expect("initialize Esplora-backed store");
+    let interpreter = DeadcatInterpreter::new(LiquidNetwork::ElementsRegtest, policy_asset);
+
+    let SyncOutcome::Ready(elements_initial) =
+        SyncCoordinator::new(&elements_source, &elements_store, &interpreter)
+            .sync_to_tip()
+            .await
+            .expect("initial Elements-backed sync")
+    else {
+        panic!("initial Elements-backed sync unexpectedly required a rescan")
+    };
+    let SyncOutcome::Ready(esplora_initial) =
+        SyncCoordinator::new(&esplora_source, &esplora_store, &interpreter)
+            .sync_to_tip()
+            .await
+            .expect("initial Esplora-backed sync")
+    else {
+        panic!("initial Esplora-backed sync unexpectedly required a rescan")
+    };
+    assert_eq!(esplora_initial, elements_initial);
+    assert_eq!(elements_initial.blocks_applied, 2);
+    assert_eq!(
+        stored_market_state(&elements_store, market_id),
+        trading_state
+    );
+    assert_market_store_equivalence(&elements_store, &esplora_store, market_id);
+    let original_history = elements_store
+        .contract_history(market_id)
+        .expect("original market history");
+    assert_eq!(original_history.len(), 1);
+    let original_position = original_history[0].position;
+
+    let invalidated: JsonValue = rpc
+        .call("invalidateblock", &[json!(original_issuance_hash.clone())])
+        .expect("invalidate original issuance block");
+    assert!(invalidated.is_null());
+    let empty_replacement_hash = mine_exact(vec![]);
+    assert_ne!(empty_replacement_hash, original_issuance_hash);
+    let replacement_tip =
+        assert_live_chain_equivalence(&elements_source, &esplora_source, baseline.height).await;
+    assert_eq!(replacement_tip.height, initial_tip.height);
+    assert_eq!(replacement_tip.hash.to_string(), empty_replacement_hash);
+
+    let SyncOutcome::Ready(elements_reorg) =
+        SyncCoordinator::new(&elements_source, &elements_store, &interpreter)
+            .sync_to_tip()
+            .await
+            .expect("Elements-backed one-block reorg")
+    else {
+        panic!("Elements-backed one-block reorg unexpectedly required a rescan")
+    };
+    let SyncOutcome::Ready(esplora_reorg) =
+        SyncCoordinator::new(&esplora_source, &esplora_store, &interpreter)
+            .sync_to_tip()
+            .await
+            .expect("Esplora-backed one-block reorg")
+    else {
+        panic!("Esplora-backed one-block reorg unexpectedly required a rescan")
+    };
+    assert_eq!(esplora_reorg, elements_reorg);
+    assert_eq!(elements_reorg.blocks_rolled_back, 1);
+    assert_eq!(elements_reorg.blocks_applied, 1);
+    assert_eq!(
+        stored_market_state(&elements_store, market_id),
+        BinaryMarketState::Trading {
+            outstanding_pairs: 0,
+        }
+    );
+    assert!(
+        elements_store
+            .contract_history(market_id)
+            .expect("rolled-back market history")
+            .is_empty()
+    );
+    assert!(
+        elements_store
+            .transaction(original_position)
+            .expect("rolled-back original evidence")
+            .is_none()
+    );
+    assert_market_store_equivalence(&elements_store, &esplora_store, market_id);
+
+    let moved_issuance_hash = mine_exact(vec![issuance.txid().to_string()]);
+    let moved_tip =
+        assert_live_chain_equivalence(&elements_source, &esplora_source, baseline.height).await;
+    assert_eq!(moved_tip.hash.to_string(), moved_issuance_hash);
+    assert_eq!(moved_tip.height, initial_tip.height + 1);
+    let moved_status = elements_source
+        .transaction_status(issuance.txid())
+        .await
+        .expect("moved Elements issuance status");
+    wait_for_esplora_status(&esplora_source, issuance.txid(), moved_status).await;
+
+    let SyncOutcome::Ready(elements_remine) =
+        SyncCoordinator::new(&elements_source, &elements_store, &interpreter)
+            .sync_to_tip()
+            .await
+            .expect("Elements-backed issuance remine")
+    else {
+        panic!("Elements-backed issuance remine unexpectedly required a rescan")
+    };
+    let SyncOutcome::Ready(esplora_remine) =
+        SyncCoordinator::new(&esplora_source, &esplora_store, &interpreter)
+            .sync_to_tip()
+            .await
+            .expect("Esplora-backed issuance remine")
+    else {
+        panic!("Esplora-backed issuance remine unexpectedly required a rescan")
+    };
+    assert_eq!(esplora_remine, elements_remine);
+    assert_eq!(elements_remine.blocks_applied, 1);
+    assert_eq!(elements_remine.blocks_rolled_back, 0);
+    assert_eq!(
+        stored_market_state(&elements_store, market_id),
+        trading_state
+    );
+    assert_market_store_equivalence(&elements_store, &esplora_store, market_id);
+
+    let moved_history = elements_store
+        .contract_history(market_id)
+        .expect("moved market history");
+    assert_eq!(moved_history.len(), 1);
+    let moved_position = moved_history[0].position;
+    assert_eq!(
+        moved_position.block_height,
+        original_position.block_height + 1
+    );
+    assert_ne!(moved_position, original_position);
+    assert!(
+        elements_store
+            .transaction(original_position)
+            .expect("stale original evidence")
+            .is_none()
+    );
+    let moved_evidence = elements_store
+        .transaction(moved_position)
+        .expect("moved transaction evidence")
+        .expect("canonical moved issuance evidence");
+    assert_eq!(
+        elements::encode::deserialize::<Transaction>(&moved_evidence.raw_tx)
+            .expect("decode moved issuance evidence"),
+        issuance
+    );
+    let moved_outspend = esplora_source
+        .outspend(spent_market_outpoint)
+        .await
+        .expect("Esplora moved outspend")
+        .expect("moved issuance spends the market RT");
+    assert_eq!(moved_outspend.spending_txid, issuance.txid());
+    assert_eq!(moved_outspend.status, moved_status);
+    assert!(matches!(
+        elements_source.outspend(spent_market_outpoint).await,
+        Err(ChainSourceError::Unsupported(_))
+    ));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -4830,5 +5424,468 @@ async fn multi_contract_transaction_is_accepted_and_indexed_by_elementsd() {
     eprintln!(
         "DEADCAT_MULTI_CONTRACT_REGTEST_METRICS={}",
         serde_json::to_string(&report).expect("serialize multi-contract metrics")
+    );
+}
+
+fn process_chain_tip(rpc: &Client) -> ChainAnchor {
+    let height = u32::try_from(rpc.get_block_count().expect("process-test block count"))
+        .expect("liquidregtest height fits in u32");
+    let hash = BlockHash::from_str(
+        &rpc.get_block_hash(u64::from(height))
+            .expect("process-test tip hash")
+            .to_string(),
+    )
+    .expect("Elements tip hash");
+    ChainAnchor { height, hash }
+}
+
+fn build_process_relay(signer: &Signer, policy_asset: AssetId, funding: &Funding) -> Transaction {
+    let mut pset = PartiallySignedTransaction::new_v2();
+    pset.add_input(pset_input(funding.outpoint, funding.txout.clone()));
+    pset.add_output(PsetOutput::from_txout(explicit_txout(
+        policy_asset,
+        FUNDING_VALUE - FEE,
+        signer.get_address().script_pubkey(),
+    )));
+    pset.add_output(PsetOutput::from_txout(TxOut::new_fee(FEE, policy_asset)));
+    sign_input(signer, &mut pset, 0);
+    pset.extract_tx().expect("extract process-test relay")
+}
+
+#[test]
+#[ignore = "starts elementsd, the deadcat-node daemon, and real Iroh/CLI processes"]
+fn daemon_iroh_cli_restart_and_rebuild_boundary_is_live() {
+    let node_binary = process_support::required_binary("DEADCAT_NODE_BIN", "deadcat-node");
+    let cli_binary = process_support::required_binary("DEADCAT_CLI_BIN", "deadcat");
+    let (client, signer) =
+        Regtest::from_config(&RegtestConfig::default()).expect("regtest environment");
+    let network = SimplicityNetwork::default_regtest();
+    let policy_asset = network.policy_asset();
+    let miner = ElementsRpc::new(client.rpc_url(), client.auth()).expect("Elements RPC");
+    let rpc = Client::new(&client.rpc_url(), client.auth()).expect("raw Elements RPC");
+    let genesis_hash = BlockHash::from_str(
+        &rpc.get_block_hash(0)
+            .expect("regtest genesis block")
+            .to_string(),
+    )
+    .expect("Elements genesis hash");
+    let (_funding_tx, funding_accepted, funding) =
+        prepare_funding(&signer, &rpc, &miner, policy_asset);
+    let baseline = ChainAnchor {
+        height: u32::try_from(funding_accepted.block_height).expect("baseline height"),
+        hash: BlockHash::from_str(&funding_accepted.block_hash).expect("baseline hash"),
+    };
+
+    let directory = tempfile::tempdir().expect("process-boundary directory");
+    let database = directory.path().join("deadcat.redb");
+    let iroh_secret = directory.path().join("iroh-secret");
+    let mut node = process_support::NodeProcess::spawn(
+        &node_binary,
+        &database,
+        &iroh_secret,
+        LiquidNetwork::ElementsRegtest,
+        policy_asset,
+        Some(baseline.height),
+        &client.rpc_url(),
+        &client.auth(),
+    );
+    let initial_info = process_support::wait_for_info(&cli_binary, node.endpoint(), |info| {
+        info.sync_status == SyncStatus::Ready
+            && info.source_tip == Some(baseline)
+            && info.indexed_tip == baseline
+    });
+    assert_eq!(initial_info.network, LiquidNetwork::ElementsRegtest);
+    assert_eq!(initial_info.genesis_hash, genesis_hash);
+    assert_eq!(initial_info.policy_asset, policy_asset);
+    let before_market_cursor = initial_info.event_high_watermark;
+
+    // Create a real market after the daemon is already serving. This drives
+    // background Elements synchronization and leaves a durable event for a
+    // separately spawned CLI subscription to resume from its old cursor.
+    let market = create_market(
+        &signer,
+        &rpc,
+        &miner,
+        policy_asset,
+        &funding[0],
+        &funding[1],
+        baseline.height.checked_add(1_000).expect("future expiry"),
+    );
+    let market_tip = ChainAnchor {
+        height: u32::try_from(market.accepted.block_height).expect("market height"),
+        hash: BlockHash::from_str(&market.accepted.block_hash).expect("market block hash"),
+    };
+    let market_id = ContractId::new(OutPoint::new(market.transaction.txid(), 0));
+    let caught_up = process_support::wait_for_info(&cli_binary, node.endpoint(), |info| {
+        info.sync_status == SyncStatus::Ready
+            && info.source_tip == Some(market_tip)
+            && info.indexed_tip == market_tip
+    });
+    assert!(caught_up.discovery.canonical_market_complete);
+
+    let subscribe_args = vec![
+        "subscribe".to_owned(),
+        "--after-json".to_owned(),
+        serde_json::to_string(&before_market_cursor).expect("serialize old event cursor"),
+    ];
+    let subscription = process_support::subscription_until(
+        &cli_binary,
+        node.endpoint(),
+        &subscribe_args,
+        move |value| {
+            serde_json::from_value::<EventEnvelope>(value.clone()).is_ok_and(|envelope| {
+                match envelope.event {
+                    Event::ContractRegistered { contract_id }
+                    | Event::ContractReady { contract_id, .. }
+                    | Event::BackfillApplied { contract_id, .. } => contract_id == market_id,
+                    Event::TransactionApplied {
+                        affected_contract_ids,
+                        ..
+                    }
+                    | Event::ChainRolledBack {
+                        affected_contract_ids,
+                        ..
+                    } => affected_contract_ids.contains(&market_id),
+                    Event::SyncStatusChanged { .. } | Event::CaughtUp { .. } => false,
+                }
+            })
+        },
+    );
+    assert!(subscription[0].get("subscription_opened").is_some());
+    let event: EventEnvelope = serde_json::from_value(
+        subscription
+            .last()
+            .expect("matched market subscription event")
+            .clone(),
+    )
+    .expect("subscription event envelope");
+    assert_eq!(event.cursor.epoch, before_market_cursor.epoch);
+    assert!(event.cursor.sequence > before_market_cursor.sequence);
+    assert!(match event.event {
+        Event::ContractRegistered { contract_id }
+        | Event::ContractReady { contract_id, .. }
+        | Event::BackfillApplied { contract_id, .. } => contract_id == market_id,
+        Event::TransactionApplied {
+            affected_contract_ids,
+            ..
+        }
+        | Event::ChainRolledBack {
+            affected_contract_ids,
+            ..
+        } => affected_contract_ids.contains(&market_id),
+        Event::SyncStatusChanged { .. } | Event::CaughtUp { .. } => false,
+    });
+
+    let package = ContractPackage {
+        format_version: CONTRACT_PACKAGE_FORMAT_VERSION,
+        chain: ChainIdentity {
+            network: LiquidNetwork::ElementsRegtest,
+            genesis_hash,
+        },
+        roots: vec![market_id],
+        declarations: vec![ContractDeclaration {
+            contract_id: market_id,
+            descriptor: ContractDescriptor::BinaryMarketV1 {
+                params: market.params,
+            },
+        }],
+    };
+    let registration = process_support::cli_response(
+        &cli_binary,
+        node.endpoint(),
+        &[
+            "register".to_owned(),
+            "--json".to_owned(),
+            serde_json::to_string(&package).expect("serialize contract package"),
+        ],
+    );
+    let Response::RegistrationAccepted { registration } = registration else {
+        panic!("real CLI returned the wrong registration response")
+    };
+    assert_eq!(registration.roots, vec![market_id]);
+    assert_eq!(registration.contracts.len(), 1);
+    assert_eq!(registration.contracts[0].contract_id, market_id);
+    assert!(registration.contracts[0].already_registered);
+    assert!(matches!(
+        registration.contracts[0].sync_state,
+        ContractSyncState::Ready { synced_through } if synced_through == market_tip
+    ));
+
+    let contract = process_support::cli_response(
+        &cli_binary,
+        node.endpoint(),
+        &["get-contract".to_owned(), market_id.to_string()],
+    );
+    let Response::Contract {
+        contract: Some(contract),
+    } = contract
+    else {
+        panic!("real CLI did not return the discovered market")
+    };
+    assert_eq!(contract.contract_id, market_id);
+    assert_eq!(contract.creation_position.block_height, market_tip.height);
+
+    let markets =
+        process_support::cli_response(&cli_binary, node.endpoint(), &["list-markets".to_owned()]);
+    let Response::Markets { page } = markets else {
+        panic!("real CLI returned the wrong markets response")
+    };
+    assert_eq!(page.contracts.len(), 1);
+    assert_eq!(page.contracts[0].contract_id, market_id);
+
+    let history = process_support::cli_response(
+        &cli_binary,
+        node.endpoint(),
+        &["history".to_owned(), market_id.to_string()],
+    );
+    let Response::ContractHistory { page } = history else {
+        panic!("real CLI returned the wrong history response")
+    };
+    assert_eq!(page.contract_id, market_id);
+    assert!(page.entries.is_empty());
+
+    let creation_position = contract.creation_position;
+    let evidence = process_support::cli_response(
+        &cli_binary,
+        node.endpoint(),
+        &[
+            "transaction".to_owned(),
+            format!(
+                "{}:{}",
+                creation_position.block_height, creation_position.tx_index
+            ),
+        ],
+    );
+    let Response::Transaction {
+        evidence: Some(evidence),
+    } = evidence
+    else {
+        panic!("real CLI did not return creation evidence")
+    };
+    assert_eq!(evidence.transaction, market.transaction);
+
+    // Relay a separately signed wallet transaction through the actual CLI and
+    // Iroh server, then require the daemon to index its confirmed block.
+    let relay = build_process_relay(&signer, policy_asset, &funding[5]);
+    let broadcast = process_support::cli_response(
+        &cli_binary,
+        node.endpoint(),
+        &[
+            "broadcast".to_owned(),
+            "--hex".to_owned(),
+            elements::encode::serialize_hex(&relay),
+        ],
+    );
+    assert_eq!(
+        broadcast,
+        Response::BroadcastAccepted { txid: relay.txid() }
+    );
+    miner.generate_blocks(1).expect("mine relayed transaction");
+    let relay_tip = process_chain_tip(&rpc);
+    let relay_status: JsonValue = rpc
+        .call(
+            "getrawtransaction",
+            &[json!(relay.txid().to_string()), json!(true)],
+        )
+        .expect("read confirmed relayed transaction");
+    assert!(
+        relay_status["confirmations"]
+            .as_u64()
+            .is_some_and(|confirmations| confirmations >= 1)
+    );
+    assert_eq!(
+        relay_status["blockhash"].as_str(),
+        Some(relay_tip.hash.to_string().as_str())
+    );
+    let before_restart = process_support::wait_for_info(&cli_binary, node.endpoint(), |info| {
+        info.sync_status == SyncStatus::Ready
+            && info.source_tip == Some(relay_tip)
+            && info.indexed_tip == relay_tip
+    });
+    let pre_rebuild_cursor = before_restart.event_high_watermark;
+    let endpoint_id = node.endpoint().id;
+    node.stop_gracefully();
+
+    // A fresh daemon process must reuse its Iroh identity and redb state.
+    let mut restarted = process_support::NodeProcess::spawn(
+        &node_binary,
+        &database,
+        &iroh_secret,
+        LiquidNetwork::ElementsRegtest,
+        policy_asset,
+        Some(baseline.height),
+        &client.rpc_url(),
+        &client.auth(),
+    );
+    assert_eq!(restarted.endpoint().id, endpoint_id);
+    process_support::wait_for_info(&cli_binary, restarted.endpoint(), |info| {
+        info.sync_status == SyncStatus::Ready && info.indexed_tip == relay_tip
+    });
+    let persisted = process_support::cli_response(
+        &cli_binary,
+        restarted.endpoint(),
+        &["get-contract".to_owned(), market_id.to_string()],
+    );
+    assert!(matches!(
+        persisted,
+        Response::Contract {
+            contract: Some(ref value)
+        } if value.contract_id == market_id
+    ));
+
+    // Replace a three-block suffix. The daemon can retain only two undo
+    // deltas, so it must fail closed and require the explicit rebuild command.
+    let stale_height = relay_tip.height.checked_add(1).expect("stale height");
+    miner
+        .generate_blocks(3)
+        .expect("mine stale three-block suffix");
+    let stale_tip = process_chain_tip(&rpc);
+    process_support::wait_for_info(&cli_binary, restarted.endpoint(), |info| {
+        info.sync_status == SyncStatus::Ready && info.indexed_tip == stale_tip
+    });
+    let stale_root_hash = rpc
+        .get_block_hash(u64::from(stale_height))
+        .expect("stale suffix root")
+        .to_string();
+    let invalidated: JsonValue = rpc
+        .call("invalidateblock", &[json!(stale_root_hash)])
+        .expect("invalidate deep suffix");
+    assert!(invalidated.is_null());
+    let replacement_marker = build_process_relay(&signer, policy_asset, &funding[6]);
+    let replacement_marker_txid: String = rpc
+        .call(
+            "sendrawtransaction",
+            &[
+                json!(elements::encode::serialize_hex(&replacement_marker)),
+                json!(0),
+            ],
+        )
+        .expect("broadcast replacement-branch marker");
+    assert_eq!(
+        replacement_marker_txid,
+        replacement_marker.txid().to_string()
+    );
+    let mining_address = signer.get_address().to_unconfidential().to_string();
+    for index in 0..3 {
+        let txids = if index == 0 {
+            vec![replacement_marker_txid.clone()]
+        } else {
+            Vec::new()
+        };
+        let generated: JsonValue = rpc
+            .call(
+                "generateblock",
+                &[json!(mining_address.clone()), json!(txids)],
+            )
+            .expect("mine exact replacement block");
+        assert!(generated["hash"].is_string());
+    }
+    let replacement_tip = process_chain_tip(&rpc);
+    assert_eq!(replacement_tip.height, stale_tip.height);
+    assert_ne!(replacement_tip.hash, stale_tip.hash);
+    let invalidated_info =
+        process_support::wait_for_info(&cli_binary, restarted.endpoint(), |info| {
+            info.sync_status == SyncStatus::RescanRequired
+        });
+    assert_eq!(invalidated_info.indexed_tip, stale_tip);
+    assert_eq!(invalidated_info.source_tip, Some(replacement_tip));
+    assert_ne!(
+        invalidated_info.event_high_watermark.epoch,
+        pre_rebuild_cursor.epoch
+    );
+    let invalidated_epoch = invalidated_info.event_high_watermark.epoch;
+    let stale_contract = process_support::cli_output(
+        &cli_binary,
+        restarted.endpoint(),
+        &["get-contract".to_owned(), market_id.to_string()],
+    );
+    assert!(!stale_contract.status.success());
+    let stale_contract_error = String::from_utf8_lossy(&stale_contract.stderr).to_lowercase();
+    assert!(
+        stale_contract_error.contains("rescan"),
+        "chain-derived RPC did not fail explicitly during invalidation: {stale_contract_error}"
+    );
+    restarted.stop_gracefully();
+
+    let rebuild_output =
+        process_support::run_rebuild(&node_binary, &database, &client.rpc_url(), &client.auth());
+    assert!(rebuild_output.contains("rebuild complete"));
+
+    let mut rebuilt = process_support::NodeProcess::spawn(
+        &node_binary,
+        &database,
+        &iroh_secret,
+        LiquidNetwork::ElementsRegtest,
+        policy_asset,
+        Some(baseline.height),
+        &client.rpc_url(),
+        &client.auth(),
+    );
+    assert_eq!(rebuilt.endpoint().id, endpoint_id);
+    let rebuilt_info = process_support::wait_for_info(&cli_binary, rebuilt.endpoint(), |info| {
+        info.sync_status == SyncStatus::Ready
+            && info.source_tip == Some(replacement_tip)
+            && info.indexed_tip == replacement_tip
+    });
+    assert_eq!(rebuilt_info.event_high_watermark.epoch, invalidated_epoch);
+    let rebuilt_contract = process_support::cli_response(
+        &cli_binary,
+        rebuilt.endpoint(),
+        &["get-contract".to_owned(), market_id.to_string()],
+    );
+    assert!(matches!(
+        rebuilt_contract,
+        Response::Contract {
+            contract: Some(ref value)
+        } if value.contract_id == market_id && value.creation_position == creation_position
+    ));
+    let rebuilt_evidence = process_support::cli_response(
+        &cli_binary,
+        rebuilt.endpoint(),
+        &[
+            "transaction".to_owned(),
+            format!(
+                "{}:{}",
+                creation_position.block_height, creation_position.tx_index
+            ),
+        ],
+    );
+    assert!(matches!(
+        rebuilt_evidence,
+        Response::Transaction {
+            evidence: Some(ref value)
+        } if value.transaction == market.transaction
+            && value.position == creation_position
+    ));
+
+    let stale_subscription = process_support::cli_output(
+        &cli_binary,
+        rebuilt.endpoint(),
+        &[
+            "subscribe".to_owned(),
+            "--after-json".to_owned(),
+            serde_json::to_string(&pre_rebuild_cursor).expect("serialize stale cursor"),
+        ],
+    );
+    assert!(!stale_subscription.status.success());
+    let stale_error = String::from_utf8_lossy(&stale_subscription.stderr).to_lowercase();
+    assert!(
+        stale_error.contains("stale"),
+        "stale cursor rejection was not explicit: {stale_error}"
+    );
+    rebuilt.stop_gracefully();
+
+    eprintln!(
+        "DEADCAT_PROCESS_BOUNDARY_REGTEST_METRICS={}",
+        serde_json::to_string(&json!({
+            "schema": "deadcat.process-boundary-regtest.v1",
+            "market_id": market_id.to_string(),
+            "endpoint_id": endpoint_id.to_string(),
+            "baseline": baseline,
+            "stale_tip": stale_tip,
+            "replacement_tip": replacement_tip,
+            "rescan_cursor_epoch_rotated_once": true,
+        }))
+        .expect("serialize process-boundary metrics")
     );
 }

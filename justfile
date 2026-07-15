@@ -45,8 +45,23 @@ regtest-multi-contract: generate
         multi_contract_transaction_is_accepted_and_indexed_by_elementsd \
         -- --ignored --nocapture --test-threads=1
 
+# Drive the production Elements RPC and Esplora sources against the same
+# liquidregtest branch, including broadcast, indexing, and a real reorg.
+regtest-backend-equivalence: generate
+    cargo test --locked -p deadcat-client --test market_regtest \
+        elements_and_esplora_backends_index_the_same_live_chain \
+        -- --ignored --nocapture --test-threads=1
+
+# Cross actual daemon/CLI process boundaries over direct Iroh, including
+# restart identity persistence, deep-reorg refusal, and operator rebuild.
+regtest-process-boundary: generate
+    cargo build --locked -p deadcat-node -p deadcat-cli
+    cargo test --locked -p deadcat-client --test market_regtest \
+        daemon_iroh_cli_restart_and_rebuild_boundary_is_live \
+        -- --ignored --nocapture --test-threads=1
+
 # Every isolated live-chain protocol gate required before CI succeeds.
-regtest: regtest-market-ab regtest-maker-orders regtest-multi-contract
+regtest: regtest-market-ab regtest-maker-orders regtest-multi-contract regtest-backend-equivalence regtest-process-boundary
 
 wasm-check:
     NIX_HARDENING_ENABLE=pic cargo check --locked -p deadcat-iroh --lib --target wasm32-unknown-unknown

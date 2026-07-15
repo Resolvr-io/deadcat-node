@@ -126,17 +126,16 @@ ignored only for ordinary `cargo test`; it is mandatory in CI.
 
 ## Deliberate boundaries
 
-This is one deterministic, high-value composed transition, not the independent
-randomized reference model or mutation-boundary fault-injection suite promised
-by the implementation plan. Those remain separate protocol-assurance work.
+This remains one deterministic, high-value composed transition. Independent
+seeded reference-model and mutation-boundary fault-injection coverage now lives
+in the `deadcat-node` store assurance tests.
 
-The gate uses the production Elements RPC source. Live Esplora/Electrs backend
-equivalence remains separate work, and the test runs on local liquidregtest,
-not public Liquid testnet. It invokes the store reset and synchronization
-coordinator directly, exercising recovery after the point where the CLI would
-verify backend genesis and activation. Spawned-process coverage of the local
-`deadcat-node rebuild` CLI boundary remains separate work.
+The gate uses the production Elements RPC source and runs on local
+liquidregtest, not public Liquid testnet. The separate mandatory
+backend-equivalence gate compares the Elements and Esplora adapters. This test
+invokes the store reset and synchronization coordinator directly; the separate
+process-boundary gate covers the shipped `deadcat-node rebuild` command.
 
 The live test invokes the production request handler directly for RPC replay;
-it does not replace the separate Iroh framing/transport tests or the future
-spawned-daemon process-boundary gate.
+the mandatory process-boundary gate separately spawns the daemon and CLI over
+real Iroh.

@@ -19,6 +19,7 @@ use deadcat_types::{
 use elements::encode;
 use tokio::sync::{Semaphore, mpsc};
 
+use crate::activation::validate_policy_asset;
 use crate::chain::{ChainSource, ChainSourceError};
 use crate::registration::{RegistrationError, RegistrationVerifier};
 use crate::store::{
@@ -82,6 +83,12 @@ where
                     "database chain identity is not initialized",
                 )
             })?;
+        validate_policy_asset(identity.network, identity.policy_asset).map_err(|error| {
+            RpcError::new(
+                RpcErrorCode::NotSynced,
+                format!("database chain identity violates network policy: {error}"),
+            )
+        })?;
         // Fail closed for embedders as well as the daemon: RPC discovery and
         // recovery metadata require the store's atomically bound activation.
         store.status_snapshot().map_err(store_error)?;
@@ -1205,6 +1212,49 @@ mod tests {
             StoreError::InvalidRegistrationEvidence("conflict".to_owned()),
         ));
         assert_eq!(error.code, RpcErrorCode::InvalidRegistration);
+    }
+
+    #[test]
+    fn handler_rejects_wrong_production_policy_before_advertising_capabilities() {
+        use crate::chain::esplora::{EsploraChainSource, EsploraConfig};
+        use elements::hashes::Hash as _;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            Store::open(directory.path().join("deadcat.redb")).expect("open malformed store"),
+        );
+        store
+            .bind_chain(ChainIdentity {
+                network: deadcat_types::LiquidNetwork::Liquid,
+                genesis_hash: elements::BlockHash::from_byte_array([0x11; 32]),
+                policy_asset: crate::activation::production_policy_asset(
+                    deadcat_types::LiquidNetwork::LiquidTestnet,
+                )
+                .expect("testnet policy asset"),
+            })
+            .expect("write malformed legacy identity");
+        let source = Arc::new(
+            EsploraChainSource::new(EsploraConfig::new("http://127.0.0.1:1"))
+                .expect("offline source"),
+        );
+        let error = match NodeRpcHandler::new(
+            source,
+            store,
+            RpcHandlerConfig {
+                backend: BackendKind::ElementsRpc,
+                registration_bearer_token: None,
+                max_concurrent_registrations: 1,
+                max_concurrent_broadcasts: 1,
+                subscription_buffer: 1,
+                subscription_poll_interval: Duration::from_millis(1),
+            },
+        ) {
+            Ok(_) => panic!("wrong production policy asset must reject handler construction"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, RpcErrorCode::NotSynced);
+        assert!(error.message.contains("violates network policy"));
+        assert!(error.message.contains("conflicts with immutable"));
     }
 
     #[test]
