@@ -137,6 +137,48 @@ where
         self
     }
 
+    /// Explicitly reset an invalidated database to its immutable activation
+    /// checkpoint and replay to a pinned source tip. A previous invocation
+    /// interrupted after the atomic reset resumes from its persisted prefix
+    /// without clearing it again.
+    pub async fn rebuild_to_tip(&self) -> Result<SyncOutcome, SyncError> {
+        let activation = self
+            .store
+            .activation_anchor()?
+            .ok_or(SyncError::ActivationNotInitialized)?;
+        let source_tip = self.source.tip().await?;
+        if source_tip.height < activation.height {
+            return Err(SyncError::ActivationAboveSourceTip {
+                activation,
+                source_tip,
+            });
+        }
+        let source_hash = self.source.block_hash(activation.height).await?;
+        if source_hash != activation.hash {
+            return Err(SyncError::ActivationHashMismatch {
+                activation,
+                actual: source_hash,
+            });
+        }
+
+        match self.store.sync_status()? {
+            SyncStatus::RescanRequired => {
+                self.store.reset_for_rebuild()?;
+            }
+            SyncStatus::Syncing | SyncStatus::BackendUnavailable => {
+                let indexed_activation = self.store.canonical_anchor(activation.height)?;
+                if indexed_activation != Some(activation) {
+                    return Err(SyncError::IndexedActivationMismatch {
+                        expected: activation,
+                        actual: indexed_activation,
+                    });
+                }
+            }
+            status => return Err(SyncError::RebuildNotRequired { status }),
+        }
+        self.sync_to_tip().await
+    }
+
     /// Reconcile the indexed chain, replay all pending late registrations, and
     /// advance to a pinned source tip. The method returns only after a final
     /// canonicality check or after explicitly entering `RescanRequired`.
@@ -657,6 +699,25 @@ pub enum SyncError {
     Store(#[from] StoreError),
     #[error("indexed tip is not initialized")]
     TipNotInitialized,
+    #[error("v1 activation checkpoint is not initialized")]
+    ActivationNotInitialized,
+    #[error("activation checkpoint {activation:?} is above source tip {source_tip:?}")]
+    ActivationAboveSourceTip {
+        activation: ChainAnchor,
+        source_tip: ChainAnchor,
+    },
+    #[error("activation checkpoint {activation:?} has source hash {actual}")]
+    ActivationHashMismatch {
+        activation: ChainAnchor,
+        actual: BlockHash,
+    },
+    #[error("indexed activation checkpoint mismatch: expected {expected:?}, got {actual:?}")]
+    IndexedActivationMismatch {
+        expected: ChainAnchor,
+        actual: Option<ChainAnchor>,
+    },
+    #[error("explicit rebuild is not required while sync status is {status:?}")]
+    RebuildNotRequired { status: SyncStatus },
     #[error("canonical checkpoint is missing at height {0}")]
     MissingCheckpoint(u32),
     #[error("invalid complete block at height {height}: {reason}")]
@@ -695,8 +756,8 @@ mod tests {
     use super::*;
     use crate::chain::{Outspend, TransactionStatus};
     use crate::store::{
-        AssetBinding, AssetRelationKind, ContractParameters, ContractState, RegistrationEvidence,
-        ScriptBinding, TrackedOutpoint, TransitionRecord,
+        AssetBinding, AssetRelationKind, ChainIdentity, ContractParameters, ContractState,
+        RegistrationEvidence, ScriptBinding, TrackedOutpoint, TransitionRecord,
     };
 
     #[derive(Clone)]
@@ -1081,13 +1142,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovers_one_and_two_block_reorgs_then_requires_rescan_for_three() {
+    async fn recovers_shallow_reorgs_then_explicitly_rebuilds_a_three_block_fork() {
         let block0 = test_block(0, BlockHash::all_zeros(), 30, vec![transaction(1, &[])]);
         let a1 = test_block(1, block0.block_hash(), 31, vec![transaction(2, &[])]);
         let a2 = test_block(2, a1.block_hash(), 32, vec![transaction(3, &[])]);
         let a3 = test_block(3, a2.block_hash(), 33, vec![transaction(4, &[])]);
         let source = FakeChain::new(vec![block0.clone(), a1.clone(), a2.clone(), a3]);
-        let (_dir, _path, store) = initialized_store(block_anchor(&block0));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("store.redb")).expect("open store");
+        store
+            .initialize_chain(
+                ChainIdentity {
+                    network: deadcat_types::LiquidNetwork::ElementsRegtest,
+                    genesis_hash: block0.block_hash(),
+                    policy_asset: asset(0x90),
+                },
+                block_anchor(&block0),
+            )
+            .expect("initialize chain");
         let coordinator = SyncCoordinator::new(&source, &store, &NoopInterpreter);
         assert!(matches!(
             coordinator.sync_to_tip().await.expect("initial"),
@@ -1122,6 +1194,56 @@ mod tests {
         assert_eq!(
             store.sync_status().expect("status"),
             SyncStatus::RescanRequired
+        );
+        let rebuild_epoch = store.event_high_watermark().expect("rebuild epoch").epoch;
+        let invalidated_tip = store.tip().expect("invalidated tip");
+        let wrong_activation =
+            test_block(0, BlockHash::all_zeros(), 99, vec![transaction(99, &[])]);
+        let wrong_source = FakeChain::new(vec![wrong_activation]);
+        assert!(matches!(
+            SyncCoordinator::new(&wrong_source, &store, &NoopInterpreter)
+                .rebuild_to_tip()
+                .await,
+            Err(SyncError::ActivationHashMismatch { .. })
+        ));
+        assert_eq!(
+            store.tip().expect("preflight preserves tip"),
+            invalidated_tip
+        );
+        assert_eq!(
+            store.sync_status().expect("preflight preserves status"),
+            SyncStatus::RescanRequired
+        );
+        assert_eq!(
+            store
+                .event_high_watermark()
+                .expect("preflight preserves epoch")
+                .epoch,
+            rebuild_epoch
+        );
+        let SyncOutcome::Ready(rebuilt) = coordinator
+            .rebuild_to_tip()
+            .await
+            .expect("explicit activation rebuild")
+        else {
+            panic!("replacement branch unexpectedly required another rebuild")
+        };
+        assert_eq!(rebuilt.starting_tip.height, 0);
+        assert_eq!(rebuilt.blocks_applied, 3);
+        assert_eq!(
+            store.tip().expect("replacement tip"),
+            Some(source.tip().await.unwrap())
+        );
+        assert_eq!(
+            store.sync_status().expect("ready status"),
+            SyncStatus::Ready
+        );
+        assert_eq!(
+            store
+                .event_high_watermark()
+                .expect("stable rebuild epoch")
+                .epoch,
+            rebuild_epoch
         );
     }
 

@@ -194,8 +194,11 @@ pub struct NodeInfo {
     pub genesis_hash: BlockHash,
     pub policy_asset: AssetId,
     pub backend: BackendKind,
-    /// Absent while the configured backend is unavailable. The indexed tip
-    /// remains an exact canonical anchor for the evidence already stored.
+    /// Absent while the configured backend is unavailable. Except while
+    /// `sync_status` is `RescanRequired`, the indexed tip remains an exact
+    /// canonical anchor for the evidence already stored. `RescanRequired`
+    /// deliberately exposes the last indexed, now-untrusted branch tip only
+    /// for operator diagnosis; chain-derived RPCs fail closed in that state.
     pub source_tip: Option<ChainAnchor>,
     pub indexed_tip: ChainAnchor,
     pub sync_status: SyncStatus,

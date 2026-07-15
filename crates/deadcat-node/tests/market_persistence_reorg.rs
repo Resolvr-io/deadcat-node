@@ -9,7 +9,8 @@ use deadcat_contracts::recovery::{MarketCollateral, MarketRecoveryHint};
 use deadcat_contracts::rt::{RtLeg, RtSide, infer_side};
 use deadcat_node::interpreter::DeadcatInterpreter;
 use deadcat_node::store::{
-    BlockDelta, ChainTxDelta, ContractState, RecoveryHintDelta, RollbackResult, Store,
+    BlockDelta, ChainIdentity as StoreChainIdentity, ChainTxDelta, ContractState,
+    RecoveryHintDelta, RollbackResult, Store,
 };
 use deadcat_node::sync::{
     ChainInterpreter, InterpretationContext, InterpretationMode, TransactionInterpretation,
@@ -364,7 +365,16 @@ fn ab_markets_survive_restart_and_two_block_reorg_then_reapply_atomically() {
     assert_eq!(issuance.output.len(), 6);
 
     let store = Store::open(&database).expect("open store");
-    store.initialize_tip(genesis).expect("initialize tip");
+    store
+        .initialize_chain(
+            StoreChainIdentity {
+                network: LiquidNetwork::ElementsRegtest,
+                genesis_hash: genesis.hash,
+                policy_asset,
+            },
+            genesis,
+        )
+        .expect("initialize chain");
     let creation_block = interpret_block(
         &store,
         &interpreter,

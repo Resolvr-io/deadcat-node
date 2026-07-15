@@ -44,8 +44,8 @@ use deadcat_node::interpreter::{
 use deadcat_node::registration::RegistrationVerifier;
 use deadcat_node::rpc_handler::{NodeRpcHandler, RpcHandlerConfig};
 use deadcat_node::store::{
-    ChainIdentity as StoreChainIdentity, ContractParameters, ContractState, OrderBookEntry, Store,
-    StoredEvent,
+    BlockDelta, ChainIdentity as StoreChainIdentity, ContractParameters, ContractState,
+    OrderBookEntry, Store, StoreError, StoredEvent,
 };
 use deadcat_node::sync::{SyncCoordinator, SyncOutcome};
 use deadcat_rpc::{
@@ -55,8 +55,8 @@ use deadcat_rpc::{
 use deadcat_types::{
     BinaryMarketParams, BinaryMarketState, CONTRACT_PACKAGE_FORMAT_VERSION, ChainAnchor,
     ChainIdentity, ChainPosition, ContractDeclaration, ContractDescriptor, ContractId,
-    ContractPackage, ContractSyncState, DiscoveryCoverage, DiscoveryMode, LiquidNetwork,
-    MakerOrderParams, MakerOrderState, OrderDirection, OrderSide,
+    ContractPackage, ContractSyncState, LiquidNetwork, MakerOrderParams, MakerOrderState,
+    OrderDirection, OrderSide,
 };
 use elements::confidential::{Asset, AssetBlindingFactor, Nonce, Value, ValueBlindingFactor};
 use elements::hashes::Hash as _;
@@ -424,16 +424,47 @@ fn assert_live_elements_package_ingestion(
 
     let directory = tempfile::tempdir().expect("package-ingestion database directory");
     let store = Store::open(directory.path().join("deadcat.redb")).expect("open store");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("registration runtime");
+    let activation_height = creation_anchor
+        .height
+        .checked_sub(1)
+        .expect("live creation is after regtest genesis");
+    let activation = ChainAnchor {
+        height: activation_height,
+        hash: runtime
+            .block_on(source.block_hash(activation_height))
+            .expect("pre-creation activation hash"),
+    };
+    let creation_block = runtime
+        .block_on(source.block(creation_anchor.hash))
+        .expect("canonical creation block");
+    assert_eq!(creation_block.header.prev_blockhash, activation.hash);
     store
-        .bind_chain(StoreChainIdentity {
-            network: chain.network,
-            genesis_hash: chain.genesis_hash,
-            policy_asset,
+        .initialize_chain(
+            StoreChainIdentity {
+                network: chain.network,
+                genesis_hash: chain.genesis_hash,
+                policy_asset,
+            },
+            activation,
+        )
+        .expect("bind store chain and activation");
+    store
+        .apply_block(&BlockDelta {
+            anchor: creation_anchor,
+            prev_block_hash: activation.hash,
+            ordered_txids: creation_block
+                .txdata
+                .iter()
+                .map(Transaction::txid)
+                .collect(),
+            relevant_transactions: Vec::new(),
+            recovery_hints: Vec::new(),
         })
-        .expect("bind store chain");
-    store
-        .initialize_tip(creation_anchor)
-        .expect("initialize indexed tip");
+        .expect("index canonical creation block");
     let verifier = RegistrationVerifier::new(
         &source,
         &store,
@@ -441,11 +472,6 @@ fn assert_live_elements_package_ingestion(
         genesis_hash,
         policy_asset,
     );
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("registration runtime");
-
     let registered = runtime
         .block_on(verifier.verify_and_register_package(&package))
         .expect("verify live creation through the Elements backend");
@@ -1316,23 +1342,13 @@ fn node_elements_auth(auth: &Auth) -> ElementsRpcAuth {
 }
 
 fn maker_rpc_config(
-    genesis_hash: BlockHash,
-    policy_asset: AssetId,
-    baseline: ChainAnchor,
-    tip: ChainAnchor,
+    _genesis_hash: BlockHash,
+    _policy_asset: AssetId,
+    _baseline: ChainAnchor,
+    _tip: ChainAnchor,
 ) -> RpcHandlerConfig {
     RpcHandlerConfig {
-        network: LiquidNetwork::ElementsRegtest,
-        genesis_hash,
-        policy_asset,
         backend: BackendKind::ElementsRpc,
-        discovery: DiscoveryCoverage {
-            mode: DiscoveryMode::FullHintScan,
-            from: baseline,
-            scanned_through: tip,
-            target_tip: tip,
-            canonical_market_complete: true,
-        },
         registration_bearer_token: None,
         max_concurrent_registrations: 1,
         max_concurrent_broadcasts: 1,
@@ -2755,13 +2771,15 @@ async fn maker_order_lifecycle_is_accepted_by_elementsd() {
     let database_path = database_directory.path().join("deadcat.redb");
     let store = Arc::new(Store::open(&database_path).expect("open maker node store"));
     store
-        .bind_chain(StoreChainIdentity {
-            network: LiquidNetwork::ElementsRegtest,
-            genesis_hash,
-            policy_asset,
-        })
-        .expect("bind maker node chain");
-    store.initialize_tip(baseline).expect("initialize baseline");
+        .initialize_chain(
+            StoreChainIdentity {
+                network: LiquidNetwork::ElementsRegtest,
+                genesis_hash,
+                policy_asset,
+            },
+            baseline,
+        )
+        .expect("initialize maker node chain");
     let interpreter = DeadcatInterpreter::new(LiquidNetwork::ElementsRegtest, policy_asset);
     eprintln!("DEADCAT_MAKER_REGTEST_PHASE=initial_sync");
     let SyncOutcome::Ready(initial_sync) =
@@ -3360,13 +3378,15 @@ async fn multi_contract_transaction_is_accepted_and_indexed_by_elementsd() {
     let database_path = database_directory.path().join("deadcat.redb");
     let store = Arc::new(Store::open(&database_path).expect("open multi-contract store"));
     store
-        .bind_chain(StoreChainIdentity {
-            network: LiquidNetwork::ElementsRegtest,
-            genesis_hash,
-            policy_asset,
-        })
-        .expect("bind multi-contract chain");
-    store.initialize_tip(baseline).expect("initialize baseline");
+        .initialize_chain(
+            StoreChainIdentity {
+                network: LiquidNetwork::ElementsRegtest,
+                genesis_hash,
+                policy_asset,
+            },
+            baseline,
+        )
+        .expect("initialize multi-contract chain");
     let interpreter = DeadcatInterpreter::new(LiquidNetwork::ElementsRegtest, policy_asset);
     eprintln!("DEADCAT_MULTI_CONTRACT_REGTEST_PHASE=initial_sync");
     let SyncOutcome::Ready(initial_sync) =
@@ -4530,6 +4550,265 @@ async fn multi_contract_transaction_is_accepted_and_indexed_by_elementsd() {
     assert_eq!(rpc_evidence.transaction, composed);
     assert_eq!(rpc_evidence.affected_contract_ids, expected_affected);
 
+    // Push the composed block outside the two-block undo window, replace the
+    // complete three-block suffix, and exercise the explicit activation-based
+    // rebuild boundary against real Elements consensus.
+    eprintln!("DEADCAT_MULTI_CONTRACT_REGTEST_PHASE=deep_reorg_invalidation");
+    let _stale_successor_one = mine_exact(vec![]);
+    let _stale_successor_two = mine_exact(vec![]);
+    let SyncOutcome::Ready(stale_successor_sync) =
+        SyncCoordinator::new(source.as_ref(), reopened.as_ref(), &interpreter)
+            .sync_to_tip()
+            .await
+            .expect("index successors beyond undo retention")
+    else {
+        panic!("successor indexing unexpectedly required a rescan")
+    };
+    assert_eq!(stale_successor_sync.blocks_applied, 2);
+    let stale_branch_tip = source.tip().await.expect("stale branch tip");
+    let before_deep_reorg_cursor = reopened
+        .event_high_watermark()
+        .expect("cursor before deep reorg");
+    let retained_before_rebuild = [market_id, sell_base.contract_id, sell_quote.contract_id]
+        .into_iter()
+        .map(|contract_id| {
+            (
+                contract_id,
+                reopened
+                    .retained_declaration(contract_id)
+                    .expect("retained declaration lookup")
+                    .expect("package declaration retained"),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let invalidated: JsonValue = rpc
+        .call("invalidateblock", &[json!(final_block_hash_string.clone())])
+        .expect("invalidate composed block beyond undo retention");
+    assert!(invalidated.is_null());
+    let deep_empty_hash_string = mine_exact(vec![]);
+    let deep_composed_hash_string = mine_exact(vec![composed.txid().to_string()]);
+    let _deep_successor_hash_string = mine_exact(vec![]);
+    let deep_composed_hash =
+        BlockHash::from_str(&deep_composed_hash_string).expect("deep replacement block hash");
+    assert_ne!(deep_empty_hash_string, final_block_hash_string);
+    assert_ne!(deep_composed_hash_string, final_block_hash_string);
+    let deep_source_tip = source.tip().await.expect("deep replacement tip");
+    assert_eq!(deep_source_tip.height, stale_branch_tip.height);
+
+    let SyncOutcome::RescanRequired {
+        indexed_tip,
+        source_tip,
+    } = SyncCoordinator::new(source.as_ref(), reopened.as_ref(), &interpreter)
+        .sync_to_tip()
+        .await
+        .expect("detect real three-block fork")
+    else {
+        panic!("three-block fork did not enter RescanRequired")
+    };
+    assert_eq!(indexed_tip, stale_branch_tip);
+    assert_eq!(source_tip, deep_source_tip);
+    assert_eq!(
+        reopened.sync_status().expect("invalidated status"),
+        deadcat_rpc::SyncStatus::RescanRequired
+    );
+    let invalidated_cursor = reopened
+        .event_high_watermark()
+        .expect("invalidated event cursor");
+    assert_ne!(invalidated_cursor.epoch, before_deep_reorg_cursor.epoch);
+    assert_eq!(invalidated_cursor.sequence, 1);
+    assert_eq!(stored_market_state(&reopened, market_id), post_market_state);
+    assert_eq!(
+        stored_maker_state(&reopened, sell_base.contract_id),
+        post_sell_base_state
+    );
+    assert_eq!(
+        stored_maker_state(&reopened, sell_quote.contract_id),
+        MakerOrderState::Consumed
+    );
+    assert!(matches!(
+        reopened.events_after(Some(before_deep_reorg_cursor), 1),
+        Err(StoreError::StaleCursor { .. })
+    ));
+
+    let stale_read = reopened_handler
+        .handle(
+            [0x91; 32],
+            Request::GetContract {
+                contract_id: market_id,
+            },
+        )
+        .await
+        .expect_err("known-stale RPC state must fail closed");
+    assert_eq!(stale_read.code, RpcErrorCode::RescanRequired);
+    let Response::Info { info } = reopened_handler
+        .handle([0x91; 32], Request::GetInfo)
+        .await
+        .expect("GetInfo during invalidation")
+    else {
+        panic!("unexpected invalidated GetInfo response")
+    };
+    assert_eq!(info.sync_status, deadcat_rpc::SyncStatus::RescanRequired);
+    assert_eq!(info.indexed_tip, stale_branch_tip);
+    assert!(!info.discovery.canonical_market_complete);
+    drop(reopened_handler);
+    drop(reopened);
+
+    // Reopen before reset, atomically clear to the persisted activation
+    // checkpoint, then reopen again before replay. This simulates both sides
+    // of an operator process interruption without relying on in-memory state.
+    eprintln!("DEADCAT_MULTI_CONTRACT_REGTEST_PHASE=deep_rebuild_reset");
+    let invalidated_store = Store::open(&database_path).expect("reopen invalidated store");
+    assert_eq!(
+        invalidated_store
+            .sync_status()
+            .expect("reopened invalidated status"),
+        deadcat_rpc::SyncStatus::RescanRequired
+    );
+    for (contract_id, declaration) in &retained_before_rebuild {
+        assert_eq!(
+            invalidated_store
+                .retained_declaration(*contract_id)
+                .expect("reopened retained declaration"),
+            Some(*declaration)
+        );
+    }
+    let reset_cursor = invalidated_store
+        .reset_for_rebuild()
+        .expect("explicit activation reset");
+    assert_eq!(reset_cursor.epoch, invalidated_cursor.epoch);
+    assert_eq!(invalidated_store.tip().expect("reset tip"), Some(baseline));
+    assert_eq!(
+        invalidated_store.sync_status().expect("reset status"),
+        deadcat_rpc::SyncStatus::Syncing
+    );
+    for (contract_id, declaration) in &retained_before_rebuild {
+        assert!(
+            invalidated_store
+                .contract(*contract_id)
+                .expect("cleared contract lookup")
+                .is_none()
+        );
+        assert_eq!(
+            invalidated_store
+                .retained_declaration(*contract_id)
+                .expect("retained declaration after reset"),
+            Some(*declaration)
+        );
+    }
+    drop(invalidated_store);
+
+    eprintln!("DEADCAT_MULTI_CONTRACT_REGTEST_PHASE=deep_rebuild_replay");
+    let rebuilt = Arc::new(Store::open(&database_path).expect("reopen reset store"));
+    let SyncOutcome::Ready(deep_rebuild) =
+        SyncCoordinator::new(source.as_ref(), rebuilt.as_ref(), &interpreter)
+            .rebuild_to_tip()
+            .await
+            .expect("resume explicit rebuild after reopen")
+    else {
+        panic!("replacement branch changed deeply during rebuild")
+    };
+    assert!(deep_rebuild.blocks_applied > 0);
+    assert_eq!(deep_rebuild.indexed_tip, deep_source_tip);
+    assert_eq!(
+        rebuilt.sync_status().expect("rebuilt status"),
+        deadcat_rpc::SyncStatus::Ready
+    );
+    assert_eq!(
+        rebuilt
+            .event_high_watermark()
+            .expect("rebuilt cursor")
+            .epoch,
+        invalidated_cursor.epoch
+    );
+    assert_eq!(stored_market_state(&rebuilt, market_id), post_market_state);
+    assert_eq!(
+        stored_maker_state(&rebuilt, sell_base.contract_id),
+        post_sell_base_state
+    );
+    assert_eq!(
+        stored_maker_state(&rebuilt, sell_quote.contract_id),
+        MakerOrderState::Consumed
+    );
+    assert_eq!(
+        ready_order_rows(&rebuilt, market_id),
+        expected_post_order_book
+    );
+    for (contract_id, declaration) in &retained_before_rebuild {
+        assert_eq!(
+            rebuilt
+                .retained_declaration(*contract_id)
+                .expect("retained declaration after replay"),
+            Some(*declaration)
+        );
+    }
+
+    let deep_market_history = rebuilt
+        .contract_history(market_id)
+        .expect("deep rebuilt market history");
+    let deep_position = deep_market_history
+        .iter()
+        .find(|entry| entry.txid == composed.txid())
+        .expect("deep rebuilt composed market transition")
+        .position;
+    assert_eq!(deep_position.block_height, final_position.block_height + 1);
+    assert_eq!(
+        rebuilt
+            .contract_history(sell_base.contract_id)
+            .expect("deep rebuilt SellBase history")[0]
+            .position,
+        deep_position
+    );
+    assert_eq!(
+        rebuilt
+            .contract_history(sell_quote.contract_id)
+            .expect("deep rebuilt SellQuote history")[0]
+            .position,
+        deep_position
+    );
+    let deep_evidence = rebuilt
+        .transaction(deep_position)
+        .expect("deep rebuilt evidence lookup")
+        .expect("deep rebuilt shared evidence");
+    assert_eq!(deep_evidence.block_hash, deep_composed_hash);
+    assert_eq!(deep_evidence.txid, composed.txid());
+    assert_eq!(deep_evidence.raw_tx, elements::encode::serialize(&composed));
+    assert_eq!(deep_evidence.affected_contract_ids, expected_affected);
+    assert!(matches!(
+        rebuilt.events_after(Some(before_deep_reorg_cursor), 1),
+        Err(StoreError::StaleCursor { .. })
+    ));
+
+    let deep_handler = NodeRpcHandler::new(
+        Arc::clone(&source),
+        Arc::clone(&rebuilt),
+        maker_rpc_config(genesis_hash, policy_asset, baseline, deep_source_tip),
+    )
+    .expect("deep rebuilt RPC handler");
+    let (deep_parent_view, deep_parent_history) =
+        assert_rpc_contract_replay(&deep_handler, source.as_ref(), market_id, None).await;
+    assert_eq!(deep_parent_history.entries.len(), 2);
+    for (order, expected_state) in [
+        (&sell_base, post_sell_base_state),
+        (&sell_quote, MakerOrderState::Consumed),
+    ] {
+        let (view, history) = assert_rpc_contract_replay(
+            &deep_handler,
+            source.as_ref(),
+            order.contract_id,
+            Some(&deep_parent_view),
+        )
+        .await;
+        assert_eq!(
+            view.state,
+            ContractStateView::MakerOrder {
+                state: expected_state
+            }
+        );
+        assert_eq!(history.entries.len(), 1);
+        assert_eq!(history.entries[0].position, deep_position);
+    }
+
     let report = json!({
         "schema": "deadcat.multi-contract-regtest.v1",
         "market_id": market_id.to_string(),
@@ -4544,6 +4823,8 @@ async fn multi_contract_transaction_is_accepted_and_indexed_by_elementsd() {
         "moved_block_hash": moved_block_hash_string,
         "final_position": final_position,
         "final_block_hash": final_block_hash_string,
+        "deep_rebuild_position": deep_position,
+        "deep_rebuild_block_hash": deep_composed_hash_string,
         "negative_test": wrong_sell_quote_rejection,
     });
     eprintln!(

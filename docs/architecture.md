@@ -153,7 +153,8 @@ The hosted production service should use its own Elements Core backend. Esplora
 is the low-operations option for ordinary self-hosting and development.
 
 Full public market recovery is a separate backend capability. With archival
-Elements Core, the node scans complete blocks from the v1 activation anchor,
+Elements Core, the node scans complete blocks strictly after the exclusive v1
+activation anchor,
 parses market hints, derives issuance assets, recompiles the market, verifies
 the dormant RT outputs, and follows the resulting lineage. Esplora can provide
 the same result only when raw historical blocks are available; standard Esplora
@@ -164,8 +165,8 @@ has no query for all OP_RETURNs matching a prefix, so a global scan is expensive
 Nostr events and manual RPC calls carry untrusted `ContractPackage` values.
 Registration performs:
 
-1. package format, bounds, exact network/genesis, roots, and dependency-graph
-   validation;
+1. package format, bounds, exact network/genesis, activation-height boundary,
+   roots, and dependency-graph validation;
 2. confirmed raw creation-transaction retrieval from the node's own chain
    source, with each shared transaction fetched at most once;
 3. parent-market verification before child contracts, independent of supplied
@@ -192,10 +193,13 @@ atomic or chain-verifiable registration boundary.
 
 Normalized declarations form a non-chain-derived watch registry. Materialized
 records and their live outpoints are still discarded on a destructive rebuild;
-the registry survives so a genesis replay can verify retained markets before
-their retained maker children against the exact replacement-branch
-transactions. A declaration that is absent or invalid on that branch remains
-dormant and cannot prevent unrelated canonical synchronization.
+the registry survives so replay from the persisted immutable v1 activation
+checkpoint can verify retained markets before their retained maker children
+against the exact replacement-branch transactions. Registration rejects
+creation at or before that checkpoint, so the replay boundary cannot omit a
+supported v1 contract. A declaration that is absent or invalid on the
+replacement branch remains dormant and cannot prevent unrelated canonical
+synchronization.
 
 For a binary market, step 5 is a critical solvency check. The node and client
 independently require each uniquely derived issuance to have a null initial

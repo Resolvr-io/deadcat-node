@@ -60,6 +60,7 @@ const EVENT_EPOCH_KEY: &str = "event_epoch";
 const EVENT_SEQUENCE_KEY: &str = "event_sequence";
 const SYNC_STATUS_KEY: &str = "sync_status";
 const CHAIN_IDENTITY_KEY: &str = "chain_identity";
+const ACTIVATION_ANCHOR_KEY: &str = "v1_activation_anchor";
 const TIP_KEY: &str = "tip";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,6 +401,17 @@ pub struct StoreSnapshotMetadata {
     pub event_high_watermark: EventCursor,
 }
 
+/// One atomic view of the persisted metadata used by status and subscription
+/// RPCs. Reading these fields together prevents reporting combinations that
+/// never existed across rollback or rebuild-epoch commits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoreStatusSnapshot {
+    pub indexed_tip: ChainAnchor,
+    pub activation_anchor: ChainAnchor,
+    pub sync_status: SyncStatus,
+    pub event_high_watermark: EventCursor,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoreSnapshotCursor {
     pub as_of: ChainAnchor,
@@ -549,7 +561,8 @@ impl Store {
         decode_u32(value.value()).map_err(|_| StoreError::CorruptSchemaVersion)
     }
 
-    pub fn bind_chain(&self, identity: ChainIdentity) -> Result<(), StoreError> {
+    #[cfg(test)]
+    fn bind_chain(&self, identity: ChainIdentity) -> Result<(), StoreError> {
         let write = self.database.begin_write()?;
         {
             let mut meta = write.open_table(META)?;
@@ -580,7 +593,67 @@ impl Store {
         self.read_meta_record(CHAIN_IDENTITY_KEY)
     }
 
-    pub fn initialize_tip(&self, anchor: ChainAnchor) -> Result<(), StoreError> {
+    /// Atomically bind a fresh database to one chain and immutable v1
+    /// activation checkpoint, or verify an existing binding exactly.
+    pub fn initialize_chain(
+        &self,
+        identity: ChainIdentity,
+        activation_anchor: ChainAnchor,
+    ) -> Result<(), StoreError> {
+        let write = self.database.begin_write()?;
+        let existing_identity =
+            read_meta_record_from_write::<ChainIdentity>(&write, CHAIN_IDENTITY_KEY)?;
+        let existing_activation =
+            read_meta_record_from_write::<ChainAnchor>(&write, ACTIVATION_ANCHOR_KEY)?;
+        let existing_tip = tip_from_write(&write)?;
+
+        match (existing_identity, existing_activation, existing_tip) {
+            (None, None, None) => {
+                write_meta_record(&write, CHAIN_IDENTITY_KEY, &identity)?;
+                write_meta_record(&write, ACTIVATION_ANCHOR_KEY, &activation_anchor)?;
+                write_tip(&write, activation_anchor)?;
+            }
+            (Some(actual_identity), Some(actual_activation), Some(tip)) => {
+                if actual_identity != identity {
+                    return Err(StoreError::ChainIdentityMismatch {
+                        expected: Box::new(actual_identity),
+                        actual: Box::new(identity),
+                    });
+                }
+                if actual_activation != activation_anchor {
+                    return Err(StoreError::ActivationAnchorMismatch {
+                        expected: actual_activation,
+                        actual: activation_anchor,
+                    });
+                }
+                if tip.height < activation_anchor.height {
+                    return Err(StoreError::TipBeforeActivation {
+                        tip,
+                        activation: activation_anchor,
+                    });
+                }
+                let canonical = canonical_anchor_from_write(&write, activation_anchor.height)?;
+                if canonical != Some(activation_anchor) {
+                    return Err(StoreError::ActivationAnchorNotCanonical {
+                        expected: activation_anchor,
+                        actual: canonical,
+                    });
+                }
+            }
+            _ => return Err(StoreError::IncompleteChainConfiguration),
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    pub fn activation_anchor(&self) -> Result<Option<ChainAnchor>, StoreError> {
+        self.read_meta_record(ACTIVATION_ANCHOR_KEY)
+    }
+
+    /// Low-level fixture initializer. Production code must atomically bind
+    /// chain identity, activation, and tip through `initialize_chain`.
+    #[cfg(test)]
+    pub(crate) fn initialize_tip(&self, anchor: ChainAnchor) -> Result<(), StoreError> {
         let write = self.database.begin_write()?;
         {
             let mut tips = write.open_table(CHAIN_TIP)?;
@@ -623,6 +696,15 @@ impl Store {
         let write = self.database.begin_write()?;
         let current = read_meta_record_from_write::<SyncStatus>(&write, SYNC_STATUS_KEY)?
             .ok_or(StoreError::MissingMetadata(SYNC_STATUS_KEY))?;
+        if status == SyncStatus::RescanRequired {
+            mark_rebuild_required(&write)?;
+            let cursor = high_watermark_from_write(&write)?;
+            write.commit()?;
+            return Ok(cursor);
+        }
+        if current == SyncStatus::RescanRequired {
+            return Err(StoreError::RebuildRequired);
+        }
         if current != status {
             write_meta_record(&write, SYNC_STATUS_KEY, &status)?;
             append_event(&write, StoredEvent::SyncStatusChanged { status })?;
@@ -638,29 +720,32 @@ impl Store {
         event_cursor_from_meta(&meta)
     }
 
+    pub fn status_snapshot(&self) -> Result<StoreStatusSnapshot, StoreError> {
+        let read = self.database.begin_read()?;
+        status_snapshot_from_read(&read)
+    }
+
+    /// Atomically capture the subscription boundary and validate a supplied
+    /// cursor against that exact epoch/high-watermark snapshot.
+    pub fn subscription_snapshot(
+        &self,
+        after: Option<EventCursor>,
+    ) -> Result<StoreStatusSnapshot, StoreError> {
+        let read = self.database.begin_read()?;
+        let snapshot = status_snapshot_from_read(&read)?;
+        validate_event_cursor(after, snapshot.event_high_watermark)?;
+        Ok(snapshot)
+    }
+
     pub fn events_after(
         &self,
         after: Option<EventCursor>,
         limit: usize,
     ) -> Result<Vec<StoredEventEnvelope>, StoreError> {
-        let high = self.event_high_watermark()?;
-        let after_sequence = match after {
-            Some(cursor) if cursor.epoch != high.epoch => {
-                return Err(StoreError::StaleCursor {
-                    expected_epoch: high.epoch,
-                    actual_epoch: cursor.epoch,
-                });
-            }
-            Some(cursor) if cursor.sequence > high.sequence => {
-                return Err(StoreError::CursorAhead {
-                    requested: cursor.sequence,
-                    high_watermark: high.sequence,
-                });
-            }
-            Some(cursor) => cursor.sequence,
-            None => 0,
-        };
         let read = self.database.begin_read()?;
+        let meta = read.open_table(META)?;
+        let high = event_cursor_from_meta(&meta)?;
+        let after_sequence = validate_event_cursor(after, high)?;
         let table = read.open_table(EVENTS)?;
         let mut events = Vec::new();
         for entry in table.iter()? {
@@ -1161,6 +1246,19 @@ impl Store {
             == Some(SyncStatus::RescanRequired)
         {
             return Err(StoreError::RebuildRequired);
+        }
+        let activation = read_meta_record_from_write::<ChainAnchor>(&write, ACTIVATION_ANCHOR_KEY)?;
+        // Some low-level unit fixtures intentionally use the test-only tip
+        // initializer. No non-test build can create such a store.
+        if activation.is_none() && !cfg!(test) {
+            return Err(StoreError::ActivationNotInitialized);
+        }
+        if let Some(activation) = activation
+            && registrations
+                .iter()
+                .any(|(record, _)| record.creation_position.block_height <= activation.height)
+        {
+            return Err(StoreError::PreActivationContract { activation });
         }
         for declaration in &retained_declarations {
             if let Some(existing) = read_fixed_from_write::<ContractDeclaration, 36>(
@@ -1790,6 +1888,11 @@ impl Store {
 
     pub fn rollback_to(&self, ancestor: ChainAnchor) -> Result<RollbackResult, StoreError> {
         let write = self.database.begin_write()?;
+        if read_meta_record_from_write::<SyncStatus>(&write, SYNC_STATUS_KEY)?
+            == Some(SyncStatus::RescanRequired)
+        {
+            return Err(StoreError::RebuildRequired);
+        }
         let old_tip = tip_from_write(&write)?.ok_or(StoreError::TipNotInitialized)?;
         if ancestor == old_tip {
             drop(write);
@@ -1900,36 +2003,19 @@ impl Store {
         Ok(epoch)
     }
 
-    /// Explicitly discard chain-derived materialized state before replaying.
-    /// When explicit declarations are retained, v1 requires an exact genesis
-    /// baseline because it has no authenticated post-genesis state checkpoint
-    /// from which pre-baseline contracts could be reconstructed safely.
-    pub fn reset_for_rebuild(&self, baseline: ChainAnchor) -> Result<EventCursor, StoreError> {
+    /// Explicitly discard chain-derived materialized state before replaying
+    /// from the immutable v1 activation checkpoint. Registration rejects every
+    /// pre-activation declaration, so retained watch intent is complete from
+    /// this checkpoint without a genesis rescan.
+    pub fn reset_for_rebuild(&self) -> Result<EventCursor, StoreError> {
         let write = self.database.begin_write()?;
         if read_meta_record_from_write::<SyncStatus>(&write, SYNC_STATUS_KEY)?
             != Some(SyncStatus::RescanRequired)
         {
             return Err(StoreError::RebuildNotRequired);
         }
-        let has_retained_declarations = {
-            let table = write.open_table(RETAINED_DECLARATIONS)?;
-            table.iter()?.next().transpose()?.is_some()
-        };
-        if has_retained_declarations {
-            let identity =
-                read_meta_record_from_write::<ChainIdentity>(&write, CHAIN_IDENTITY_KEY)?
-                    .ok_or(StoreError::MissingMetadata(CHAIN_IDENTITY_KEY))?;
-            let expected = ChainAnchor {
-                height: 0,
-                hash: identity.genesis_hash,
-            };
-            if baseline != expected {
-                return Err(StoreError::RetainedDeclarationsRequireGenesis {
-                    expected,
-                    requested: baseline,
-                });
-            }
-        }
+        let baseline = read_meta_record_from_write::<ChainAnchor>(&write, ACTIVATION_ANCHOR_KEY)?
+            .ok_or(StoreError::MissingMetadata(ACTIVATION_ANCHOR_KEY))?;
         clear_chain_tables(&write)?;
         write_tip(&write, baseline)?;
         write_meta_record(&write, SYNC_STATUS_KEY, &SyncStatus::Syncing)?;
@@ -3107,6 +3193,11 @@ fn undo_range_available(
 }
 
 fn mark_rebuild_required(write: &WriteTransaction) -> Result<[u8; 16], StoreError> {
+    if read_meta_record_from_write::<SyncStatus>(write, SYNC_STATUS_KEY)?
+        == Some(SyncStatus::RescanRequired)
+    {
+        return Ok(high_watermark_from_write(write)?.epoch);
+    }
     let epoch = random_epoch();
     {
         let mut meta = write.open_table(META)?;
@@ -3225,6 +3316,47 @@ fn snapshot_from_read(read: &ReadTransaction) -> Result<StoreSnapshotMetadata, S
         as_of,
         event_high_watermark: event_cursor_from_meta(&meta)?,
     })
+}
+
+fn status_snapshot_from_read(read: &ReadTransaction) -> Result<StoreStatusSnapshot, StoreError> {
+    let tips = read.open_table(CHAIN_TIP)?;
+    let indexed_tip = tips
+        .get(TIP_KEY)?
+        .map(|value| decode_record(value.value()))
+        .transpose()?
+        .ok_or(StoreError::TipNotInitialized)?;
+    let meta = read.open_table(META)?;
+    let activation_anchor = meta
+        .get(ACTIVATION_ANCHOR_KEY)?
+        .map(|value| decode_record(value.value()))
+        .transpose()?
+        .ok_or(StoreError::MissingMetadata(ACTIVATION_ANCHOR_KEY))?;
+    let sync_status = meta
+        .get(SYNC_STATUS_KEY)?
+        .map(|value| decode_record(value.value()))
+        .transpose()?
+        .ok_or(StoreError::MissingMetadata(SYNC_STATUS_KEY))?;
+    Ok(StoreStatusSnapshot {
+        indexed_tip,
+        activation_anchor,
+        sync_status,
+        event_high_watermark: event_cursor_from_meta(&meta)?,
+    })
+}
+
+fn validate_event_cursor(after: Option<EventCursor>, high: EventCursor) -> Result<u64, StoreError> {
+    match after {
+        Some(cursor) if cursor.epoch != high.epoch => Err(StoreError::StaleCursor {
+            expected_epoch: high.epoch,
+            actual_epoch: cursor.epoch,
+        }),
+        Some(cursor) if cursor.sequence > high.sequence => Err(StoreError::CursorAhead {
+            requested: cursor.sequence,
+            high_watermark: high.sequence,
+        }),
+        Some(cursor) => Ok(cursor.sequence),
+        None => Ok(0),
+    }
 }
 
 fn validate_query_limit(limit: usize) -> Result<(), StoreError> {
@@ -3586,6 +3718,25 @@ pub enum StoreError {
         expected: Box<ChainIdentity>,
         actual: Box<ChainIdentity>,
     },
+    #[error("activation anchor mismatch: database has {expected:?}, requested {actual:?}")]
+    ActivationAnchorMismatch {
+        expected: ChainAnchor,
+        actual: ChainAnchor,
+    },
+    #[error("v1 activation checkpoint is not initialized")]
+    ActivationNotInitialized,
+    #[error("database has only part of its chain identity, activation anchor, and tip")]
+    IncompleteChainConfiguration,
+    #[error("indexed tip {tip:?} is before activation checkpoint {activation:?}")]
+    TipBeforeActivation {
+        tip: ChainAnchor,
+        activation: ChainAnchor,
+    },
+    #[error("activation checkpoint {expected:?} is not canonical in the database: {actual:?}")]
+    ActivationAnchorNotCanonical {
+        expected: ChainAnchor,
+        actual: Option<ChainAnchor>,
+    },
     #[error("chain tip is not initialized")]
     TipNotInitialized,
     #[error("chain tip already initialized to {current:?}, not {requested:?}")]
@@ -3685,11 +3836,8 @@ pub enum StoreError {
     RebuildRequired,
     #[error("cannot reset canonical state when a rebuild is not required")]
     RebuildNotRequired,
-    #[error("retained declarations require a genesis rebuild from {expected:?}, not {requested:?}")]
-    RetainedDeclarationsRequireGenesis {
-        expected: ChainAnchor,
-        requested: ChainAnchor,
-    },
+    #[error("contract creation is not after v1 activation checkpoint {activation:?}")]
+    PreActivationContract { activation: ChainAnchor },
     #[error("invalid rollback target {ancestor:?} from {old_tip:?}")]
     InvalidRollbackTarget {
         old_tip: ChainAnchor,
@@ -4304,34 +4452,80 @@ mod tests {
     }
 
     #[test]
-    fn destructive_rebuild_retains_watch_intent_and_requires_genesis() {
-        let (directory, path, store) = initialized_store();
+    fn destructive_rebuild_retains_watch_intent_from_activation() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("deadcat.redb");
+        let store = Store::open(&path).expect("open store");
         let identity = ChainIdentity {
             network: LiquidNetwork::ElementsRegtest,
             genesis_hash: anchor(0).hash,
             policy_asset: asset(0xaa),
         };
-        store.bind_chain(identity).expect("bind chain");
+        store
+            .initialize_chain(identity, anchor(0))
+            .expect("initialize chain");
+        let pre_activation_creation = transaction(8_019, &[], 1);
+        let mut pre_activation_market = market_record(
+            0x66,
+            ChainPosition {
+                block_height: 0,
+                tx_index: 0,
+            },
+            pre_activation_creation.txid(),
+            0,
+            0,
+            anchor(0),
+        );
+        pre_activation_market.sync_state = ContractSyncState::CatchingUp {
+            synced_through: anchor(0),
+        };
+        assert!(matches!(
+            store.register_contract(
+                &pre_activation_market,
+                &RegistrationEvidence {
+                    anchor: anchor(0),
+                    transaction: Arc::new(pre_activation_creation),
+                    associated_hint: None,
+                },
+            ),
+            Err(StoreError::PreActivationContract { activation })
+                if activation == anchor(0)
+        ));
+        assert!(
+            store
+                .retained_declaration(pre_activation_market.contract_id)
+                .expect("pre-activation declaration")
+                .is_none()
+        );
         let creation = transaction(8_020, &[], 1);
+        store
+            .apply_block(&BlockDelta {
+                anchor: anchor(1),
+                prev_block_hash: anchor(0).hash,
+                ordered_txids: vec![creation.txid()],
+                relevant_transactions: Vec::new(),
+                recovery_hints: Vec::new(),
+            })
+            .expect("index creation block");
         let mut market = market_record(
             0x67,
             ChainPosition {
-                block_height: 0,
+                block_height: 1,
                 tx_index: 0,
             },
             creation.txid(),
             0,
             0,
-            anchor(0),
+            anchor(1),
         );
         market.sync_state = ContractSyncState::CatchingUp {
-            synced_through: anchor(0),
+            synced_through: anchor(1),
         };
         store
             .register_contract(
                 &market,
                 &RegistrationEvidence {
-                    anchor: anchor(0),
+                    anchor: anchor(1),
                     transaction: Arc::new(creation),
                     associated_hint: None,
                 },
@@ -4340,21 +4534,13 @@ mod tests {
         let declaration = declaration_from_record(&market).expect("declaration");
 
         store.invalidate_for_rebuild().expect("invalidate");
-        assert!(matches!(
-            store.reset_for_rebuild(anchor(1)),
-            Err(StoreError::RetainedDeclarationsRequireGenesis {
-                expected,
-                requested,
-            }) if expected == anchor(0) && requested == anchor(1)
-        ));
         assert_eq!(
-            store.sync_status().expect("status after rejected reset"),
+            store.sync_status().expect("status before reset"),
             SyncStatus::RescanRequired
         );
 
-        store
-            .reset_for_rebuild(anchor(0))
-            .expect("genesis rebuild reset");
+        store.reset_for_rebuild().expect("activation rebuild reset");
+        assert_eq!(store.tip().expect("activation tip"), Some(anchor(0)));
         assert!(
             store
                 .contract(market.contract_id)
@@ -4378,6 +4564,125 @@ mod tests {
         );
         drop(reopened);
         drop(directory);
+    }
+
+    #[test]
+    fn nonzero_activation_rejects_lower_equal_and_mixed_registrations_atomically() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(directory.path().join("deadcat.redb")).expect("open store");
+        store
+            .initialize_chain(
+                ChainIdentity {
+                    network: LiquidNetwork::ElementsRegtest,
+                    genesis_hash: anchor(0).hash,
+                    policy_asset: asset(0xaa),
+                },
+                anchor(2),
+            )
+            .expect("initialize nonzero activation");
+
+        let lower_tx = transaction(8_101, &[], 1);
+        let mut lower = market_record(
+            0x71,
+            ChainPosition {
+                block_height: 1,
+                tx_index: 0,
+            },
+            lower_tx.txid(),
+            0,
+            0,
+            anchor(1),
+        );
+        lower.sync_state = ContractSyncState::CatchingUp {
+            synced_through: anchor(1),
+        };
+        assert!(matches!(
+            store.register_contract(
+                &lower,
+                &RegistrationEvidence {
+                    anchor: anchor(1),
+                    transaction: Arc::new(lower_tx),
+                    associated_hint: None,
+                },
+            ),
+            Err(StoreError::PreActivationContract { activation }) if activation == anchor(2)
+        ));
+
+        let equal_tx = transaction(8_102, &[], 1);
+        let mut equal = market_record(
+            0x72,
+            ChainPosition {
+                block_height: 2,
+                tx_index: 0,
+            },
+            equal_tx.txid(),
+            0,
+            0,
+            anchor(2),
+        );
+        equal.sync_state = ContractSyncState::CatchingUp {
+            synced_through: anchor(2),
+        };
+        let valid_tx = transaction(8_103, &[], 1);
+        store
+            .apply_block(&BlockDelta {
+                anchor: anchor(3),
+                prev_block_hash: anchor(2).hash,
+                ordered_txids: vec![valid_tx.txid()],
+                relevant_transactions: Vec::new(),
+                recovery_hints: Vec::new(),
+            })
+            .expect("index first post-activation block");
+        let mut valid = market_record(
+            0x73,
+            ChainPosition {
+                block_height: 3,
+                tx_index: 0,
+            },
+            valid_tx.txid(),
+            0,
+            0,
+            anchor(3),
+        );
+        valid.sync_state = ContractSyncState::CatchingUp {
+            synced_through: anchor(3),
+        };
+        let equal_evidence = RegistrationEvidence {
+            anchor: anchor(2),
+            transaction: Arc::new(equal_tx),
+            associated_hint: None,
+        };
+        let valid_evidence = RegistrationEvidence {
+            anchor: anchor(3),
+            transaction: Arc::new(valid_tx),
+            associated_hint: None,
+        };
+        assert!(matches!(
+            store.register_contracts(&[
+                (valid.clone(), valid_evidence.clone()),
+                (equal.clone(), equal_evidence),
+            ]),
+            Err(StoreError::PreActivationContract { activation }) if activation == anchor(2)
+        ));
+        for contract_id in [equal.contract_id, valid.contract_id] {
+            assert!(
+                store
+                    .contract(contract_id)
+                    .expect("contract lookup")
+                    .is_none()
+            );
+            assert!(
+                store
+                    .retained_declaration(contract_id)
+                    .expect("declaration lookup")
+                    .is_none()
+            );
+        }
+        assert!(
+            store
+                .register_contract(&valid, &valid_evidence)
+                .expect("post-activation registration")
+        );
     }
 
     #[test]
@@ -5225,7 +5530,18 @@ mod tests {
 
     #[test]
     fn deeper_rollback_requires_rebuild_and_invalidates_old_cursors() {
-        let (_dir, _path, store) = initialized_store();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("deadcat.redb")).expect("open store");
+        store
+            .initialize_chain(
+                ChainIdentity {
+                    network: LiquidNetwork::ElementsRegtest,
+                    genesis_hash: anchor(0).hash,
+                    policy_asset: asset(0xaa),
+                },
+                anchor(0),
+            )
+            .expect("initialize chain");
         for height in 1..=3 {
             store
                 .apply_block(&empty_block(height))
@@ -5245,6 +5561,40 @@ mod tests {
             store.sync_status().expect("status"),
             SyncStatus::RescanRequired
         );
+        let invalidated_cursor = store.event_high_watermark().expect("invalidated cursor");
+        assert!(matches!(
+            store.rollback_to(anchor(2)),
+            Err(StoreError::RebuildRequired)
+        ));
+        assert_eq!(store.tip().expect("sticky rollback tip"), Some(anchor(3)));
+        assert_eq!(
+            store
+                .event_high_watermark()
+                .expect("sticky rollback cursor"),
+            invalidated_cursor
+        );
+        for attempted in [
+            SyncStatus::BackendUnavailable,
+            SyncStatus::Syncing,
+            SyncStatus::Ready,
+        ] {
+            assert!(matches!(
+                store.set_sync_status(attempted),
+                Err(StoreError::RebuildRequired)
+            ));
+            assert_eq!(
+                store.sync_status().expect("sticky status"),
+                SyncStatus::RescanRequired
+            );
+        }
+        assert_eq!(
+            store.invalidate_for_rebuild().expect("repeat invalidation"),
+            new_event_epoch
+        );
+        assert_eq!(
+            store.event_high_watermark().expect("stable cursor"),
+            invalidated_cursor
+        );
         assert!(matches!(
             store.events_after(Some(old_cursor), 10),
             Err(StoreError::StaleCursor { .. })
@@ -5263,7 +5613,7 @@ mod tests {
             Err(StoreError::CursorAhead { .. })
         ));
 
-        let reset_cursor = store.reset_for_rebuild(anchor(0)).expect("explicit reset");
+        let reset_cursor = store.reset_for_rebuild().expect("explicit reset");
         assert_eq!(reset_cursor.epoch, new_event_epoch);
         assert_eq!(reset_cursor.sequence, 2);
         assert_eq!(store.tip().expect("baseline tip"), Some(anchor(0)));
@@ -5272,6 +5622,27 @@ mod tests {
         store
             .apply_block(&empty_block(1))
             .expect("replay after explicit reset");
+    }
+
+    #[test]
+    fn generic_rescan_status_transition_rotates_the_epoch_exactly_once() {
+        let (_dir, _path, store) = initialized_store();
+        let before = store.event_high_watermark().expect("initial cursor");
+        let invalidated = store
+            .set_sync_status(SyncStatus::RescanRequired)
+            .expect("enter rescan through generic status API");
+        assert_ne!(invalidated.epoch, before.epoch);
+        assert_eq!(invalidated.sequence, 1);
+        assert_eq!(
+            store.sync_status().expect("rescan status"),
+            SyncStatus::RescanRequired
+        );
+        assert_eq!(
+            store
+                .set_sync_status(SyncStatus::RescanRequired)
+                .expect("repeat rescan"),
+            invalidated
+        );
     }
 
     #[test]
@@ -5296,6 +5667,51 @@ mod tests {
                 expected: SCHEMA_VERSION,
                 actual,
             }) if actual == SCHEMA_VERSION + 1
+        ));
+    }
+
+    #[test]
+    fn chain_activation_and_tip_are_bound_atomically_and_exactly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("deadcat.redb");
+        let store = Store::open(&path).expect("open");
+        let identity = ChainIdentity {
+            network: LiquidNetwork::ElementsRegtest,
+            genesis_hash: anchor(0).hash,
+            policy_asset: asset(0xaa),
+        };
+        store
+            .initialize_chain(identity, anchor(0))
+            .expect("initialize exact binding");
+        assert_eq!(store.chain_identity().expect("identity"), Some(identity));
+        assert_eq!(
+            store.activation_anchor().expect("activation"),
+            Some(anchor(0))
+        );
+        assert_eq!(store.tip().expect("tip"), Some(anchor(0)));
+        store
+            .initialize_chain(identity, anchor(0))
+            .expect("idempotent binding");
+        assert!(matches!(
+            store.initialize_chain(identity, anchor(1)),
+            Err(StoreError::ActivationAnchorMismatch { expected, actual })
+                if expected == anchor(0) && actual == anchor(1)
+        ));
+        drop(store);
+
+        let reopened = Store::open(&path).expect("reopen");
+        reopened
+            .initialize_chain(identity, anchor(0))
+            .expect("verify reopened binding");
+
+        let partial_dir = tempfile::tempdir().expect("partial tempdir");
+        let partial = Store::open(partial_dir.path().join("deadcat.redb")).expect("partial store");
+        partial
+            .bind_chain(identity)
+            .expect("write partial identity");
+        assert!(matches!(
+            partial.initialize_chain(identity, anchor(0)),
+            Err(StoreError::IncompleteChainConfiguration)
         ));
     }
 }
