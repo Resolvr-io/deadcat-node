@@ -1,5 +1,6 @@
 //! Deadcat node runtime.
 
+pub mod activation;
 pub mod chain;
 pub mod discovery;
 pub mod interpreter;

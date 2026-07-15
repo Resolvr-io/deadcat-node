@@ -91,6 +91,21 @@ No orphaned position is returned as canonical evidence after either
 replacement. Durable subscription events name the exact affected contracts and
 market, and the rollback event precedes the replacement transaction event.
 
+The harness then moves the composed transaction beyond the retained two-block
+undo window and creates a real three-block alternate branch. The coordinator
+enters sticky `RescanRequired`, rotates the durable-event epoch exactly once,
+and rejects chain-derived RPC reads while leaving `GetInfo` available. The test
+closes and reopens redb before recovery to prove that invalidation survives a
+process restart.
+
+An explicit rebuild resets chain-derived state to the persisted regtest
+activation checkpoint while retaining the exact market and maker-order
+declarations. The test closes and reopens redb again immediately after reset,
+resumes activation-forward replay, and returns to `Ready` at the replacement
+tip. All three contracts, order-book rows, histories, shared raw-transaction
+evidence, and independent client replays then match the replacement branch;
+the pre-rebuild event cursor remains stale.
+
 ## Required commands
 
 Run the focused gate:
@@ -116,10 +131,11 @@ randomized reference model or mutation-boundary fault-injection suite promised
 by the implementation plan. Those remain separate protocol-assurance work.
 
 The gate uses the production Elements RPC source. Live Esplora/Electrs backend
-equivalence remains separate work, as do activation-anchor enforcement and the
-operator deep-rebuild path after a reorg exceeds retained undo depth. The test
-stays within the supported two-block automatic reorg window and runs on local
-liquidregtest, not public Liquid testnet.
+equivalence remains separate work, and the test runs on local liquidregtest,
+not public Liquid testnet. It invokes the store reset and synchronization
+coordinator directly, exercising recovery after the point where the CLI would
+verify backend genesis and activation. Spawned-process coverage of the local
+`deadcat-node rebuild` CLI boundary remains separate work.
 
 The live test invokes the production request handler directly for RPC replay;
 it does not replace the separate Iroh framing/transport tests or the future

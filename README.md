@@ -50,7 +50,15 @@ The mandatory multi-contract liquidregtest gate extends protocol assurance from
 isolated covenant lifecycles to composed chain ingestion. One real consensus
 transaction advances a market and two maker orders, then is interpreted,
 indexed, restarted, reorganized, and independently replayed as one atomic
-transaction.
+transaction. That gate also drives a real three-block fork through
+`RescanRequired`, stale-read refusal, an activation-checkpoint reset, process
+reopen, retained-declaration replay, and return to `Ready` on the replacement
+branch.
+
+V1 activation is immutable per production network. Liquid mainnet begins after
+block `3974391` (`705d699f…890c35`) and Liquid testnet begins after block
+`2529866` (`78fe3d5c…2f510e`). The exact checkpoint is verified against the
+backend and bound atomically with chain identity and the initial redb tip.
 
 This is not yet a production release. Public Liquid testnet shakedowns,
 operational backup/restore tooling, Nostr announcement ingestion, browser
@@ -94,7 +102,6 @@ Run against Elements Core:
 just node run \
   --network elements-regtest \
   --policy-asset <asset-id> \
-  --baseline-height 0 \
   elements --url http://127.0.0.1:7041 --cookie-file <cookie-path>
 ```
 
@@ -108,11 +115,31 @@ just node run \
 ```
 
 The daemon prints its serialized Iroh endpoint address on startup and persists
-a stable endpoint secret beside the database. For a new database,
-`--baseline-height` is the canonical checkpoint immediately before the block
-range the node should scan. Elements-backed nodes report full public market
-hint coverage; Esplora-backed nodes support chain-validated contract-package
-registration and report advisory discovery coverage.
+a stable endpoint secret beside the database. Production networks always use
+their compiled activation checkpoint. A dynamically-created Elements regtest
+chain defaults to genesis; `--baseline-height` is available only on regtest
+when a later explicit test checkpoint is useful. Scanning and valid v1
+creation begin strictly after that checkpoint. Elements-backed nodes report
+full public market hint coverage only when their persisted indexed tip is
+`Ready` at the current source tip; Esplora-backed nodes support chain-validated
+contract-package registration and report advisory discovery coverage.
+
+After a fork exceeds the two-block undo window, stop the daemon and run the
+local maintenance command with a backend for the same chain:
+
+```sh
+just node rebuild \
+  --database ./deadcat-node-data/store.redb \
+  elements --url http://127.0.0.1:7041 --cookie-file <cookie-path>
+```
+
+The command verifies the stored network genesis and activation hash before any
+destructive write, clears chain materialization, history, index, and undo
+tables, preserves normalized declarations and the durable event journal, and
+replays in complete-block commits. It is safe to rerun after interruption.
+Until reset, `RescanRequired` is sticky and chain-derived RPCs fail closed;
+`GetInfo`, subscriptions, fee estimation, and signed-transaction relay remain
+available.
 
 Contract identity and ingestion are deliberately separate. A compact
 `ContractId` is the exact creation-anchor outpoint: the initial dormant YES RT

@@ -48,8 +48,15 @@ one coordinated operation before the replacement branch is applied.
 
 A deeper reorg is not guessed through, and two-block undo is not treated as if
 it could restore an older checkpoint. The node becomes unready, rotates its
-durable-event epoch, rebuilds chain-derived tables from genesis or a verified
-full-state checkpoint, and rescans before serving canonical state again.
+durable-event epoch, makes `RescanRequired` sticky, and rejects chain-derived
+RPCs. The local `deadcat-node rebuild` command reverifies the backend genesis
+and immutable v1 activation checkpoint, clears chain materialization, history,
+index, and undo tables, retains normalized contract declarations and the event
+journal, and replays from the activation checkpoint before serving canonical
+state again. Registration rejects creation at or before the activation
+checkpoint, so that replay boundary cannot omit a supported v1 contract. Each
+block is a complete persisted prefix, allowing an interrupted rebuild to
+resume without another reset.
 
 ## Consequences
 

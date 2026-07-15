@@ -13,7 +13,9 @@ use deadcat_contracts::recovery::{MarketCollateral, MarketRecoveryHint};
 use deadcat_contracts::rt::{RtLeg, RtSide, infer_side};
 use deadcat_node::chain::{ChainSource, ChainSourceError, Outspend, TransactionStatus};
 use deadcat_node::interpreter::{DeadcatInterpreter, TRANSITION_V1_MARKET_ISSUED};
-use deadcat_node::store::{ContractParameters, ContractState, Store};
+use deadcat_node::store::{
+    ChainIdentity as StoreChainIdentity, ContractParameters, ContractState, Store,
+};
 use deadcat_node::sync::{SyncCoordinator, SyncOutcome};
 use deadcat_rpc::RecoveryFamily;
 use deadcat_types::{
@@ -576,7 +578,14 @@ async fn full_chain_market_recovery_survives_restart_and_coordinator_reorgs() {
     let interpreter = DeadcatInterpreter::new(LiquidNetwork::ElementsRegtest, policy_asset);
     let store = Store::open(&database).expect("open empty store");
     store
-        .initialize_tip(block_anchor(0, &genesis))
+        .initialize_chain(
+            StoreChainIdentity {
+                network: LiquidNetwork::ElementsRegtest,
+                genesis_hash: genesis.block_hash(),
+                policy_asset,
+            },
+            block_anchor(0, &genesis),
+        )
         .expect("initialize activation anchor");
     assert!(
         store

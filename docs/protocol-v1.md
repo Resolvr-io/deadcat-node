@@ -159,11 +159,13 @@ the complete package. One invalid declaration, dependency, chain identity, or
 conflicting existing record rejects the package without partial insertion. An
 identical retry is idempotent. The same transaction also retains a normalized
 copy of every verified declaration as explicit watch intent. Chain-derived
-state is still disposable: after a destructive rebuild, genesis replay matches
-those declarations by creation transaction, verifies markets before maker
-children against the exact canonical transactions, and rematerializes only the
-claims that remain valid. Missing or invalid claims stay dormant rather than
-blocking unrelated synchronization.
+state is still disposable: after a destructive rebuild, replay immediately
+after the immutable network activation checkpoint matches those declarations
+by creation transaction, verifies markets before maker children against the
+exact canonical transactions, and rematerializes only the claims that remain
+valid. Registration rejects v1 creation at or before that checkpoint, making
+the replay boundary complete. Missing or invalid claims stay dormant rather
+than blocking unrelated synchronization.
 
 ### Recovery outputs
 

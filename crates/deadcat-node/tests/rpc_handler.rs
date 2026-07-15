@@ -7,13 +7,14 @@ use deadcat_iroh::{RequestHandler as _, SubscriptionItem};
 use deadcat_node::chain::{ChainSource, ChainSourceError, Outspend, TransactionStatus};
 use deadcat_node::rpc_handler::{NodeRpcHandler, RpcHandlerConfig};
 use deadcat_node::store::{
-    AssetBinding, AssetRelationKind as StoreAssetRelationKind, BlockDelta, ChainTxDelta,
-    ContractParameters, ContractRecord, ContractState, OrderBookEntry, RecoveryHintDelta,
-    RegistrationEvidence, ScriptBinding, StateUpdate, Store, TrackedOutpoint, TransitionRecord,
+    AssetBinding, AssetRelationKind as StoreAssetRelationKind, BlockDelta,
+    ChainIdentity as StoreChainIdentity, ChainTxDelta, ContractParameters, ContractRecord,
+    ContractState, OrderBookEntry, RecoveryHintDelta, RegistrationEvidence, ScriptBinding,
+    StateUpdate, Store, TrackedOutpoint, TransitionRecord,
 };
 use deadcat_rpc::{
     AssetRelationKind, BackendKind, Capability, Event, EventFilter, PageRequest, RecoveryFamily,
-    Request, Response, RpcErrorCode,
+    Request, Response, RpcErrorCode, SubscriptionEnd,
 };
 use deadcat_types::{
     BinaryMarketParams, BinaryMarketState, CONTRACT_PACKAGE_FORMAT_VERSION, ChainAnchor,
@@ -318,11 +319,10 @@ fn order_record(
 
 fn rpc_config(discovery: DiscoveryCoverage) -> RpcHandlerConfig {
     RpcHandlerConfig {
-        network: LiquidNetwork::ElementsRegtest,
-        genesis_hash: block_hash(0),
-        policy_asset: asset(0x20),
-        backend: BackendKind::Esplora,
-        discovery,
+        backend: match discovery.mode {
+            DiscoveryMode::FullHintScan => BackendKind::ElementsRpc,
+            DiscoveryMode::AdvisoryOnly => BackendKind::Esplora,
+        },
         registration_bearer_token: Some("registration-secret".to_owned()),
         max_concurrent_registrations: 1,
         max_concurrent_broadcasts: 1,
@@ -334,7 +334,16 @@ fn rpc_config(discovery: DiscoveryCoverage) -> RpcHandlerConfig {
 fn new_store() -> (tempfile::TempDir, Arc<Store>) {
     let directory = tempfile::tempdir().expect("temporary directory");
     let store = Arc::new(Store::open(directory.path().join("deadcat.redb")).expect("open store"));
-    store.initialize_tip(anchor(0)).expect("initialize tip");
+    store
+        .initialize_chain(
+            StoreChainIdentity {
+                network: LiquidNetwork::ElementsRegtest,
+                genesis_hash: block_hash(0),
+                policy_asset: asset(0x20),
+            },
+            anchor(0),
+        )
+        .expect("initialize chain");
     (directory, store)
 }
 
@@ -871,10 +880,10 @@ fn resolve_market(fixture: &Fixture) {
 async fn get_info_keeps_index_evidence_when_backend_is_unavailable() {
     let (directory, store) = new_store();
     let discovery = DiscoveryCoverage {
-        mode: DiscoveryMode::FullHintScan,
+        mode: DiscoveryMode::AdvisoryOnly,
         from: anchor(0),
         scanned_through: anchor(0),
-        target_tip: anchor(7),
+        target_tip: anchor(0),
         canonical_market_complete: false,
     };
     let handler = NodeRpcHandler::new(
@@ -892,9 +901,189 @@ async fn get_info_keeps_index_evidence_when_backend_is_unavailable() {
     assert_eq!(info.source_tip, None);
     assert_eq!(info.indexed_tip, anchor(0));
     assert_eq!(info.discovery, discovery);
-    assert!(info.capabilities.contains(&Capability::FullHintScan));
+    assert!(!info.capabilities.contains(&Capability::FullHintScan));
     assert!(info.capabilities.contains(&Capability::Esplora));
     drop(directory);
+}
+
+#[tokio::test]
+async fn discovery_completeness_is_derived_from_persisted_tip_status_and_live_source() {
+    let (directory, store) = new_store();
+    store
+        .set_sync_status(deadcat_rpc::SyncStatus::Ready)
+        .expect("ready status");
+    let full = DiscoveryCoverage {
+        mode: DiscoveryMode::FullHintScan,
+        from: anchor(0),
+        scanned_through: anchor(0),
+        target_tip: anchor(0),
+        canonical_market_complete: false,
+    };
+    let caught_up = NodeRpcHandler::new(
+        Arc::new(MockSource {
+            tip: Some(anchor(0)),
+        }),
+        Arc::clone(&store),
+        rpc_config(full),
+    )
+    .expect("caught-up handler");
+    let Response::Info { info } = request(&caught_up, Request::GetInfo)
+        .await
+        .expect("caught-up info")
+    else {
+        panic!("unexpected response")
+    };
+    assert!(info.discovery.canonical_market_complete);
+    assert_eq!(info.discovery.from, anchor(0));
+    assert_eq!(info.discovery.scanned_through, anchor(0));
+
+    let advanced = NodeRpcHandler::new(
+        Arc::new(MockSource {
+            tip: Some(anchor(1)),
+        }),
+        Arc::clone(&store),
+        rpc_config(full),
+    )
+    .expect("advanced handler");
+    let Response::Info { info } = request(&advanced, Request::GetInfo)
+        .await
+        .expect("advanced info")
+    else {
+        panic!("unexpected response")
+    };
+    assert!(!info.discovery.canonical_market_complete);
+    assert_eq!(info.discovery.scanned_through, anchor(0));
+    assert_eq!(info.discovery.target_tip, anchor(1));
+    drop(directory);
+}
+
+#[tokio::test]
+async fn rescan_required_blocks_every_chain_derived_rpc_before_dispatch() {
+    let fixture = fixture();
+    let old_cursor = fixture
+        .store
+        .event_high_watermark()
+        .expect("old event cursor");
+    fixture
+        .store
+        .invalidate_for_rebuild()
+        .expect("invalidate store");
+
+    let ContractParameters::BinaryMarket(params) = fixture.market.params else {
+        panic!("fixture market parameters")
+    };
+    let package = ContractPackage {
+        format_version: CONTRACT_PACKAGE_FORMAT_VERSION,
+        chain: ChainIdentity {
+            network: LiquidNetwork::ElementsRegtest,
+            genesis_hash: block_hash(0),
+        },
+        roots: vec![fixture.market.contract_id],
+        declarations: vec![ContractDeclaration {
+            contract_id: fixture.market.contract_id,
+            descriptor: ContractDescriptor::BinaryMarketV1 { params },
+        }],
+    };
+    let page = PageRequest {
+        cursor: None,
+        limit: 10,
+    };
+    let blocked = vec![
+        Request::RegisterContractPackage {
+            package,
+            bearer_token: None,
+        },
+        Request::GetContract {
+            contract_id: fixture.market.contract_id,
+        },
+        Request::ListMarkets { page: page.clone() },
+        Request::GetMarketSnapshot {
+            market_id: fixture.market.contract_id,
+        },
+        Request::ListOrders {
+            market_id: fixture.market.contract_id,
+            side: None,
+            direction: None,
+            page: page.clone(),
+        },
+        Request::GetOrderBook {
+            market_id: fixture.market.contract_id,
+        },
+        Request::ListRecoveryHints {
+            family: None,
+            page: page.clone(),
+        },
+        Request::GetContractHistory {
+            contract_id: fixture.market.contract_id,
+            after: None,
+            limit: 10,
+        },
+        Request::GetTransaction {
+            position: fixture.market.creation_position,
+        },
+        Request::InterpretTransaction {
+            transaction: fixture.transactions[0].clone(),
+        },
+        Request::LookupAsset {
+            asset_id: fixture.collateral,
+        },
+        Request::SuggestRoute {
+            market_id: fixture.market.contract_id,
+            side: OrderSide::Yes,
+            direction: OrderDirection::SellBase,
+            base_amount: 1,
+            max_orders: 1,
+        },
+    ];
+    for request_value in blocked {
+        let error = request(&fixture.handler, request_value)
+            .await
+            .expect_err("chain-derived RPC must fail closed");
+        assert_eq!(error.code, RpcErrorCode::RescanRequired);
+    }
+
+    let Response::Info { info } = request(&fixture.handler, Request::GetInfo)
+        .await
+        .expect("GetInfo remains available")
+    else {
+        panic!("unexpected info response")
+    };
+    assert_eq!(info.sync_status, deadcat_rpc::SyncStatus::RescanRequired);
+    assert!(!info.discovery.canonical_market_complete);
+    assert_ne!(info.event_high_watermark.epoch, old_cursor.epoch);
+
+    for request_value in [
+        Request::EstimateFeerate { target_blocks: 2 },
+        Request::BroadcastSignedTransaction {
+            transaction: fixture.transactions[0].clone(),
+        },
+    ] {
+        let error = request(&fixture.handler, request_value)
+            .await
+            .expect_err("mock backend is unavailable");
+        assert_eq!(error.code, RpcErrorCode::BackendUnavailable);
+    }
+
+    let mut subscription = fixture
+        .handler
+        .subscribe(
+            [0x88; 32],
+            Request::SubscribeEvents {
+                after: None,
+                filter: EventFilter::Contracts {
+                    contract_ids: vec![fixture.market.contract_id],
+                },
+            },
+        )
+        .await
+        .expect("new-epoch subscription remains available");
+    let status = recv_event(&mut subscription).await;
+    assert!(matches!(
+        status.event,
+        Event::SyncStatusChanged {
+            status: deadcat_rpc::SyncStatus::RescanRequired
+        }
+    ));
 }
 
 #[tokio::test]
@@ -944,25 +1133,23 @@ async fn registration_package_rpc_returns_ordered_idempotent_receipts() {
     let store = Arc::new(
         Store::open(directory.path().join("registration.redb")).expect("open registration store"),
     );
-    store.initialize_tip(anchor(1)).expect("initialize tip");
-
-    // Seed an already verified parent market without a full block row so the
-    // RPC test can focus on the package boundary and exact maker anchor.
+    // Seed an already verified parent market without an interpreted creation
+    // row so the RPC test can focus on the package boundary and exact maker anchor.
     let parent_transaction = transaction(90);
+    store
+        .initialize_chain(
+            StoreChainIdentity {
+                network: LiquidNetwork::ElementsRegtest,
+                genesis_hash: block_hash(0),
+                policy_asset: asset(0x20),
+            },
+            anchor(0),
+        )
+        .expect("initialize chain");
     let mut parent = market_record(0x31, &parent_transaction, 0);
     parent.sync_state = ContractSyncState::CatchingUp {
         synced_through: anchor(1),
     };
-    store
-        .register_contract(
-            &parent,
-            &RegistrationEvidence {
-                anchor: anchor(1),
-                transaction: Arc::new(parent_transaction),
-                associated_hint: None,
-            },
-        )
-        .expect("register parent fixture");
     let ContractParameters::BinaryMarket(parent_params) = parent.params else {
         panic!("parent market params")
     };
@@ -989,6 +1176,25 @@ async fn registration_package_rpc_returns_ordered_idempotent_receipts() {
             witness: TxOutWitness::default(),
         }],
     };
+    store
+        .apply_block(&BlockDelta {
+            anchor: anchor(1),
+            prev_block_hash: anchor(0).hash,
+            ordered_txids: vec![parent_transaction.txid(), creation.txid()],
+            relevant_transactions: Vec::new(),
+            recovery_hints: Vec::new(),
+        })
+        .expect("index shared creation block");
+    store
+        .register_contract(
+            &parent,
+            &RegistrationEvidence {
+                anchor: anchor(1),
+                transaction: Arc::new(parent_transaction),
+                associated_hint: None,
+            },
+        )
+        .expect("register parent fixture");
     let contract_id = ContractId::new(OutPoint::new(creation.txid(), 0));
     let package = ContractPackage {
         format_version: CONTRACT_PACKAGE_FORMAT_VERSION,
@@ -1145,6 +1351,57 @@ async fn subscription_replay_boundary_precedes_events_appended_after_open_withou
             status: deadcat_rpc::SyncStatus::Ready
         }
     ));
+}
+
+#[tokio::test]
+async fn subscription_opening_never_mixes_events_across_epoch_rotation() {
+    let (_directory, store) = new_store();
+    let old_high = store
+        .set_sync_status(deadcat_rpc::SyncStatus::Syncing)
+        .expect("old-epoch event");
+    let discovery = DiscoveryCoverage {
+        mode: DiscoveryMode::AdvisoryOnly,
+        from: anchor(0),
+        scanned_through: anchor(0),
+        target_tip: anchor(0),
+        canonical_market_complete: false,
+    };
+    let handler = NodeRpcHandler::new(
+        Arc::new(MockSource {
+            tip: Some(anchor(0)),
+        }),
+        Arc::clone(&store),
+        rpc_config(discovery),
+    )
+    .expect("handler");
+    let mut subscription = handler
+        .subscribe(
+            [0x78; 32],
+            Request::SubscribeEvents {
+                after: None,
+                filter: EventFilter::All,
+            },
+        )
+        .await
+        .expect("subscription");
+    assert_eq!(subscription.through, old_high);
+
+    let new_high = store
+        .set_sync_status(deadcat_rpc::SyncStatus::RescanRequired)
+        .expect("rotate epoch");
+    assert_ne!(new_high.epoch, old_high.epoch);
+
+    loop {
+        let item = tokio::time::timeout(Duration::from_secs(1), subscription.events.recv())
+            .await
+            .expect("subscription receive timeout")
+            .expect("subscription closed without reason");
+        match item {
+            SubscriptionItem::Event(event) => assert_eq!(event.cursor.epoch, old_high.epoch),
+            SubscriptionItem::End(SubscriptionEnd::StaleCursor) => break,
+            SubscriptionItem::End(reason) => panic!("unexpected subscription end: {reason:?}"),
+        }
+    }
 }
 
 async fn recv_event(subscription: &mut deadcat_iroh::Subscription) -> deadcat_rpc::EventEnvelope {

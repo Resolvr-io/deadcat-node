@@ -1,7 +1,7 @@
 //! Iroh RPC application handler over canonical store and chain evidence.
 
 use std::cmp::Reverse;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use deadcat_iroh::{ClientId, RequestHandler, Subscription, SubscriptionItem};
@@ -14,27 +14,23 @@ use deadcat_rpc::{
     SubscriptionEnd, TransactionEvidence,
 };
 use deadcat_types::{
-    ChainAnchor, ChainPosition, ContractKind, ContractSyncState, DiscoveryCoverage, LiquidNetwork,
+    ChainPosition, ContractKind, ContractSyncState, DiscoveryCoverage, DiscoveryMode,
 };
-use elements::{AssetId, BlockHash, encode};
+use elements::encode;
 use tokio::sync::{Semaphore, mpsc};
 
 use crate::chain::{ChainSource, ChainSourceError};
 use crate::registration::{RegistrationError, RegistrationVerifier};
 use crate::store::{
-    AssetRelationKind as StoreAssetRelationKind, ContractParameters, ContractRecord, ContractState,
-    Store, StoreError, StoreSnapshotCursor, StoreSnapshotMetadata, StoredEvent,
+    AssetRelationKind as StoreAssetRelationKind, ChainIdentity, ContractParameters, ContractRecord,
+    ContractState, Store, StoreError, StoreSnapshotCursor, StoreSnapshotMetadata, StoredEvent,
     StoredEventEnvelope,
 };
 use crate::sync::{ChainInterpreter as _, InterpretationContext, InterpretationMode};
 
 #[derive(Clone, Debug)]
 pub struct RpcHandlerConfig {
-    pub network: LiquidNetwork,
-    pub genesis_hash: BlockHash,
-    pub policy_asset: AssetId,
     pub backend: BackendKind,
-    pub discovery: DiscoveryCoverage,
     pub registration_bearer_token: Option<String>,
     pub max_concurrent_registrations: usize,
     pub max_concurrent_broadcasts: usize,
@@ -61,8 +57,8 @@ impl RpcHandlerConfig {
 pub struct NodeRpcHandler<S> {
     source: Arc<S>,
     store: Arc<Store>,
+    identity: ChainIdentity,
     config: RpcHandlerConfig,
-    discovery: Arc<RwLock<DiscoveryCoverage>>,
     registrations: Arc<Semaphore>,
     broadcasts: Arc<Semaphore>,
 }
@@ -77,29 +73,37 @@ where
         config: RpcHandlerConfig,
     ) -> Result<Self, RpcError> {
         config.validate()?;
-        let discovery = Arc::new(RwLock::new(config.discovery));
+        let identity = store
+            .chain_identity()
+            .map_err(store_error)?
+            .ok_or_else(|| {
+                RpcError::new(
+                    RpcErrorCode::NotSynced,
+                    "database chain identity is not initialized",
+                )
+            })?;
+        // Fail closed for embedders as well as the daemon: RPC discovery and
+        // recovery metadata require the store's atomically bound activation.
+        store.status_snapshot().map_err(store_error)?;
         Ok(Self {
             source,
             store,
+            identity,
             registrations: Arc::new(Semaphore::new(config.max_concurrent_registrations)),
             broadcasts: Arc::new(Semaphore::new(config.max_concurrent_broadcasts)),
             config,
-            discovery,
         })
     }
 
-    pub fn set_discovery_coverage(&self, coverage: DiscoveryCoverage) -> Result<(), RpcError> {
-        *self.discovery.write().map_err(|_| {
-            RpcError::new(
-                RpcErrorCode::BackendUnavailable,
-                "discovery status lock is poisoned",
-            )
-        })? = coverage;
-        Ok(())
-    }
-
     async fn handle_request(&self, request: Request) -> Result<Response, RpcError> {
-        match request {
+        let chain_read = Self::request_reads_chain_state(&request);
+        let admitted_epoch = if chain_read {
+            Some(self.available_chain_state_epoch()?)
+        } else {
+            self.ensure_request_available(&request)?;
+            None
+        };
+        let response = match request {
             Request::GetInfo => self.get_info().await,
             Request::RegisterContractPackage {
                 package,
@@ -117,9 +121,9 @@ where
                 let verifier = RegistrationVerifier::new(
                     self.source.as_ref(),
                     self.store.as_ref(),
-                    self.config.network,
-                    self.config.genesis_hash,
-                    self.config.policy_asset,
+                    self.identity.network,
+                    self.identity.genesis_hash,
+                    self.identity.policy_asset,
                 );
                 let registrations = verifier
                     .verify_and_register_package(&package)
@@ -297,8 +301,8 @@ where
             Request::InterpretTransaction { transaction } => {
                 let snapshot = self.store.snapshot_metadata().map_err(store_error)?;
                 let interpreter = crate::interpreter::DeadcatInterpreter::new(
-                    self.config.network,
-                    self.config.policy_asset,
+                    self.identity.network,
+                    self.identity.policy_asset,
                 );
                 let interpreted = interpreter
                     .interpret_transaction(
@@ -349,18 +353,34 @@ where
                 RpcErrorCode::InvalidTransaction,
                 "subscription request used on unary handler",
             )),
+        };
+        if let Some(expected_epoch) = admitted_epoch {
+            let current_epoch = self.available_chain_state_epoch()?;
+            if current_epoch != expected_epoch {
+                return Err(rescan_required_error());
+            }
         }
+        response
     }
 
     async fn get_info(&self) -> Result<Response, RpcError> {
         let source_tip = self.source.tip().await.ok();
-        let indexed_tip = self.indexed_tip()?;
-        let discovery = *self.discovery.read().map_err(|_| {
-            RpcError::new(
-                RpcErrorCode::BackendUnavailable,
-                "discovery status lock is poisoned",
-            )
-        })?;
+        let persisted = self.store.status_snapshot().map_err(store_error)?;
+        let indexed_tip = persisted.indexed_tip;
+        let sync_status = persisted.sync_status;
+        let discovery_mode = match self.config.backend {
+            BackendKind::ElementsRpc => DiscoveryMode::FullHintScan,
+            BackendKind::Esplora => DiscoveryMode::AdvisoryOnly,
+        };
+        let discovery = DiscoveryCoverage {
+            mode: discovery_mode,
+            from: persisted.activation_anchor,
+            scanned_through: indexed_tip,
+            target_tip: source_tip.unwrap_or(indexed_tip),
+            canonical_market_complete: discovery_mode == DiscoveryMode::FullHintScan
+                && sync_status == deadcat_rpc::SyncStatus::Ready
+                && source_tip == Some(indexed_tip),
+        };
         let mut capabilities = vec![
             Capability::BinaryMarketV1,
             Capability::MakerOrderV1,
@@ -374,22 +394,22 @@ where
             Capability::DurableSubscriptions,
             Capability::AdvisoryRouting,
         ];
-        if matches!(discovery.mode, deadcat_types::DiscoveryMode::FullHintScan) {
+        if discovery.mode == DiscoveryMode::FullHintScan {
             capabilities.push(Capability::FullHintScan);
         }
         Ok(Response::Info {
             info: NodeInfo {
-                network: self.config.network,
-                genesis_hash: self.config.genesis_hash,
-                policy_asset: self.config.policy_asset,
+                network: self.identity.network,
+                genesis_hash: self.identity.genesis_hash,
+                policy_asset: self.identity.policy_asset,
                 backend: self.config.backend,
                 source_tip,
                 indexed_tip,
-                sync_status: self.store.sync_status().map_err(store_error)?,
+                sync_status,
                 rollback_retention_blocks: 2,
                 discovery,
                 capabilities,
-                event_high_watermark: self.store.event_high_watermark().map_err(store_error)?,
+                event_high_watermark: persisted.event_high_watermark,
             },
         })
     }
@@ -677,11 +697,40 @@ where
         Ok(())
     }
 
-    fn indexed_tip(&self) -> Result<ChainAnchor, RpcError> {
-        self.store
-            .tip()
+    fn ensure_request_available(&self, request: &Request) -> Result<(), RpcError> {
+        if self
+            .store
+            .status_snapshot()
             .map_err(store_error)?
-            .ok_or_else(|| RpcError::new(RpcErrorCode::NotSynced, "indexed tip is unavailable"))
+            .sync_status
+            == deadcat_rpc::SyncStatus::RescanRequired
+            && !matches!(
+                request,
+                Request::GetInfo
+                    | Request::EstimateFeerate { .. }
+                    | Request::BroadcastSignedTransaction { .. }
+                    | Request::SubscribeEvents { .. }
+            )
+        {
+            return Err(rescan_required_error());
+        }
+        Ok(())
+    }
+
+    fn request_reads_chain_state(request: &Request) -> bool {
+        !matches!(
+            request,
+            Request::GetInfo
+                | Request::RegisterContractPackage { .. }
+                | Request::EstimateFeerate { .. }
+                | Request::BroadcastSignedTransaction { .. }
+                | Request::SubscribeEvents { .. }
+        )
+    }
+
+    fn available_chain_state_epoch(&self) -> Result<[u8; 16], RpcError> {
+        let snapshot = self.store.status_snapshot().map_err(store_error)?;
+        available_chain_state_epoch(snapshot)
     }
 
     fn open_subscription(
@@ -689,26 +738,34 @@ where
         after: Option<deadcat_types::EventCursor>,
         filter: EventFilter,
     ) -> Result<Subscription, RpcError> {
-        let through = self.store.event_high_watermark().map_err(store_error)?;
-        // Validate the supplied epoch/ahead-of-server cursor before returning
-        // the opening frame. Replay itself runs in the bounded producer task.
-        self.store.events_after(after, 1).map_err(store_error)?;
+        // Capture the tip and event boundary and validate the caller's cursor
+        // in one redb snapshot so epoch rotation cannot split the opening
+        // frame from the replay cursor.
+        let opening = self
+            .store
+            .subscription_snapshot(after)
+            .map_err(store_error)?;
+        let through = opening.event_high_watermark;
         let (sender, receiver) = mpsc::channel(self.config.subscription_buffer);
         let store = Arc::clone(&self.store);
         let poll_interval = self.config.subscription_poll_interval;
         tokio::spawn(async move {
-            let mut cursor = after;
+            let mut cursor = Some(after.unwrap_or(deadcat_types::EventCursor {
+                epoch: through.epoch,
+                sequence: 0,
+            }));
             let mut caught_up = false;
             loop {
-                if !caught_up && cursor.map_or(0, |cursor| cursor.sequence) >= through.sequence {
+                if !caught_up
+                    && cursor.is_some_and(|cursor| {
+                        cursor.epoch == through.epoch && cursor.sequence >= through.sequence
+                    })
+                {
                     let caught_up_event = EventEnvelope {
                         cursor: through,
                         event: Event::CaughtUp {
                             through_cursor: through,
-                            indexed_tip: match store.tip() {
-                                Ok(Some(tip)) => tip,
-                                _ => break,
-                            },
+                            indexed_tip: opening.indexed_tip,
                         },
                     };
                     if sender
@@ -937,7 +994,7 @@ fn event_matches(event: &StoredEventEnvelope, filter: &EventFilter, store: &Stor
             } => affected_contract_ids
                 .iter()
                 .any(|contract_id| contract_ids.contains(contract_id)),
-            StoredEvent::SyncStatusChanged { .. } => false,
+            StoredEvent::SyncStatusChanged { .. } => true,
         },
         EventFilter::MarketTree { market_id } => match &event.event {
             StoredEvent::ContractRegistered { contract_id }
@@ -957,7 +1014,7 @@ fn event_matches(event: &StoredEventEnvelope, filter: &EventFilter, store: &Stor
                 affected_market_ids,
                 ..
             } => affected_market_ids.contains(market_id),
-            StoredEvent::SyncStatusChanged { .. } => false,
+            StoredEvent::SyncStatusChanged { .. } => true,
         },
     }
 }
@@ -1028,6 +1085,22 @@ fn chain_error(error: ChainSourceError) -> RpcError {
     RpcError::new(code, error.to_string())
 }
 
+fn rescan_required_error() -> RpcError {
+    RpcError::new(
+        RpcErrorCode::RescanRequired,
+        "chain-derived state is unavailable until the required rebuild completes",
+    )
+}
+
+fn available_chain_state_epoch(
+    snapshot: crate::store::StoreStatusSnapshot,
+) -> Result<[u8; 16], RpcError> {
+    if snapshot.sync_status == deadcat_rpc::SyncStatus::RescanRequired {
+        return Err(rescan_required_error());
+    }
+    Ok(snapshot.event_high_watermark.epoch)
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn store_error(error: StoreError) -> RpcError {
     let code = match &error {
@@ -1068,6 +1141,7 @@ fn registration_error(error: RegistrationError) -> RpcError {
             StoreError::ForkConflict { .. } => RpcErrorCode::ForkConflict,
             StoreError::TipNotInitialized => RpcErrorCode::NotSynced,
             StoreError::InvalidContract(_)
+            | StoreError::PreActivationContract { .. }
             | StoreError::ContractAlreadyExists(_)
             | StoreError::InvalidRegistrationEvidence(_)
             | StoreError::RegistrationTransactionConflict(_)
@@ -1076,6 +1150,7 @@ fn registration_error(error: RegistrationError) -> RpcError {
         },
         RegistrationError::ParentMarketNotFound => RpcErrorCode::NotFound,
         RegistrationError::UnconfirmedCreation
+        | RegistrationError::PreActivationCreation { .. }
         | RegistrationError::WrongChain
         | RegistrationError::InvalidPackage(_)
         | RegistrationError::ParentIsNotMarket
@@ -1130,5 +1205,39 @@ mod tests {
             StoreError::InvalidRegistrationEvidence("conflict".to_owned()),
         ));
         assert_eq!(error.code, RpcErrorCode::InvalidRegistration);
+    }
+
+    #[test]
+    fn chain_state_epoch_revalidation_rejects_a_concurrent_invalidation() {
+        use elements::hashes::Hash as _;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(directory.path().join("deadcat.redb")).expect("open store");
+        let activation = deadcat_types::ChainAnchor {
+            height: 0,
+            hash: elements::BlockHash::from_byte_array([0x11; 32]),
+        };
+        store
+            .initialize_chain(
+                ChainIdentity {
+                    network: deadcat_types::LiquidNetwork::ElementsRegtest,
+                    genesis_hash: activation.hash,
+                    policy_asset: elements::AssetId::from_slice(&[0x22; 32]).expect("asset"),
+                },
+                activation,
+            )
+            .expect("initialize chain");
+        let admitted =
+            available_chain_state_epoch(store.status_snapshot().expect("admission snapshot"))
+                .expect("chain state initially available");
+        store.invalidate_for_rebuild().expect("invalidate");
+        let error =
+            available_chain_state_epoch(store.status_snapshot().expect("post-dispatch snapshot"))
+                .expect_err("post-dispatch epoch check must reject invalidation");
+        assert_eq!(error.code, RpcErrorCode::RescanRequired);
+        assert_ne!(
+            admitted,
+            store.event_high_watermark().expect("rotated cursor").epoch
+        );
     }
 }

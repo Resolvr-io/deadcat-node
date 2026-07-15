@@ -535,16 +535,20 @@ fn canonical_hint_creates_ready_market_but_composed_shape_is_registration_only()
 
 #[test]
 fn destructive_replay_revalidates_retained_market_and_identical_same_tx_makers() {
-    let (directory, store) = empty_store();
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(directory.path().join("deadcat.redb")).expect("store");
     let genesis = anchor(0, 0x01);
     let policy = asset(0xa2);
     store
-        .bind_chain(crate::store::ChainIdentity {
-            network: LiquidNetwork::ElementsRegtest,
-            genesis_hash: genesis.hash,
-            policy_asset: policy,
-        })
-        .expect("bind chain");
+        .initialize_chain(
+            crate::store::ChainIdentity {
+                network: LiquidNetwork::ElementsRegtest,
+                genesis_hash: genesis.hash,
+                policy_asset: policy,
+            },
+            genesis,
+        )
+        .expect("initialize chain");
 
     let (mut creation, market_params) = standalone_market_with_params(policy);
     let order_params = MakerOrderParams {
@@ -656,9 +660,7 @@ fn destructive_replay_revalidates_retained_market_and_identical_same_tx_makers()
     );
 
     store.invalidate_for_rebuild().expect("invalidate");
-    store
-        .reset_for_rebuild(genesis)
-        .expect("genesis rebuild reset");
+    store.reset_for_rebuild().expect("activation rebuild reset");
     let replacement_one = anchor(1, 0x12);
     let unrelated = Transaction {
         version: 2,

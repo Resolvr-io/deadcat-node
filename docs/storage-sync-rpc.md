@@ -77,7 +77,7 @@ The initial schema contains:
 
 | Table | Purpose |
 |---|---|
-| `meta` | schema version, network, event epoch/high-watermark, sync status |
+| `meta` | schema version, chain identity, immutable activation anchor, event epoch/high-watermark, sync status |
 | `chain_tip` | singleton indexed canonical tip |
 | `chain_checkpoints` | height to block hash and previous hash |
 | `contracts` | immutable params, kind/version, creation, current state, provenance |
@@ -205,9 +205,24 @@ preview is explicitly noncanonical and cannot alter current state or history.
 
 ### Global hint discovery
 
-Each protocol release defines a network-specific activation anchor. An archival
-Elements Core backend can scan complete blocks once from that anchor to the
-pinned tip. During the same ordered pass the node:
+Each protocol release defines a network-specific activation anchor. The anchor
+is an exclusive checkpoint: valid v1 creation and scanning begin at
+`anchor.height + 1`. V1 fixes these production checkpoints:
+
+| Network | Height | Block hash |
+|---|---:|---|
+| Liquid | 3,974,391 | `705d699fe1d7f9433837f5f8fec9347c2d5f25aebec5c70ce838db50db890c35` |
+| Liquid testnet | 2,529,866 | `78fe3d5ce6a0df49e7f41adf2e20e610f34f2813dfeaaf50be869ad0e32f510e` |
+
+Elements regtest uses its dynamically selected checkpoint, genesis by default.
+The node verifies the exact height/hash against its backend before creating or
+opening the database and atomically binds chain identity, activation, and the
+initial tip. Package registration rejects every creation at or before the
+checkpoint, which makes activation-forward retained-declaration replay
+complete.
+
+An archival Elements Core backend scans complete blocks once from immediately
+after that anchor to the pinned tip. During the same ordered pass the node:
 
 - stores every length-valid recognized recovery-hint envelope with its chain
   position and output index;
@@ -231,6 +246,11 @@ scanned_through: ChainAnchor
 target_tip: ChainAnchor
 canonical_market_complete: bool
 ```
+
+`from` is the exclusive activation checkpoint. `scanned_through` is the
+persisted indexed tip. `canonical_market_complete` is true only for
+`FullHintScan` while sync status is `Ready` and the current source tip exactly
+equals the indexed tip; it is derived rather than stored as a mutable flag.
 
 A node can be fully synchronized for every registered contract while its global
 market discovery remains incomplete.
@@ -284,22 +304,38 @@ bytes, but it is never returned as canonical history.
 If no common ancestor exists in the retained window:
 
 1. set `SyncStatus::RescanRequired`;
-2. mark the node unready and stop claiming current state;
+2. make that status sticky and reject chain-derived reads, interpretation,
+   routing, and registration;
 3. rotate the durable-event epoch;
-4. rebuild chain-derived materialized tables and histories from genesis; and
-5. rescan before returning to `Ready`.
+4. require the local operator to stop the daemon and invoke
+   `deadcat-node rebuild`;
+5. reverify the backend genesis and immutable activation checkpoint before any
+   destructive write;
+6. clear chain materialization, history, index, and undo tables while retaining
+   normalized declarations and the durable event journal;
+7. reset the tip to the activation checkpoint; and
+8. replay complete blocks before returning to `Ready`.
 
-V1 requires the exact genesis anchor whenever retained declarations exist.
-Starting later could skip a watched contract's creation and no authenticated
-post-genesis contract-state checkpoint exists yet. A future full-state
-checkpoint format may relax this only by authenticating all pre-checkpoint
-contract state and declaration coverage.
+`RescanRequired` cannot be overwritten by a later backend outage or ordinary
+status update; only the atomic reset exits it. Repeated invalidation is
+idempotent and does not rotate the event epoch again. A crash before reset
+leaves the invalidated database untouched. A crash after reset or any replayed
+block leaves a complete persisted prefix, so `rebuild` or ordinary `run` can
+resume without clearing again.
 
 Two-block undo data is not claimed to restore an older checkpoint. The rebuild
 is explicit and observable. The node never silently wipes, guesses, or
 continues from inconsistent state.
 
 ## RPC
+
+While `RescanRequired` is active, `GetInfo`, `SubscribeEvents`,
+`EstimateFeerate`, and `BroadcastSignedTransaction` remain available. Every
+registration and chain-derived query, interpretation, or routing request fails
+with typed `RescanRequired` before dispatch. Chain-derived reads also
+revalidate the durable-event epoch before returning, so an invalidation that
+commits while a request is in flight cannot release known-stale materialized
+state.
 
 The transport-neutral request set begins with:
 
@@ -390,9 +426,11 @@ pub struct EventEnvelope {
 
 Events are append-only within an epoch and delivered at least once. Clients
 deduplicate by the full cursor. A fresh random epoch is created on database
-initialization and on any destructive rebuild or backup restore; sequence
-starts at zero within it. A cursor from another epoch, or ahead of the server's
-high-watermark, returns `StaleCursor`.
+initialization and when the node first enters `RescanRequired`; sequence starts
+at zero within it. The explicit reset and replay preserve that epoch, and
+repeated invalidation while already invalidated does not rotate it again. A
+cursor from another epoch, or ahead of the server's high-watermark, returns
+`StaleCursor`. Backup and restore epoch policy remains future operational work.
 
 ```text
 TransactionApplied { anchor, txid, position, transitions }
@@ -408,6 +446,10 @@ ContractRegistered
 SyncStatusChanged
 CaughtUp { through_cursor, indexed_tip }
 ```
+
+`SyncStatusChanged` passes every subscription filter so contract- and
+market-scoped subscribers observe invalidation and recovery even when no
+contract transition is involved.
 
 Subscriptions accept an optional prior cursor and an actual server-side filter:
 

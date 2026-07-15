@@ -364,6 +364,20 @@ where
                     return Err(RegistrationError::UnconfirmedCreation);
                 }
             };
+            let activation = self.store.activation_anchor()?;
+            // Test-only verifier fixtures may omit chain bootstrap; production
+            // builds require the persisted activation before accepting evidence.
+            if activation.is_none() && !cfg!(test) {
+                return Err(StoreError::ActivationNotInitialized.into());
+            }
+            if let Some(activation) = activation
+                && anchor.height <= activation.height
+            {
+                return Err(RegistrationError::PreActivationCreation {
+                    creation: anchor,
+                    activation,
+                });
+            }
             entry.insert(CreationEvidence {
                 transaction: Arc::new(transaction),
                 anchor,
@@ -886,6 +900,11 @@ pub enum RegistrationError {
     Store(#[from] StoreError),
     #[error("creation transaction is not confirmed")]
     UnconfirmedCreation,
+    #[error("contract creation {creation:?} is not after v1 activation checkpoint {activation:?}")]
+    PreActivationCreation {
+        creation: ChainAnchor,
+        activation: ChainAnchor,
+    },
     #[error("contract package targets a different Liquid chain")]
     WrongChain,
     #[error("invalid contract package: {0}")]
