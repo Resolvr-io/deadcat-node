@@ -2,12 +2,11 @@
 
 use std::collections::HashSet;
 
-use deadcat_types::ContractId;
 use elements::confidential::{Asset, Value};
 use elements::hashes::{Hash as _, HashEngine as _, sha256};
 use elements::secp256k1_zkp::{Secp256k1, XOnlyPublicKey};
 use elements::taproot::{ControlBlock, TaprootBuilder, TaprootBuilderError};
-use elements::{AssetId, Script, Txid};
+use elements::{AssetId, Script};
 use simplex::program::ArgumentsTrait as _;
 use simplex::simplicityhl::CompiledProgram;
 use simplex::simplicityhl::simplicity::{HasCmr as _, leaf_version};
@@ -115,14 +114,6 @@ impl CompiledBinaryMarket {
     #[must_use]
     pub const fn cmr(&self) -> [u8; 32] {
         self.cmr
-    }
-
-    #[must_use]
-    pub const fn contract_id(&self, creation_txid: Txid) -> ContractId {
-        ContractId {
-            cmr: self.cmr,
-            creation_txid,
-        }
     }
 
     #[must_use]
@@ -328,9 +319,8 @@ fn tap_data_hash(data: &[u8]) -> sha256::Hash {
 mod tests {
     use std::collections::HashSet;
 
-    use elements::hashes::Hash as _;
+    use elements::AssetId;
     use elements::schnorr::TweakedPublicKey;
-    use elements::{AssetId, Txid};
     use simplex::provider::SimplicityNetwork;
 
     use super::*;
@@ -466,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn cmr_and_contract_identity_are_deterministic() {
+    fn cmr_is_deterministic() {
         let params = params();
         let first = CompiledBinaryMarket::new(params).expect("first compile");
         let second = CompiledBinaryMarket::new(params).expect("second compile");
@@ -478,15 +468,6 @@ mod tests {
                 0x5f, 0xea, 0x07, 0x45, 0x88, 0x51, 0xe0, 0x24, 0x64, 0x96, 0xfd, 0x31, 0x74, 0xd7,
                 0x34, 0x37, 0x93, 0x01,
             ]
-        );
-
-        let creation_txid = Txid::from_byte_array([0x77; 32]);
-        assert_eq!(
-            first.contract_id(creation_txid),
-            ContractId {
-                cmr: first.cmr(),
-                creation_txid,
-            }
         );
 
         let mut changed = params;

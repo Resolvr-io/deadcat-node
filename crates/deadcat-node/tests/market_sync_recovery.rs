@@ -18,7 +18,7 @@ use deadcat_node::sync::{SyncCoordinator, SyncOutcome};
 use deadcat_rpc::RecoveryFamily;
 use deadcat_types::{
     BinaryMarketParams, BinaryMarketState, ChainAnchor, ChainPosition, ContractId,
-    ContractSyncState, DeadcatOutPoint, LiquidNetwork, RecoveryHintLocation,
+    ContractSyncState, LiquidNetwork, RecoveryHintLocation,
 };
 use elements::confidential::{Asset, Nonce, Value};
 use elements::hashes::{Hash as _, HashEngine as _, sha256d};
@@ -104,15 +104,12 @@ impl ChainSource for MutableChain {
         Err(ChainSourceError::NotFound(txid.to_string()))
     }
 
-    async fn outspend(
-        &self,
-        outpoint: DeadcatOutPoint,
-    ) -> Result<Option<Outspend>, ChainSourceError> {
+    async fn outspend(&self, outpoint: OutPoint) -> Result<Option<Outspend>, ChainSourceError> {
         let blocks = self.blocks.lock().expect("chain lock");
         for (&height, block) in &*blocks {
             for (tx_index, transaction) in block.txdata.iter().enumerate() {
                 for (input_index, input) in transaction.input.iter().enumerate() {
-                    if DeadcatOutPoint::from(input.previous_output) == outpoint {
+                    if input.previous_output == outpoint {
                         return Ok(Some(Outspend {
                             spending_txid: transaction.txid(),
                             input_index: u32::try_from(input_index).map_err(|_| {
@@ -307,9 +304,8 @@ fn market_fixture(seed: u8, policy_asset: AssetId, pairs: u64) -> MarketFixture 
     let (creation, entropies) =
         creation_transaction(params, policy_asset, defining_outpoints(seed));
     let issuance = initial_issuance(params, &creation, entropies, pairs);
-    let contract_id = CompiledBinaryMarket::new(params)
-        .expect("compile market")
-        .contract_id(creation.txid());
+    CompiledBinaryMarket::new(params).expect("compile market");
+    let contract_id = ContractId::new(OutPoint::new(creation.txid(), 0));
     MarketFixture {
         params,
         creation,
@@ -415,7 +411,7 @@ fn assert_indexed_market(store: &Store, fixture: &MarketFixture, expected_tip: C
     );
     assert_eq!(record.outpoints.len(), 3);
     for vout in 0..3_u32 {
-        let outpoint = DeadcatOutPoint::new(fixture.issuance.txid(), vout);
+        let outpoint = OutPoint::new(fixture.issuance.txid(), vout);
         assert!(
             record
                 .outpoints
@@ -434,11 +430,11 @@ fn assert_indexed_market(store: &Store, fixture: &MarketFixture, expected_tip: C
     }
 
     let yes = store
-        .output(DeadcatOutPoint::new(fixture.issuance.txid(), 0))
+        .output(OutPoint::new(fixture.issuance.txid(), 0))
         .expect("read YES output")
         .expect("stored YES output");
     let no = store
-        .output(DeadcatOutPoint::new(fixture.issuance.txid(), 1))
+        .output(OutPoint::new(fixture.issuance.txid(), 1))
         .expect("read NO output")
         .expect("stored NO output");
     assert_eq!(
@@ -646,7 +642,7 @@ async fn full_chain_market_recovery_survives_restart_and_coordinator_reorgs() {
     );
     assert!(
         reopened
-            .output(DeadcatOutPoint::new(original.issuance.txid(), 0))
+            .output(OutPoint::new(original.issuance.txid(), 0))
             .expect("orphan output lookup")
             .is_none()
     );

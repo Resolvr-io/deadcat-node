@@ -18,9 +18,11 @@ use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 
 use super::*;
+use crate::registration::{verify_binary_market_creation, verify_maker_order_creation};
 use crate::store::{
     AssetBinding, AssetRelationKind, BlockDelta, ChainTxDelta, ContractParameters, ContractRecord,
-    ContractState, OrderBookEntry, ScriptBinding, Store, TrackedOutpoint, TransitionRecord,
+    ContractState, OrderBookEntry, RegistrationEvidence, ScriptBinding, Store, TrackedOutpoint,
+    TransitionRecord,
 };
 
 const VALID_XONLY: [u8; 32] = [
@@ -99,7 +101,10 @@ fn maker_creation(
         .enumerate()
         .map(|(index, params)| {
             let compiled = CompiledMakerOrder::new(*params).expect("compile maker");
-            let contract_id = compiled.contract_id(transaction.txid());
+            let output_index = u32::try_from(index).expect("vout");
+            let contract_id = ContractId::new(OutPoint::new(transaction.txid(), output_index));
+            let parent_market =
+                ContractId::new(OutPoint::new(Txid::from_byte_array([0x78; 32]), 0));
             ContractRecord {
                 contract_id,
                 kind: ContractKind::MakerOrderV1,
@@ -110,10 +115,7 @@ fn maker_creation(
                     total_filled_base: 0,
                 }),
                 sync_state: ContractSyncState::Ready { synced_through },
-                parent_market: Some(ContractId {
-                    cmr: [0x77; 32],
-                    creation_txid: Txid::from_byte_array([0x78; 32]),
-                }),
+                parent_market: Some(parent_market),
                 outcome_side: Some(OrderSide::Yes),
                 scripts: vec![ScriptBinding {
                     role: 0,
@@ -133,16 +135,10 @@ fn maker_creation(
                 ],
                 outpoints: vec![TrackedOutpoint {
                     role: 0,
-                    outpoint: DeadcatOutPoint::new(
-                        transaction.txid(),
-                        u32::try_from(index).expect("vout"),
-                    ),
+                    outpoint: OutPoint::new(transaction.txid(), output_index),
                 }],
                 order_book: Some(OrderBookEntry {
-                    market_id: ContractId {
-                        cmr: [0x77; 32],
-                        creation_txid: Txid::from_byte_array([0x78; 32]),
-                    },
+                    market_id: parent_market,
                     side: OrderSide::Yes,
                     direction: params.direction,
                     price: params.price,
@@ -155,12 +151,12 @@ fn maker_creation(
     (transaction, records)
 }
 
-fn cancellation(outpoints: impl IntoIterator<Item = DeadcatOutPoint>) -> Transaction {
+fn cancellation(outpoints: impl IntoIterator<Item = OutPoint>) -> Transaction {
     let input = outpoints
         .into_iter()
         .map(|outpoint| {
             let mut input = TxIn {
-                previous_output: outpoint.into(),
+                previous_output: outpoint,
                 ..TxIn::default()
             };
             input.witness.script_witness = vec![vec![1; 64]];
@@ -217,6 +213,7 @@ fn multi_contract_batch_is_atomic_and_fails_closed() {
             tx_index: 1,
         },
         prior_transactions: &prior,
+        retained_declarations: &[],
         mode: InterpretationMode::Canonical,
     };
 
@@ -261,7 +258,7 @@ fn same_block_overlay_uses_latest_state_and_transaction_output() {
             compiled.script_pubkey().clone(),
         )],
     };
-    let moved = DeadcatOutPoint::new(move_tx.txid(), 0);
+    let moved = OutPoint::new(move_tx.txid(), 0);
     let prior = vec![
         prior_creation(
             creation,
@@ -307,6 +304,7 @@ fn same_block_overlay_uses_latest_state_and_transaction_output() {
             tx_index: 2,
         },
         prior_transactions: &prior,
+        retained_declarations: &[],
         mode: InterpretationMode::Canonical,
     };
 
@@ -365,6 +363,7 @@ fn backfill_filters_non_targets_and_materializes_stored_outputs() {
             tx_index: 0,
         },
         prior_transactions: &[],
+        retained_declarations: &[],
         mode: InterpretationMode::Backfill {
             contract_ids: &targets,
         },
@@ -394,7 +393,7 @@ fn issuance_input(byte: u8, vout: u32) -> TxIn {
     }
 }
 
-fn standalone_market(policy_asset: AssetId) -> Transaction {
+fn standalone_market_with_params(policy_asset: AssetId) -> (Transaction, BinaryMarketParams) {
     let yes_input = issuance_input(0x41, 3);
     let no_input = issuance_input(0x42, 4);
     let ids = derive_issuance_assets(yes_input.previous_output, no_input.previous_output);
@@ -424,7 +423,7 @@ fn standalone_market(policy_asset: AssetId) -> Transaction {
     }
     .encode()
     .expect("hint");
-    Transaction {
+    let transaction = Transaction {
         version: 2,
         lock_time: LockTime::ZERO,
         input: vec![yes_input, no_input],
@@ -451,7 +450,12 @@ fn standalone_market(policy_asset: AssetId) -> Transaction {
             },
             recovery_txout(policy_asset, &hint).expect("hint output"),
         ],
-    }
+    };
+    (transaction, params)
+}
+
+fn standalone_market(policy_asset: AssetId) -> Transaction {
+    standalone_market_with_params(policy_asset).0
 }
 
 #[test]
@@ -468,6 +472,7 @@ fn canonical_hint_creates_ready_market_but_composed_shape_is_registration_only()
             tx_index: 4,
         },
         prior_transactions: &[],
+        retained_declarations: &[],
         mode: InterpretationMode::Canonical,
     };
     let transaction = standalone_market(policy);
@@ -503,6 +508,7 @@ fn canonical_hint_creates_ready_market_but_composed_shape_is_registration_only()
             tx_index: 5,
         },
         prior_transactions: &prior,
+        retained_declarations: &[],
         mode: InterpretationMode::Canonical,
     };
     // Spending only the secondary RT leg still touches the market. The
@@ -525,6 +531,256 @@ fn canonical_hint_creates_ready_market_but_composed_shape_is_registration_only()
     assert!(interpreted.created_contracts.is_empty());
     assert_eq!(interpreted.recovery_hints.len(), 1);
     assert!(interpreted.recovery_hints[0].associated_contract.is_none());
+}
+
+#[test]
+fn destructive_replay_revalidates_retained_market_and_identical_same_tx_makers() {
+    let (directory, store) = empty_store();
+    let genesis = anchor(0, 0x01);
+    let policy = asset(0xa2);
+    store
+        .bind_chain(crate::store::ChainIdentity {
+            network: LiquidNetwork::ElementsRegtest,
+            genesis_hash: genesis.hash,
+            policy_asset: policy,
+        })
+        .expect("bind chain");
+
+    let (mut creation, market_params) = standalone_market_with_params(policy);
+    let order_params = MakerOrderParams {
+        base_asset_id: market_params.yes_token_asset_id,
+        quote_asset_id: market_params.collateral_asset_id,
+        price: 100,
+        min_active_base: 10,
+        direction: OrderDirection::SellQuote,
+        maker_receive_spk_hash: [0x43; 32],
+        maker_pubkey: VALID_XONLY,
+    };
+    let compiled_order = CompiledMakerOrder::new(order_params).expect("compile order");
+    let order_output = explicit_txout(
+        order_params.quote_asset_id,
+        2_000,
+        compiled_order.script_pubkey().clone(),
+    );
+    // Move the canonical YES RT away from vout 0. The complete declaration
+    // remains verifiable, but fixed-shape hint discovery alone must not recover
+    // this composed market during rebuild.
+    creation.output.swap(0, 1);
+    creation.output.push(order_output.clone());
+    creation.output.push(order_output);
+
+    let old_anchor = anchor(1, 0x02);
+    let old_position = ChainPosition {
+        block_height: 1,
+        tx_index: 0,
+    };
+    store
+        .apply_block(&BlockDelta {
+            anchor: old_anchor,
+            prev_block_hash: genesis.hash,
+            ordered_txids: vec![creation.txid()],
+            relevant_transactions: Vec::new(),
+            recovery_hints: Vec::new(),
+        })
+        .expect("index original creation block");
+    let market_id = ContractId::new(OutPoint::new(creation.txid(), 1));
+    let first_order_id = ContractId::new(OutPoint::new(creation.txid(), 3));
+    let second_order_id = ContractId::new(OutPoint::new(creation.txid(), 4));
+    let market = verify_binary_market_creation(
+        &creation,
+        old_position,
+        old_anchor,
+        LiquidNetwork::ElementsRegtest,
+        policy,
+        Some(market_params),
+        Some(market_id),
+    )
+    .expect("verify market");
+    let first_order = verify_maker_order_creation(
+        &creation,
+        old_position,
+        old_anchor,
+        first_order_id,
+        &market.record,
+        OrderSide::Yes,
+        order_params,
+    )
+    .expect("verify first order");
+    let second_order = verify_maker_order_creation(
+        &creation,
+        old_position,
+        old_anchor,
+        second_order_id,
+        &market.record,
+        OrderSide::Yes,
+        order_params,
+    )
+    .expect("verify second order");
+    let shared_creation = Arc::new(creation.clone());
+    store
+        .register_contracts(&[
+            (
+                market.record,
+                RegistrationEvidence {
+                    anchor: old_anchor,
+                    transaction: Arc::clone(&shared_creation),
+                    associated_hint: None,
+                },
+            ),
+            (
+                first_order.record,
+                RegistrationEvidence {
+                    anchor: old_anchor,
+                    transaction: Arc::clone(&shared_creation),
+                    associated_hint: None,
+                },
+            ),
+            (
+                second_order.record,
+                RegistrationEvidence {
+                    anchor: old_anchor,
+                    transaction: shared_creation,
+                    associated_hint: None,
+                },
+            ),
+        ])
+        .expect("retain composed declarations");
+    assert_eq!(
+        store
+            .retained_declarations_for_txid(creation.txid())
+            .expect("retained declarations")
+            .iter()
+            .map(|declaration| declaration.contract_id)
+            .collect::<Vec<_>>(),
+        vec![market_id, first_order_id, second_order_id]
+    );
+
+    store.invalidate_for_rebuild().expect("invalidate");
+    store
+        .reset_for_rebuild(genesis)
+        .expect("genesis rebuild reset");
+    let replacement_one = anchor(1, 0x12);
+    let unrelated = Transaction {
+        version: 2,
+        lock_time: LockTime::from_consensus(0x12),
+        input: Vec::new(),
+        output: vec![TxOut::new_fee(1, policy)],
+    };
+    store
+        .apply_block(&BlockDelta {
+            anchor: replacement_one,
+            prev_block_hash: genesis.hash,
+            ordered_txids: vec![unrelated.txid()],
+            relevant_transactions: Vec::new(),
+            recovery_hints: Vec::new(),
+        })
+        .expect("replacement block one");
+
+    let replacement_two = anchor(2, 0x22);
+    let new_position = ChainPosition {
+        block_height: 2,
+        tx_index: 0,
+    };
+    let interpreter = DeadcatInterpreter::new(LiquidNetwork::ElementsRegtest, policy);
+    let retained = store
+        .retained_declarations_for_txid(creation.txid())
+        .expect("retained declarations for replay");
+    let maker_only = retained
+        .iter()
+        .copied()
+        .filter(|declaration| {
+            matches!(
+                declaration.descriptor,
+                deadcat_types::ContractDescriptor::MakerOrderV1 { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    let dormant = interpreter
+        .interpret_transaction(
+            &InterpretationContext {
+                store: &store,
+                anchor: replacement_two,
+                position: new_position,
+                prior_transactions: &[],
+                retained_declarations: &maker_only,
+                mode: InterpretationMode::Canonical,
+            },
+            &creation,
+        )
+        .expect("missing retained parent leaves maker declarations dormant");
+    assert!(dormant.created_contracts.is_empty());
+
+    let interpreted = interpreter
+        .interpret_transaction(
+            &InterpretationContext {
+                store: &store,
+                anchor: replacement_two,
+                position: new_position,
+                prior_transactions: &[],
+                retained_declarations: &retained,
+                mode: InterpretationMode::Canonical,
+            },
+            &creation,
+        )
+        .expect("revalidate retained declarations");
+    assert_eq!(
+        interpreted
+            .created_contracts
+            .iter()
+            .map(|record| record.contract_id)
+            .collect::<Vec<_>>(),
+        vec![market_id, first_order_id, second_order_id]
+    );
+    assert!(
+        interpreted
+            .created_contracts
+            .iter()
+            .all(|record| record.creation_position == new_position)
+    );
+
+    store
+        .apply_block(&BlockDelta {
+            anchor: replacement_two,
+            prev_block_hash: replacement_one.hash,
+            ordered_txids: vec![creation.txid()],
+            relevant_transactions: vec![prior_creation(
+                creation,
+                interpreted.created_contracts,
+                new_position,
+                replacement_two.hash,
+            )],
+            recovery_hints: Vec::new(),
+        })
+        .expect("materialize replayed declarations");
+    for contract_id in [market_id, first_order_id, second_order_id] {
+        let record = store
+            .contract(contract_id)
+            .expect("contract lookup")
+            .expect("replayed contract");
+        assert_eq!(record.creation_position, new_position);
+        assert!(matches!(
+            record.sync_state,
+            ContractSyncState::Ready { synced_through } if synced_through == replacement_two
+        ));
+    }
+
+    let assert_identical_orders_are_indexed = |store: &Store| {
+        let mut actual = store
+            .ready_orders(market_id, None, None, None, 10)
+            .expect("ready orders")
+            .items
+            .into_iter()
+            .map(|order| order.contract.contract_id)
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        let mut expected = vec![first_order_id, second_order_id];
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+    };
+    assert_identical_orders_are_indexed(&store);
+    drop(store);
+    let reopened = Store::open(directory.path().join("deadcat.redb")).expect("reopen store");
+    assert_identical_orders_are_indexed(&reopened);
 }
 
 #[test]
@@ -606,6 +862,7 @@ fn prior_spends_and_invalid_witnesses_fail_closed() {
             tx_index: 2,
         },
         prior_transactions: &prior,
+        retained_declarations: &[],
         mode: InterpretationMode::Canonical,
     };
     let interpreter = DeadcatInterpreter::new(LiquidNetwork::ElementsRegtest, asset(0xaa));

@@ -5,7 +5,7 @@ release. Historical Deadcat SDK sources and design documents are reference
 material only when they agree with this file and the accepted ADRs.
 
 - Status: Proposed for byte-vector review
-- Date: 2026-07-13
+- Date: 2026-07-15
 
 ## 1. Common conventions
 
@@ -47,18 +47,123 @@ are authoritative for cross-language implementations.
 ### Contract identity
 
 ```rust
-pub struct ContractId {
-    pub cmr: [u8; 32],
-    pub creation_txid: Txid,
-}
+#[repr(transparent)]
+pub struct ContractId(elements::OutPoint);
 ```
 
-Stable fixed-key encoding is `cmr[32] || creation_txid[32]` under the common
-hash-byte convention above. CMR identifies the program and parameters;
-creation txid identifies the instance.
+`ContractId` identifies one on-chain contract instance by its canonical
+creation-anchor output. Its stable fixed-key encoding is
+`txid_internal_bytes[32] || vout_be_u32[4]` under the common hash-byte
+convention above. Its strict human-readable wire encoding is the object
+`{"txid": "...", "vout": n}`; the ordinary `elements::OutPoint` string serde
+is not inherited.
+
+The family-specific creation anchor is:
+
+- binary market: the initial dormant YES RT output, whose exact side-A
+  commitment and compiled `DormantYesRt` script are verified along with the NO
+  leg and the complete creation invariant; and
+- maker order: the initial output holding the order at its compiled maker-order
+  script.
+
+For the official standalone market layout the market anchor is vout 0. A
+validated custom composition may place it elsewhere. The maker anchor is the
+exact declared output index, so one transaction can create multiple distinct
+orders, including byte-identical outputs.
+
+The ID remains stable as later transactions move or terminate the contract. It
+does not commit to the descriptor and does not certify that the output exists
+or is a valid Deadcat contract. That proof belongs to declaration ingestion and
+chain evidence. Simplicity CMRs are deterministically derived from the stored
+parameters; scripts and creation evidence remain independently verifiable
+contract data, not instance identity.
+
+Ordinary transaction inputs, outputs, and live contract state use
+`elements::OutPoint` directly. The protocol does not define a duplicate generic
+outpoint wrapper: rust-elements is the native Liquid transaction model,
+`bitcoin::OutPoint` carries the wrong nominal txid type, and an LWK-specific
+type would couple the protocol layer to wallet software. `ContractId` is a
+newtype only because a creation anchor has stronger domain meaning than an
+arbitrary outpoint.
 
 The binary oracle `market_id` defined below is a different digest and must not
 be used as `ContractId`.
+
+### Contract declarations and packages
+
+Identity, semantics, and portable ingestion are separate types:
+
+```rust
+pub enum ContractDescriptor {
+    BinaryMarketV1 {
+        params: BinaryMarketParams,
+    },
+    MakerOrderV1 {
+        parent_market: ContractId,
+        side: OrderSide,
+        params: MakerOrderParams,
+    },
+}
+
+pub struct ContractDeclaration {
+    pub contract_id: ContractId,
+    pub descriptor: ContractDescriptor,
+}
+
+pub struct ContractPackage {
+    pub format_version: u16,
+    pub chain: ChainIdentity, // LiquidNetwork plus exact genesis BlockHash
+    pub roots: Vec<ContractId>,
+    pub declarations: Vec<ContractDeclaration>,
+}
+```
+
+A descriptor contains the complete public semantics required to compile one
+supported contract. A declaration is an untrusted claim that its descriptor is
+instantiated at its `ContractId`. A package is the portable registration unit:
+roots name what the sender wants ingested, while additional declarations may
+carry the roots' parent dependency closure. None of these objects attests to
+chain inclusion or validity.
+
+Package format v1 has these structural rules:
+
+- `format_version` is exactly 1;
+- `chain.network` and `chain.genesis_hash` must exactly match the receiving
+  node;
+- there are 1 through 16 unique roots and 1 through 64 unique declarations,
+  with every root declared;
+- a declaration cannot depend on itself, and every included declaration must
+  be reachable from a root through included parent edges, so unrelated payload
+  padding is rejected; and
+- a referenced parent must either be included in the package or already be a
+  verified contract in the receiving node. An included maker parent must be a
+  binary market.
+
+Declaration order has no authority over verification. The verifier resolves
+parents before children, fetches each shared creation transaction at most once,
+and checks that a child was not created before its parent. Registration receipts
+nevertheless preserve the sender's order: `roots` matches package root order and
+`contracts` matches declaration order. It retrieves confirmed creation
+transactions and status from its own configured chain source. The cumulative
+consensus-encoded size of unique creation transactions is limited to 16 MiB per
+package, matching the Iroh RPC frame ceiling and bounding server-side evidence
+work that is not present in the inbound request. The verifier recompiles the
+canonical family locally, checks the nominated anchor and all family-specific
+creation invariants, and registers verified contracts as catching up. The node
+then replays their lineage to its indexed tip. Supplied current outpoints or raw
+transactions, if supported later as acceleration hints, never replace that
+retrieval and verification.
+
+Only after every declaration succeeds does one redb write transaction register
+the complete package. One invalid declaration, dependency, chain identity, or
+conflicting existing record rejects the package without partial insertion. An
+identical retry is idempotent. The same transaction also retains a normalized
+copy of every verified declaration as explicit watch intent. Chain-derived
+state is still disposable: after a destructive rebuild, genesis replay matches
+those declarations by creation transaction, verifies markets before maker
+children against the exact canonical transactions, and rematerializes only the
+claims that remain valid. Missing or invalid claims stay dormant rather than
+blocking unrelated synchronization.
 
 ### Recovery outputs
 
@@ -74,14 +179,16 @@ proofs: empty
 ```
 
 A composed transaction may contain other OP_RETURN outputs and multiple
-recognized Deadcat hints. Parsers treat each hint independently and reject only
-an ambiguous or duplicate association with the contract being registered.
-Unknown tags are ignored after their raw occurrence is reported.
+recognized Deadcat hints. Parsers treat each hint independently. Missing,
+mismatched, duplicate, already-associated, or otherwise ambiguous hints prevent
+automatic association but never invalidate a complete declaration that passes
+the authoritative chain and covenant checks. Unknown tags are ignored after
+their raw occurrence is reported.
 
 Hints are a discovery and recovery convention, not a covenant spend rule. A
-manual registration without a hint may still be accepted when full canonical
-parameters, issuance relationships, and one unambiguous creation output are
-verified from chain data; the node marks it non-recoverable by the v1 hint
+declaration without a hint may still be accepted when its complete canonical
+descriptor, issuance relationships, and unambiguous nominated creation anchor
+are verified from chain data; the node marks it non-recoverable by the v1 hint
 scheme. Token and RT burn outputs use the separate bare script `OP_RETURN` with
 no pushed payload.
 
@@ -462,9 +569,9 @@ Automatic global discovery recognizes the official standalone shape with the
 fixed defining-input and RT-output positions above. This keeps the scan linear
 and prevents transactions containing many unrelated issuances from forcing a
 combinatorial candidate search. A composed custom creation remains eligible for
-manual registration when supplied full parameters identify one unique issuance
-and dormant-output association. A random OP_RETURN that happens to share the
-tag is discarded by full compile-and-match verification.
+package registration when its complete declaration identifies one unique
+issuance and dormant-output association. A random OP_RETURN that happens to
+share the tag is discarded by full compile-and-match verification.
 
 This recovers cryptographic market parameters and chain state, not the
 human-readable question, category, or other social metadata. Markets have a
@@ -683,9 +790,9 @@ masked_order_index = order_index XOR mask_u16
 ```
 
 The order hint is an owner mnemonic-recovery aid. A public node cannot unmask
-the index or derive maker-specific params. Public discovery supplies the full
-params through Nostr or manual registration; the node verifies them by
-recompiling and matching the creation output.
+the index or derive maker-specific params. Nostr or manual registration supplies
+the full declaration in a package; the node verifies it by recompiling and
+matching the nominated creation output.
 
 For chain-only owner recovery, the client may either start with creation
 transactions found by its normal wallet rescan or ask a node for all
@@ -696,13 +803,14 @@ script matches the unique creation output. XOR unmasking produces some `u16`
 for every foreign hint; the script match is therefore the ownership test. The
 mnemonic or derived xprv is never sent to the node.
 
-At minimum, public registration supplies the parent market creation txid, side,
-direction, price, minimum, maker public key, maker receive script hash, and
-creation txid. The creation transaction must contain one unique canonical order
-output matching the compiled script. The node derives its current outpoint only
-by replaying that output's complete spend lineage; an announced live outpoint is
-at most an acceleration hint and is never trusted because anyone can create a
-decoy output at a public script.
+Public registration supplies a `ContractPackage`. A maker-order descriptor
+contains the full parent `ContractId`, side, direction, price, minimum, maker
+public key, and maker receive script hash; its declaration nominates the exact
+creation output. That output must be the canonical explicit order state matching
+the compiled script, asset, amount, and economics. The node derives its current
+outpoint only by replaying that anchor's complete spend lineage; an announced
+live outpoint is at most an acceleration hint and is never trusted because
+anyone can create a decoy output at a public script.
 
 ### Recovery hint
 
@@ -726,6 +834,13 @@ Bytes 39-42  min_active_base, u32 big-endian
 ```
 
 The complete direct-push script is 45 bytes. No trailing bytes are accepted.
+The parent txid in this compact mnemonic-recovery hint is a locator, not a
+`ContractId`; validation derives and verifies the market's dormant-YES anchor
+from its creation transaction. Canonical package references always use the full
+parent `ContractId`. A node never globally associates a maker hint with a
+public contract record: the hint omits the maker key, receive script, exact
+output, and parent vout, so ownership is established only by client-side key
+derivation followed by an exact compiled-script match.
 
 ## 4. Confidentiality matrix
 
@@ -765,7 +880,8 @@ Machine-readable fixtures are committed before a contract is considered stable:
 12. key-spend cancellation with and without annex;
 13. a custom composed market-plus-multiple-orders transaction and its atomic
     transition batch;
-14. ContractId/redb key encodings and apply/rollback fixtures; and
+14. anchor-based ContractId/wire/redb key encodings, multi-contract same-tx
+    identity, package validation/atomicity, and apply/rollback fixtures; and
 15. `hash_to_scalar` modular-reduction cases generated from fixed artificial
     inputs.
 

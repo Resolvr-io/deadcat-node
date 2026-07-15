@@ -8,9 +8,10 @@ use deadcat_iroh::{ClientId, RequestHandler, Subscription, SubscriptionItem};
 use deadcat_rpc::{
     AssetLookup, AssetRelation, AssetRelationKind, BackendKind, Capability, ContractHistoryPage,
     ContractPage, ContractView, Event, EventEnvelope, EventFilter, FeeRateEstimate, HistoryEntry,
-    MarketSnapshot, NodeInfo, OrderBookLevel, OrderBookSnapshot, PageRequest, RecoveryHintPage,
-    RecoveryHintRecord, RegistrationReceipt, Request, Response, RouteLeg, RouteSuggestion,
-    RpcError, RpcErrorCode, SnapshotCursor, SnapshotMetadata, SubscriptionEnd, TransactionEvidence,
+    MarketSnapshot, NodeInfo, OrderBookLevel, OrderBookSnapshot, PackageRegistrationReceipt,
+    PageRequest, RecoveryHintPage, RecoveryHintRecord, RegistrationReceipt, Request, Response,
+    RouteLeg, RouteSuggestion, RpcError, RpcErrorCode, SnapshotCursor, SnapshotMetadata,
+    SubscriptionEnd, TransactionEvidence,
 };
 use deadcat_types::{
     ChainAnchor, ChainPosition, ContractKind, ContractSyncState, DiscoveryCoverage, LiquidNetwork,
@@ -100,8 +101,8 @@ where
     async fn handle_request(&self, request: Request) -> Result<Response, RpcError> {
         match request {
             Request::GetInfo => self.get_info().await,
-            Request::RegisterContract {
-                candidate,
+            Request::RegisterContractPackage {
+                package,
                 bearer_token,
             } => {
                 self.authorize_registration(bearer_token.as_deref())?;
@@ -117,17 +118,24 @@ where
                     self.source.as_ref(),
                     self.store.as_ref(),
                     self.config.network,
+                    self.config.genesis_hash,
                     self.config.policy_asset,
                 );
-                let (verified, inserted) = verifier
-                    .verify_and_register(candidate)
+                let registrations = verifier
+                    .verify_and_register_package(&package)
                     .await
                     .map_err(registration_error)?;
                 Ok(Response::RegistrationAccepted {
-                    registration: RegistrationReceipt {
-                        contract_id: verified.record.contract_id,
-                        sync_state: verified.record.sync_state,
-                        already_registered: !inserted,
+                    registration: PackageRegistrationReceipt {
+                        roots: package.roots,
+                        contracts: registrations
+                            .into_iter()
+                            .map(|(verified, inserted)| RegistrationReceipt {
+                                contract_id: verified.record.contract_id,
+                                sync_state: verified.record.sync_state,
+                                already_registered: !inserted,
+                            })
+                            .collect(),
                     },
                 })
             }
@@ -245,21 +253,18 @@ where
                     .map_err(chain_error)?;
                 Ok(Response::BroadcastAccepted { txid })
             }
-            Request::ListRecoveryHints {
-                family,
-                after,
-                limit,
-            } => {
-                validate_limit(limit)?;
-                let page = self
+            Request::ListRecoveryHints { family, page } => {
+                validate_limit(page.limit)?;
+                let cursor = page.cursor.as_ref().map(store_snapshot_cursor);
+                let result = self
                     .store
-                    .scan_recovery_hints(family, after, usize::from(limit))
+                    .scan_recovery_hints(family, cursor.as_ref(), usize::from(page.limit))
                     .map_err(store_error)?;
                 Ok(Response::RecoveryHints {
                     page: RecoveryHintPage {
-                        as_of: page.as_of,
-                        hints: page
-                            .hints
+                        snapshot: snapshot_metadata(result.snapshot),
+                        hints: result
+                            .items
                             .into_iter()
                             .map(|hint| RecoveryHintRecord {
                                 location: hint.location,
@@ -269,7 +274,7 @@ where
                                 associated_contract: hint.associated_contract,
                             })
                             .collect(),
-                        next: page.next,
+                        next: result.next.map(rpc_snapshot_cursor),
                     },
                 })
             }
@@ -305,6 +310,7 @@ where
                                 tx_index: 0,
                             },
                             prior_transactions: &[],
+                            retained_declarations: &[],
                             mode: InterpretationMode::Canonical,
                         },
                         &transaction,
@@ -362,7 +368,7 @@ where
                 BackendKind::ElementsRpc => Capability::ElementsRpc,
                 BackendKind::Esplora => Capability::Esplora,
             },
-            Capability::RegisterContract,
+            Capability::RegisterContractPackage,
             Capability::BroadcastSignedTransaction,
             Capability::EvidenceQueries,
             Capability::DurableSubscriptions,
@@ -798,6 +804,7 @@ fn store_snapshot_cursor(cursor: &SnapshotCursor) -> StoreSnapshotCursor {
     StoreSnapshotCursor {
         as_of: cursor.as_of,
         event_high_watermark: cursor.event_high_watermark,
+        scope: cursor.scope,
         after_key: cursor.after_key.clone(),
     }
 }
@@ -806,6 +813,7 @@ fn rpc_snapshot_cursor(cursor: StoreSnapshotCursor) -> SnapshotCursor {
     SnapshotCursor {
         as_of: cursor.as_of,
         event_high_watermark: cursor.event_high_watermark,
+        scope: cursor.scope,
         after_key: cursor.after_key,
     }
 }
@@ -829,7 +837,7 @@ const fn asset_relation_kind(kind: StoreAssetRelationKind) -> AssetRelationKind 
     }
 }
 
-fn order_book_ask_key(level: &OrderBookLevel) -> (u8, u32, ChainPosition, [u8; 64]) {
+fn order_book_ask_key(level: &OrderBookLevel) -> (u8, u32, ChainPosition, [u8; 36]) {
     (
         side_byte(level.side),
         level.price,
@@ -838,7 +846,7 @@ fn order_book_ask_key(level: &OrderBookLevel) -> (u8, u32, ChainPosition, [u8; 6
     )
 }
 
-fn order_book_bid_key(level: &OrderBookLevel) -> (u8, Reverse<u32>, ChainPosition, [u8; 64]) {
+fn order_book_bid_key(level: &OrderBookLevel) -> (u8, Reverse<u32>, ChainPosition, [u8; 36]) {
     (
         side_byte(level.side),
         Reverse(level.price),
@@ -894,7 +902,6 @@ fn contract_view(record: ContractRecord) -> ContractView {
         contract_id: record.contract_id,
         kind: record.kind,
         sync_state: record.sync_state,
-        creation_txid: record.contract_id.creation_txid,
         creation_position: record.creation_position,
         parameters,
         state,
@@ -1028,9 +1035,9 @@ fn store_error(error: StoreError) -> RpcError {
             RpcErrorCode::StaleCursor
         }
         StoreError::RebuildRequired => RpcErrorCode::RescanRequired,
-        StoreError::StaleSnapshotCursor { .. } | StoreError::InvalidSnapshotKey { .. } => {
-            RpcErrorCode::SnapshotInvalidated
-        }
+        StoreError::StaleSnapshotCursor { .. }
+        | StoreError::InvalidSnapshotKey { .. }
+        | StoreError::SnapshotScopeMismatch { .. } => RpcErrorCode::SnapshotInvalidated,
         StoreError::ContractNotFound(_) | StoreError::MaterializedMarketNotFound(_) => {
             RpcErrorCode::NotFound
         }
@@ -1059,14 +1066,21 @@ fn registration_error(error: RegistrationError) -> RpcError {
             StoreError::RebuildRequired => RpcErrorCode::RescanRequired,
             StoreError::ContractNotFound(_) => RpcErrorCode::NotFound,
             StoreError::ForkConflict { .. } => RpcErrorCode::ForkConflict,
+            StoreError::TipNotInitialized => RpcErrorCode::NotSynced,
+            StoreError::InvalidContract(_)
+            | StoreError::ContractAlreadyExists(_)
+            | StoreError::InvalidRegistrationEvidence(_)
+            | StoreError::RegistrationTransactionConflict(_)
+            | StoreError::OutpointAlreadyOwned { .. } => RpcErrorCode::InvalidRegistration,
             _ => RpcErrorCode::BackendUnavailable,
         },
         RegistrationError::ParentMarketNotFound => RpcErrorCode::NotFound,
         RegistrationError::UnconfirmedCreation
+        | RegistrationError::WrongChain
+        | RegistrationError::InvalidPackage(_)
         | RegistrationError::ParentIsNotMarket
         | RegistrationError::Compilation(_)
-        | RegistrationError::InvalidCreation(_)
-        | RegistrationError::AmbiguousRecoveryHint => RpcErrorCode::InvalidRegistration,
+        | RegistrationError::InvalidCreation(_) => RpcErrorCode::InvalidRegistration,
     };
     RpcError::new(code, message)
 }
@@ -1091,10 +1105,10 @@ mod tests {
         use elements::hashes::Hash as _;
 
         let level = |side, price, tx_byte| OrderBookLevel {
-            contract_id: deadcat_types::ContractId {
-                cmr: [tx_byte; 32],
-                creation_txid: elements::Txid::from_byte_array([tx_byte; 32]),
-            },
+            contract_id: deadcat_types::ContractId::new(elements::OutPoint::new(
+                elements::Txid::from_byte_array([tx_byte; 32]),
+                u32::from(tx_byte),
+            )),
             side,
             direction: deadcat_types::OrderDirection::SellBase,
             price,
@@ -1108,5 +1122,13 @@ mod tests {
         let high = level(deadcat_types::OrderSide::Yes, 9, 2);
         assert!(order_book_ask_key(&low) < order_book_ask_key(&high));
         assert!(order_book_bid_key(&high) < order_book_bid_key(&low));
+    }
+
+    #[test]
+    fn registration_store_conflicts_are_reported_as_invalid_registration() {
+        let error = registration_error(RegistrationError::Store(
+            StoreError::InvalidRegistrationEvidence("conflict".to_owned()),
+        ));
+        assert_eq!(error.code, RpcErrorCode::InvalidRegistration);
     }
 }

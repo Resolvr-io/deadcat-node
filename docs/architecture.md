@@ -63,7 +63,8 @@ The official client never compiles arbitrary SimplicityHL supplied by a node.
 
 The node owns:
 
-- candidate discovery from read-only Nostr and manual registration;
+- hint discovery plus ingestion of untrusted declarations and packages from
+  read-only Nostr and manual registration;
 - canonical contract recompilation and chain verification;
 - complete-block, transaction-ordered ingestion;
 - materialized current state, indexes, raw transition evidence, and history;
@@ -71,9 +72,10 @@ The node owns:
 - sync/readiness reporting; and
 - optional fee estimation, route suggestions, and signed-transaction relay.
 
-The node has no wallet RPC. In particular it does not accept descriptors,
-wallet scripts, unblinded wallet inputs, blinding factors, or unsigned PSET
-construction requests.
+The node has no wallet RPC. In particular it does not accept wallet
+descriptors, wallet scripts, unblinded wallet inputs, blinding factors, or
+unsigned PSET construction requests. A Deadcat `ContractDescriptor` is public
+contract semantics for chain verification, not a wallet descriptor.
 
 ## Evidence flow
 
@@ -93,7 +95,46 @@ A client can re-fetch raw transactions, compile the relevant canonical
 contract, and replay the transition sequence. This detects fabricated derived
 state and contract-inconsistent evidence. Against a single remote node it does
 not establish that the supplied chain view is canonical, current, or complete,
-so clients may compare another node or a local Elements backend.
+so clients may compare another node or a local Elements backend. That
+independent comparison authenticates the complete consensus transaction at its
+reported block position, including input and output witnesses: an Elements
+`txid` excludes witness data, while Deadcat transition interpretation depends on
+the Simplicity/Taproot witness.
+
+## Identity and portable ingestion
+
+These types have intentionally separate responsibilities:
+
+```text
+ContractId          exact creation-anchor outpoint; stable instance identity
+ContractDescriptor  complete public semantics needed to compile a family
+ContractDeclaration untrusted ContractId-plus-descriptor claim
+ContractPackage     chain-bound roots plus declarations/dependencies
+```
+
+`ContractId` is a nominal newtype around `elements::OutPoint`, not a semantic
+hash. A market uses its initial dormant YES RT output as its anchor; a maker
+order uses its initial order output. The nominated output index distinguishes
+multiple or identical contracts created in one transaction. A CMR identifies a
+Simplicity program commitment, not an instance: it omits off-leaf Taproot data
+such as the maker cancellation key and cannot distinguish identical outputs.
+Conversely, an anchor alone says nothing about the alleged contract semantics.
+The declaration supplies those semantics, and canonical chain verification
+proves whether the claim is true.
+
+Ordinary UTXO references use `elements::OutPoint` throughout the internal chain
+and transaction APIs. `ContractId` exists only to prevent confusing an
+arbitrary current/wallet outpoint with a canonical creation anchor. Explicit
+wire and redb codecs preserve protocol stability without introducing a second
+generic project-specific outpoint, converting through Bitcoin's distinct txid
+type, or coupling the protocol to LWK.
+
+Package format v1 binds declarations to the exact Liquid network and genesis,
+names one through 16 declared roots, and carries at most 64 declarations. It
+rejects duplicate roots/IDs, self-dependencies, missing root declarations, and
+declarations unrelated to a root. A maker's parent market must be included in
+the dependency closure or already verified by the node; package order is not
+trusted. These bounds apply before expensive chain work.
 
 ## Chain sources
 
@@ -120,15 +161,41 @@ has no query for all OP_RETURNs matching a prefix, so a global scan is expensive
 
 ## Discovery
 
-Nostr events and manual RPC calls are advisory locators. Registration performs:
+Nostr events and manual RPC calls carry untrusted `ContractPackage` values.
+Registration performs:
 
-1. canonical field and version validation;
-2. raw creation-transaction retrieval;
-3. parent-market verification for child contracts;
-4. contract compilation and script matching;
-5. asset/issuance relationship validation; and
-6. one atomic store transaction for metadata, scripts, indexes, and starting
-   outpoints.
+1. package format, bounds, exact network/genesis, roots, and dependency-graph
+   validation;
+2. confirmed raw creation-transaction retrieval from the node's own chain
+   source, with each shared transaction fetched at most once;
+3. parent-market verification before child contracts, independent of supplied
+   declaration order;
+4. canonical contract compilation and exact anchor/script matching;
+5. asset, issuance, value, and family-specific creation validation; and
+6. after all declarations pass, one atomic store transaction for every
+   contract's metadata, scripts, indexes, evidence, starting outpoints, and
+   normalized durable declaration.
+
+The sender is not an attesting authority. If any declaration fails, none of the
+package is registered; an identical retry is idempotent. Package roots identify
+the requested contracts, while included non-roots supply their dependency
+closure. A dependency omitted from the package must already be verified in the
+same node.
+
+Idempotence here describes state, not a zero-cost request. The alpha verifier
+still retrieves and checks evidence before recognizing an identical retry.
+Hosted public operators must enable the registration bearer token or enforce an
+equivalent edge rate limit. Per-peer admission, a process-wide weighted
+evidence budget, and a canonical stored-evidence fast path remain explicit
+availability hardening before a production release; this does not weaken the
+atomic or chain-verifiable registration boundary.
+
+Normalized declarations form a non-chain-derived watch registry. Materialized
+records and their live outpoints are still discarded on a destructive rebuild;
+the registry survives so a genesis replay can verify retained markets before
+their retained maker children against the exact replacement-branch
+transactions. A declaration that is absent or invalid on that branch remains
+dormant and cannot prevent unrelated canonical synchronization.
 
 For a binary market, step 5 is a critical solvency check. The node and client
 independently require each uniquely derived issuance to have a null initial

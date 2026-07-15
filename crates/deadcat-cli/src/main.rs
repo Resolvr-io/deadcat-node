@@ -7,11 +7,11 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use deadcat_iroh::{Client, ClientConfig, EndpointAddr, EndpointId};
 use deadcat_rpc::{
-    ContractCandidate, EventFilter, PageRequest, RecoveryFamily, Request, RequestEnvelope,
-    RequestId, SCHEMA_VERSION, SnapshotCursor,
+    EventFilter, PageRequest, RecoveryFamily, Request, RequestEnvelope, RequestId, SCHEMA_VERSION,
+    SnapshotCursor,
 };
 use deadcat_types::{
-    ChainPosition, ContractId, EventCursor, OrderDirection, OrderSide, RecoveryHintLocation,
+    ChainPosition, ContractId, ContractPackage, EventCursor, OrderDirection, OrderSide,
 };
 use elements::encode::deserialize;
 use elements::{AssetId, Transaction};
@@ -39,15 +39,15 @@ struct Cli {
 enum Command {
     /// Fetch node identity, chain position, discovery coverage, and capabilities.
     GetInfo,
-    /// Validate and register an on-chain contract candidate.
+    /// Validate and atomically register an on-chain contract package.
     Register {
         #[command(flatten)]
-        candidate: JsonSource,
+        package: JsonSource,
         /// Optional registration authorization token. No wallet secrets are sent.
         #[arg(long)]
         bearer_token: Option<String>,
     },
-    /// Fetch one contract by CMR and creation transaction ID.
+    /// Fetch one contract by its creation-anchor outpoint.
     GetContract {
         #[arg(value_parser = parse_contract_id)]
         contract_id: ContractId,
@@ -82,11 +82,8 @@ enum Command {
     ListHints {
         #[arg(long)]
         family: Option<FamilyArg>,
-        /// RecoveryHintLocation encoded as strict RPC JSON.
-        #[arg(long, value_name = "JSON", value_parser = parse_recovery_location)]
-        after_json: Option<RecoveryHintLocation>,
-        #[arg(long, default_value_t = DEFAULT_PAGE_LIMIT, value_parser = nonzero_u16)]
-        limit: u16,
+        #[command(flatten)]
+        page: PageArgs,
     },
     /// Fetch confirmed transition history for one contract.
     History {
@@ -308,10 +305,10 @@ fn command_request(command: &Command) -> Result<Request> {
     Ok(match command {
         Command::GetInfo => Request::GetInfo,
         Command::Register {
-            candidate,
+            package,
             bearer_token,
-        } => Request::RegisterContract {
-            candidate: candidate.parse::<ContractCandidate>("contract candidate")?,
+        } => Request::RegisterContractPackage {
+            package: package.parse::<ContractPackage>("contract package")?,
             bearer_token: bearer_token.clone(),
         },
         Command::GetContract { contract_id } => Request::GetContract {
@@ -337,14 +334,9 @@ fn command_request(command: &Command) -> Result<Request> {
         Command::OrderBook { market_id } => Request::GetOrderBook {
             market_id: *market_id,
         },
-        Command::ListHints {
-            family,
-            after_json,
-            limit,
-        } => Request::ListRecoveryHints {
+        Command::ListHints { family, page } => Request::ListRecoveryHints {
             family: family.map(Into::into),
-            after: *after_json,
-            limit: *limit,
+            page: page.clone().into_request(),
         },
         Command::History {
             contract_id,
@@ -459,17 +451,9 @@ fn read_source(
 }
 
 fn parse_contract_id(value: &str) -> std::result::Result<ContractId, String> {
-    let (cmr, creation_txid) = value
-        .split_once(':')
-        .ok_or_else(|| "expected CMR_HEX:CREATION_TXID".to_owned())?;
-    let cmr_bytes = hex::decode(cmr).map_err(|error| format!("invalid CMR hex: {error}"))?;
-    let cmr: [u8; 32] = cmr_bytes
-        .try_into()
-        .map_err(|_| "CMR must be exactly 32 bytes".to_owned())?;
-    let creation_txid = creation_txid
+    value
         .parse()
-        .map_err(|error| format!("invalid creation transaction ID: {error}"))?;
-    Ok(ContractId { cmr, creation_txid })
+        .map_err(|error| format!("expected TXID:VOUT contract ID: {error}"))
 }
 
 fn parse_chain_position(value: &str) -> std::result::Result<ChainPosition, String> {
@@ -496,10 +480,6 @@ fn parse_event_cursor(value: &str) -> std::result::Result<EventCursor, String> {
 
 fn parse_event_filter(value: &str) -> std::result::Result<EventFilter, String> {
     parse_json_arg(value, "event filter")
-}
-
-fn parse_recovery_location(value: &str) -> std::result::Result<RecoveryHintLocation, String> {
-    parse_json_arg(value, "recovery hint location")
 }
 
 fn parse_json_arg<T>(value: &str, description: &str) -> std::result::Result<T, String>
@@ -571,13 +551,9 @@ mod tests {
 
     #[test]
     fn compact_contract_and_position_parsers_are_exact() {
-        let cmr = "11".repeat(32);
-        let id = parse_contract_id(&format!("{cmr}:{TXID}")).expect("contract id");
-        assert_eq!(id.cmr, [0x11; 32]);
-        assert_eq!(
-            id.creation_txid,
-            elements::Txid::from_str(TXID).expect("txid")
-        );
+        let id = parse_contract_id(&format!("{TXID}:7")).expect("contract id");
+        assert_eq!(id.txid(), elements::Txid::from_str(TXID).expect("txid"));
+        assert_eq!(id.vout(), 7);
         assert_eq!(
             parse_chain_position("42:7").expect("position"),
             ChainPosition {
@@ -591,13 +567,12 @@ mod tests {
 
     #[test]
     fn typed_commands_build_rpc_requests() {
-        let cmr = "22".repeat(32);
         let cli = parse(&[
             "deadcat",
             "--endpoint-id",
             ENDPOINT_ID,
             "route",
-            &format!("{cmr}:{TXID}"),
+            &format!("{TXID}:2"),
             "--side",
             "yes",
             "--direction",
@@ -633,6 +608,79 @@ mod tests {
                 filter: EventFilter::Contracts { .. },
             }
         ));
+
+        let cli = parse(&[
+            "deadcat",
+            "--endpoint-id",
+            ENDPOINT_ID,
+            "list-hints",
+            "--family",
+            "maker-order-v1",
+            "--cursor-json",
+            r#"{"as_of":{"height":42,"hash":"1111111111111111111111111111111111111111111111111111111111111111"},"event_high_watermark":{"epoch":"000102030405060708090a0b0c0d0e0f","sequence":"9"},"scope":{"recovery_hints":{"family":"maker_order_v1"}},"after_key":"0000002a0000000300000004"}"#,
+            "--limit",
+            "3",
+        ]);
+        assert!(matches!(
+            command_request(&cli.command).expect("request"),
+            Request::ListRecoveryHints {
+                family: Some(RecoveryFamily::MakerOrderV1),
+                page: PageRequest {
+                    cursor: Some(SnapshotCursor { after_key, .. }),
+                    limit: 3,
+                },
+            } if after_key == hex::decode("0000002a0000000300000004").expect("hex")
+        ));
+    }
+
+    #[test]
+    fn register_json_and_file_sources_build_the_exact_package_request() {
+        let fixture: RequestEnvelope = serde_json::from_str(include_str!(
+            "../../../fixtures/wire-v1/register-contract-package-request.json"
+        ))
+        .expect("registration request fixture");
+        let Request::RegisterContractPackage { package, .. } = fixture.request else {
+            panic!("registration request fixture")
+        };
+        let package_json = serde_json::to_string(&package).expect("package JSON");
+
+        let inline = parse(&[
+            "deadcat",
+            "--endpoint-id",
+            ENDPOINT_ID,
+            "register",
+            "--json",
+            &package_json,
+            "--bearer-token",
+            "secret",
+        ]);
+        assert_eq!(
+            command_request(&inline.command).expect("inline registration request"),
+            Request::RegisterContractPackage {
+                package: package.clone(),
+                bearer_token: Some("secret".to_owned()),
+            }
+        );
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("package.json");
+        fs::write(&path, &package_json).expect("write package fixture");
+        let path = path.to_str().expect("UTF-8 temporary path");
+        let from_file = parse(&[
+            "deadcat",
+            "--endpoint-id",
+            ENDPOINT_ID,
+            "register",
+            "--file",
+            path,
+        ]);
+        assert_eq!(
+            command_request(&from_file.command).expect("file registration request"),
+            Request::RegisterContractPackage {
+                package,
+                bearer_token: None,
+            }
+        );
     }
 
     #[test]

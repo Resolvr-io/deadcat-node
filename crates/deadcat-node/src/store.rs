@@ -7,15 +7,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
-use deadcat_rpc::{RecoveryFamily, SyncStatus};
+use deadcat_rpc::{RecoveryFamily, SnapshotScope, SyncStatus};
 use deadcat_types::{
-    BinaryMarketParams, BinaryMarketState, ChainAnchor, ChainPosition, ContractId, ContractKind,
-    ContractSyncState, DeadcatOutPoint, EventCursor, LiquidNetwork, MakerOrderParams,
-    MakerOrderState, OrderDirection, OrderSide, RecoveryHintLocation,
+    BinaryMarketParams, BinaryMarketState, ChainAnchor, ChainPosition, ContractDeclaration,
+    ContractDescriptor, ContractId, ContractKind, ContractSyncState, EventCursor, LiquidNetwork,
+    MakerOrderParams, MakerOrderState, OrderDirection, OrderSide, RecoveryHintLocation,
 };
 use elements::hashes::Hash as _;
-use elements::{AssetId, BlockHash, Transaction, TxOut, Txid, encode};
+use elements::{AssetId, BlockHash, OutPoint, Transaction, TxOut, Txid, encode};
 use rand::RngCore as _;
 use redb::{
     Database, ReadTransaction, ReadableDatabase as _, ReadableTable, TableDefinition,
@@ -36,6 +37,11 @@ const BLOCKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("chain_checkp
 const TRANSACTIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("chain_transactions");
 const OUTPUTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("outputs");
 const CONTRACTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("contracts");
+/// Explicit, chain-verified watch intent. Unlike `CONTRACTS`, these normalized
+/// declarations survive rollback and destructive rebuild so canonical replay
+/// can independently revalidate and rematerialize them.
+const RETAINED_DECLARATIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("retained_contract_declarations");
 const OUTPOINT_OWNERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("outpoint_owners");
 const CONTRACT_OUTPOINTS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("contract_outpoints");
@@ -116,7 +122,7 @@ pub struct AssetBinding {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrackedOutpoint {
     pub role: u8,
-    pub outpoint: DeadcatOutPoint,
+    pub outpoint: OutPoint,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,7 +254,7 @@ pub struct StateUpdate {
     pub contract_id: ContractId,
     pub old_state: ContractState,
     pub new_state: ContractState,
-    pub spent_outpoints: Vec<DeadcatOutPoint>,
+    pub spent_outpoints: Vec<OutPoint>,
     pub new_outpoints: Vec<TrackedOutpoint>,
     /// Required for an active order, absent for markets and terminal orders.
     pub order_remaining_base: Option<u64>,
@@ -304,14 +310,14 @@ pub struct StoredTransaction {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredOutput {
     pub position: ChainPosition,
-    pub outpoint: DeadcatOutPoint,
+    pub outpoint: OutPoint,
     pub output: TxOut,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredOutputRef {
     position: ChainPosition,
-    outpoint: DeadcatOutPoint,
+    outpoint: OutPoint,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,7 +361,37 @@ pub struct BackfillProgress {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegistrationEvidence {
     pub anchor: ChainAnchor,
-    pub transaction: Transaction,
+    /// Shared canonical creation transaction. A composed package may register
+    /// several contracts from the same transaction without cloning its full
+    /// allocation once per declaration.
+    pub transaction: Arc<Transaction>,
+    /// Advisory recovery metadata only. Contract validity never depends on a
+    /// hint being present, unique, or unclaimed in the local hint index.
+    pub associated_hint: Option<RecoveryHintLocation>,
+}
+
+/// Canonical transaction evidence shared by every registration at one chain
+/// position. The serialized bytes and output references are checked and
+/// persisted once for the whole group, regardless of how many composed
+/// contracts the transaction creates.
+struct RegistrationTransactionGroup {
+    position: ChainPosition,
+    anchor: ChainAnchor,
+    transaction: Arc<Transaction>,
+    txid: Txid,
+    raw_tx: Vec<u8>,
+    output_count: u32,
+    existing_contract_ids: Vec<ContractId>,
+    new_contract_ids: Vec<ContractId>,
+}
+
+/// Per-input result from an atomic registration batch. Existing idempotent
+/// registrations return their current materialized record rather than the
+/// caller's initial `CatchingUp` proposal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContractRegistrationResult {
+    pub record: ContractRecord,
+    pub inserted: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -368,6 +404,7 @@ pub struct StoreSnapshotMetadata {
 pub struct StoreSnapshotCursor {
     pub as_of: ChainAnchor,
     pub event_high_watermark: EventCursor,
+    pub scope: SnapshotScope,
     pub after_key: Vec<u8>,
 }
 
@@ -388,13 +425,6 @@ pub struct MaterializedOrder {
 pub struct AssetRelationRecord {
     pub contract_id: ContractId,
     pub binding: AssetBinding,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecoveryHintScanPage {
-    pub as_of: ChainAnchor,
-    pub hints: Vec<StoredRecoveryHint>,
-    pub next: Option<RecoveryHintLocation>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -453,7 +483,7 @@ struct UndoBlock {
     previous_tip: ChainAnchor,
     contract_changes: Vec<ContractUndo>,
     transaction_positions: Vec<ChainPosition>,
-    output_outpoints: Vec<DeadcatOutPoint>,
+    output_outpoints: Vec<OutPoint>,
     history_keys: Vec<(ContractId, ChainPosition)>,
     recovery_locations: Vec<RecoveryHintLocation>,
     backfill_progress_changes: Vec<BackfillProgressUndo>,
@@ -667,9 +697,9 @@ impl Store {
         self.read_fixed(TRANSACTIONS, &position.to_fixed_key())
     }
 
-    pub fn output(&self, outpoint: DeadcatOutPoint) -> Result<Option<StoredOutput>, StoreError> {
+    pub fn output(&self, outpoint: OutPoint) -> Result<Option<StoredOutput>, StoreError> {
         let Some(reference) =
-            self.read_fixed::<StoredOutputRef, 36>(OUTPUTS, &outpoint.to_fixed_key())?
+            self.read_fixed::<StoredOutputRef, 36>(OUTPUTS, &outpoint_fixed_key(outpoint))?
         else {
             return Ok(None);
         };
@@ -704,6 +734,69 @@ impl Store {
                 Ok(record)
             })
             .transpose()
+    }
+
+    /// Return the normalized declaration retained as explicit watch intent for
+    /// one contract. This registry is independent of canonical materialized
+    /// state and therefore remains available while a rebuild is in progress.
+    pub fn retained_declaration(
+        &self,
+        contract_id: ContractId,
+    ) -> Result<Option<ContractDeclaration>, StoreError> {
+        self.read_fixed(RETAINED_DECLARATIONS, &contract_id.to_fixed_key())
+    }
+
+    /// Return every explicitly retained contract anchored in `txid`, ordered
+    /// by output index. The fixed-key layout makes this a bounded prefix scan
+    /// rather than a walk over the complete watch registry.
+    pub fn retained_declarations_for_txid(
+        &self,
+        txid: Txid,
+    ) -> Result<Vec<ContractDeclaration>, StoreError> {
+        let mut first = [0_u8; 36];
+        first[..32].copy_from_slice(&txid.to_byte_array());
+        let mut last = first;
+        last[32..].copy_from_slice(&u32::MAX.to_be_bytes());
+
+        let read = self.database.begin_read()?;
+        let table = read.open_table(RETAINED_DECLARATIONS)?;
+        let mut declarations = Vec::new();
+        for entry in table.range(first.as_slice()..=last.as_slice())? {
+            let (_, value) = entry?;
+            declarations.push(decode_record(value.value())?);
+        }
+        Ok(declarations)
+    }
+
+    /// Prefetch retained declarations for one complete canonical block while
+    /// holding a single redb read transaction/table handle. An empty registry
+    /// returns before performing any per-txid tree seeks.
+    pub fn retained_declarations_for_transactions(
+        &self,
+        txids: &[Txid],
+    ) -> Result<HashMap<Txid, Vec<ContractDeclaration>>, StoreError> {
+        let read = self.database.begin_read()?;
+        let table = read.open_table(RETAINED_DECLARATIONS)?;
+        if table.iter()?.next().transpose()?.is_none() {
+            return Ok(HashMap::new());
+        }
+
+        let mut result = HashMap::new();
+        for txid in txids {
+            let mut first = [0_u8; 36];
+            first[..32].copy_from_slice(&txid.to_byte_array());
+            let mut last = first;
+            last[32..].copy_from_slice(&u32::MAX.to_be_bytes());
+            let mut declarations = Vec::new();
+            for entry in table.range(first.as_slice()..=last.as_slice())? {
+                let (_, value) = entry?;
+                declarations.push(decode_record(value.value())?);
+            }
+            if !declarations.is_empty() {
+                result.insert(*txid, declarations);
+            }
+        }
+        Ok(result)
     }
 
     /// Return the canonical anchor retained for `height`, including the
@@ -806,7 +899,8 @@ impl Store {
         validate_query_limit(limit)?;
         let read = self.database.begin_read()?;
         let snapshot = snapshot_from_read(&read)?;
-        validate_snapshot_cursor(cursor, snapshot, 64)?;
+        let scope = SnapshotScope::Markets;
+        validate_snapshot_cursor(cursor, snapshot, scope, 36)?;
         let after = cursor.map(|cursor| cursor.after_key.as_slice());
         let table = read.open_table(CONTRACTS)?;
         let mut rows = Vec::new();
@@ -828,7 +922,7 @@ impl Store {
                 }
             }
         }
-        materialized_page(snapshot, rows, limit)
+        materialized_page(snapshot, scope, rows, limit)
     }
 
     /// Page active ready maker orders in exact order-book key order.
@@ -843,7 +937,12 @@ impl Store {
         validate_query_limit(limit)?;
         let read = self.database.begin_read()?;
         let snapshot = snapshot_from_read(&read)?;
-        validate_snapshot_cursor(cursor, snapshot, 142)?;
+        let scope = SnapshotScope::Orders {
+            market_id,
+            side,
+            direction,
+        };
+        validate_snapshot_cursor(cursor, snapshot, scope, 86)?;
         let after = cursor.map(|cursor| cursor.after_key.as_slice());
         let contracts = read.open_table(CONTRACTS)?;
         let mut market = contracts
@@ -873,10 +972,10 @@ impl Store {
             {
                 continue;
             }
-            let key_array: [u8; 142] = key
+            let key_array: [u8; 86] = key
                 .try_into()
                 .map_err(|_| StoreError::CorruptIndexKey("order_book"))?;
-            let contract_id = decode_contract_key(&key_array[78..])?;
+            let contract_id = decode_contract_key(&key_array[50..])?;
             let Some(contract) = contracts.get(contract_id.to_fixed_key().as_slice())? else {
                 return Err(StoreError::CorruptMaterializedIndex("order_book"));
             };
@@ -890,7 +989,7 @@ impl Store {
                 break;
             }
         }
-        materialized_page(snapshot, rows, limit)
+        materialized_page(snapshot, scope, rows, limit)
     }
 
     /// Return the complete ready book in deterministic key order. Callers can
@@ -924,11 +1023,11 @@ impl Store {
             if book.market_id != market_id {
                 continue;
             }
-            let key: [u8; 142] = key
+            let key: [u8; 86] = key
                 .value()
                 .try_into()
                 .map_err(|_| StoreError::CorruptIndexKey("order_book"))?;
-            let contract_id = decode_contract_key(&key[78..])?;
+            let contract_id = decode_contract_key(&key[50..])?;
             let Some(contract) = contracts.get(contract_id.to_fixed_key().as_slice())? else {
                 return Err(StoreError::CorruptMaterializedIndex("order_book"));
             };
@@ -944,46 +1043,41 @@ impl Store {
         Ok((snapshot, market, orders))
     }
 
+    /// Page public recovery hints by canonical chain/output location. A
+    /// continuation is valid only while both the exact indexed tip and durable
+    /// event watermark still match the snapshot that produced it.
     pub fn scan_recovery_hints(
         &self,
         family: Option<RecoveryFamily>,
-        after: Option<RecoveryHintLocation>,
+        cursor: Option<&StoreSnapshotCursor>,
         limit: usize,
-    ) -> Result<RecoveryHintScanPage, StoreError> {
+    ) -> Result<MaterializedPage<StoredRecoveryHint>, StoreError> {
         validate_query_limit(limit)?;
         let read = self.database.begin_read()?;
         let snapshot = snapshot_from_read(&read)?;
-        let after = after.map(recovery_key);
+        let scope = SnapshotScope::RecoveryHints { family };
+        validate_snapshot_cursor(cursor, snapshot, scope, 12)?;
+        let after = cursor.map(|cursor| cursor.after_key.as_slice());
         let table = read.open_table(RECOVERY_HINTS)?;
-        let mut hints = Vec::new();
+        let mut rows = Vec::new();
         for entry in table.iter()? {
             let (key, value) = entry?;
             let key: [u8; 12] = key
                 .value()
                 .try_into()
                 .map_err(|_| StoreError::CorruptIndexKey("recovery_hints"))?;
-            if after.is_some_and(|after| key <= after) {
+            if after.is_some_and(|after| key.as_slice() <= after) {
                 continue;
             }
             let hint: StoredRecoveryHint = decode_record(value.value())?;
             if family.is_none_or(|family| hint.family == family) {
-                hints.push(hint);
-                if hints.len() > limit {
+                rows.push((key.to_vec(), hint));
+                if rows.len() > limit {
                     break;
                 }
             }
         }
-        let next = if hints.len() > limit {
-            hints.pop();
-            hints.last().map(|hint| hint.location)
-        } else {
-            None
-        };
-        Ok(RecoveryHintScanPage {
-            as_of: snapshot.as_of,
-            hints,
-            next,
-        })
+        materialized_page(snapshot, scope, rows, limit)
     }
 
     pub fn asset_relations(
@@ -997,7 +1091,7 @@ impl Store {
         let mut relations = Vec::new();
         for entry in table.iter()? {
             let (key, value) = entry?;
-            let key: [u8; 98] = key
+            let key: [u8; 70] = key
                 .value()
                 .try_into()
                 .map_err(|_| StoreError::CorruptIndexKey("asset_relations"))?;
@@ -1005,111 +1099,341 @@ impl Store {
                 continue;
             }
             relations.push(AssetRelationRecord {
-                contract_id: decode_contract_key(&key[33..97])?,
+                contract_id: decode_contract_key(&key[33..69])?,
                 binding: decode_record(value.value())?,
             });
         }
         Ok((snapshot, relations))
     }
 
-    /// Persist a fully chain-verified late registration in `CatchingUp` state.
-    /// Returns `false` only for an identical idempotent retry.
+    /// Persist one fully chain-verified late registration. This compatibility
+    /// wrapper delegates to the atomic batch path.
     pub fn register_contract(
         &self,
         record: &ContractRecord,
         evidence: &RegistrationEvidence,
     ) -> Result<bool, StoreError> {
-        record.validate()?;
-        let ContractSyncState::CatchingUp { synced_through } = record.sync_state else {
-            return Err(StoreError::InvalidContract(
-                "late registration must begin in CatchingUp state".to_owned(),
-            ));
-        };
-        let write = self.database.begin_write()?;
-        let tip = tip_from_write(&write)?.ok_or(StoreError::TipNotInitialized)?;
-        if record.creation_position.block_height > tip.height {
-            return Err(StoreError::InvalidContract(
-                "contract creation is above the indexed tip".to_owned(),
-            ));
-        }
-        if evidence.anchor != synced_through
-            || synced_through.height != record.creation_position.block_height
-            || canonical_anchor_from_write(&write, synced_through.height)? != Some(synced_through)
-        {
-            return Err(StoreError::InvalidContract(
-                "contract creation anchor is not canonical in the indexed chain".to_owned(),
+        let mut results = self.register_contracts(&[(record.clone(), evidence.clone())])?;
+        Ok(results
+            .pop()
+            .expect("a one-item registration batch returns one result")
+            .inserted)
+    }
+
+    /// Atomically persist a nonempty batch of fully chain-verified late
+    /// registrations. Every input is preflighted before any table is mutated;
+    /// one conflict aborts the entire batch. Results retain input order.
+    pub fn register_contracts(
+        &self,
+        registrations: &[(ContractRecord, RegistrationEvidence)],
+    ) -> Result<Vec<ContractRegistrationResult>, StoreError> {
+        if registrations.is_empty() {
+            return Err(StoreError::InvalidRegistrationEvidence(
+                "registration batch has no contracts".to_owned(),
             ));
         }
-        validate_registration_evidence(&write, record, evidence)?;
-        if let Some(existing) = read_contract_from_write(&write, record.contract_id)? {
-            if registration_identity_matches(&existing, record) {
-                verify_existing_registration_evidence(&write, record, evidence)?;
-                drop(write);
-                return Ok(false);
+
+        let mut contract_ids = HashSet::with_capacity(registrations.len());
+        for (record, _) in registrations {
+            record.validate()?;
+            if !contract_ids.insert(record.contract_id) {
+                return Err(StoreError::InvalidRegistrationEvidence(
+                    "registration batch contains a duplicate contract ID".to_owned(),
+                ));
             }
-            return Err(StoreError::ContractAlreadyExists(record.contract_id));
+            if !matches!(record.sync_state, ContractSyncState::CatchingUp { .. }) {
+                return Err(StoreError::InvalidContract(
+                    "late registration must begin in CatchingUp state".to_owned(),
+                ));
+            }
         }
-        let next_position = ChainPosition {
-            block_height: record.creation_position.block_height,
-            tx_index: record
-                .creation_position
-                .tx_index
-                .checked_add(1)
-                .ok_or(StoreError::PositionOverflow)?,
-        };
-        let progress = BackfillProgress {
-            contract_id: record.contract_id,
-            pinned_tip: tip,
-            next_position,
-            last_applied: None,
-        };
-        insert_contract(&write, record)?;
-        let inserted_transaction = merge_registration_transaction(&write, record, evidence)?;
-        write_fixed(
-            &write,
-            BACKFILL_PROGRESS,
-            &record.contract_id.to_fixed_key(),
-            &progress,
-        )?;
-        if let Some(mut undo) = read_fixed_from_write::<UndoBlock, 4>(
-            &write,
-            UNDO_BLOCKS,
-            &record.creation_position.block_height.to_be_bytes(),
-        )? {
-            undo.contract_changes.push(ContractUndo {
-                contract_id: record.contract_id,
-                before: None,
-            });
-            undo.backfill_progress_changes.push(BackfillProgressUndo {
-                contract_id: record.contract_id,
-                before: None,
-            });
-            if inserted_transaction {
-                undo.transaction_positions.push(record.creation_position);
-                for (vout, _) in evidence.transaction.output.iter().enumerate() {
-                    undo.output_outpoints.push(DeadcatOutPoint::new(
-                        evidence.transaction.txid(),
-                        u32::try_from(vout).map_err(|_| {
-                            StoreError::InvalidContract("creation vout exceeds u32".to_owned())
-                        })?,
+        let retained_declarations = registrations
+            .iter()
+            .map(|(record, _)| declaration_from_record(record))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let write = self.database.begin_write()?;
+        // A rebuild invalidates every chain-derived view. Registration must
+        // obey the same write barrier as canonical and backfill application;
+        // otherwise a late-registration row could be committed against state
+        // that reset_for_rebuild is about to discard.
+        if read_meta_record_from_write::<SyncStatus>(&write, SYNC_STATUS_KEY)?
+            == Some(SyncStatus::RescanRequired)
+        {
+            return Err(StoreError::RebuildRequired);
+        }
+        for declaration in &retained_declarations {
+            if let Some(existing) = read_fixed_from_write::<ContractDeclaration, 36>(
+                &write,
+                RETAINED_DECLARATIONS,
+                &declaration.contract_id.to_fixed_key(),
+            )? && existing != *declaration
+            {
+                return Err(StoreError::InvalidRegistrationEvidence(format!(
+                    "retained declaration conflicts for {}",
+                    declaration.contract_id
+                )));
+            }
+        }
+        let tip = tip_from_write(&write)?.ok_or(StoreError::TipNotInitialized)?;
+        let mut existing_records = HashMap::<ContractId, ContractRecord>::new();
+        let mut new_progress = HashMap::<ContractId, BackfillProgress>::new();
+        let mut proposed_owners = HashMap::<OutPoint, ContractId>::new();
+        let mut claimed_hint_locations = HashSet::<RecoveryHintLocation>::new();
+        let mut ambiguous_hint_locations = HashSet::<RecoveryHintLocation>::new();
+        let mut transaction_groups = Vec::<RegistrationTransactionGroup>::new();
+        let mut group_at_position = HashMap::<ChainPosition, usize>::new();
+        let mut position_for_txid = HashMap::<Txid, ChainPosition>::new();
+
+        // Preflight the complete batch. The evidence maps additionally prove
+        // that contracts sharing a creation transaction agree on its exact
+        // bytes and canonical position.
+        for (record, evidence) in registrations {
+            let ContractSyncState::CatchingUp { synced_through } = record.sync_state else {
+                unreachable!("registration state was checked above")
+            };
+            if record.creation_position.block_height > tip.height {
+                return Err(StoreError::InvalidContract(
+                    "contract creation is above the indexed tip".to_owned(),
+                ));
+            }
+            if evidence.anchor != synced_through
+                || synced_through.height != record.creation_position.block_height
+                || canonical_anchor_from_write(&write, synced_through.height)?
+                    != Some(synced_through)
+            {
+                return Err(StoreError::InvalidContract(
+                    "contract creation anchor is not canonical in the indexed chain".to_owned(),
+                ));
+            }
+            let group_index = if let Some(group_index) =
+                group_at_position.get(&record.creation_position).copied()
+            {
+                let group = &transaction_groups[group_index];
+                if group.anchor != evidence.anchor
+                    || (!Arc::ptr_eq(&group.transaction, &evidence.transaction)
+                        && group.raw_tx != encode::serialize(evidence.transaction.as_ref()))
+                {
+                    return Err(StoreError::RegistrationTransactionConflict(
+                        record.creation_position,
                     ));
                 }
+                group_index
+            } else {
+                let txid = evidence.transaction.txid();
+                if let Some(previous_position) =
+                    position_for_txid.insert(txid, record.creation_position)
+                    && previous_position != record.creation_position
+                {
+                    return Err(StoreError::RegistrationTransactionConflict(
+                        record.creation_position,
+                    ));
+                }
+                let output_count =
+                    u32::try_from(evidence.transaction.output.len()).map_err(|_| {
+                        StoreError::InvalidRegistrationEvidence(
+                            "creation output count exceeds u32".to_owned(),
+                        )
+                    })?;
+                validate_registration_transaction_position(
+                    &write,
+                    record.creation_position,
+                    evidence.anchor,
+                    txid,
+                )?;
+                let group_index = transaction_groups.len();
+                transaction_groups.push(RegistrationTransactionGroup {
+                    position: record.creation_position,
+                    anchor: evidence.anchor,
+                    transaction: Arc::clone(&evidence.transaction),
+                    txid,
+                    raw_tx: encode::serialize(evidence.transaction.as_ref()),
+                    output_count,
+                    existing_contract_ids: Vec::new(),
+                    new_contract_ids: Vec::new(),
+                });
+                group_at_position.insert(record.creation_position, group_index);
+                group_index
+            };
+            let group = &transaction_groups[group_index];
+            validate_registration_evidence(record, group.txid, group.output_count)?;
+            if let Some(location) = evidence.associated_hint
+                && !claimed_hint_locations.insert(location)
+            {
+                // Hints are unauthenticated discovery aids. Multiple claims
+                // make this location useless for automatic association, but
+                // cannot invalidate otherwise chain-valid contracts.
+                ambiguous_hint_locations.insert(location);
             }
+
+            if let Some(existing) = read_contract_from_write(&write, record.contract_id)? {
+                if !registration_identity_matches(&existing, record) {
+                    return Err(StoreError::ContractAlreadyExists(record.contract_id));
+                }
+                let mut existing = existing;
+                normalize_ready_anchor(&mut existing, tip);
+                existing_records.insert(record.contract_id, existing);
+                transaction_groups[group_index]
+                    .existing_contract_ids
+                    .push(record.contract_id);
+                continue;
+            }
+
+            for tracked in &record.outpoints {
+                if let Some(owner) = proposed_owners.insert(tracked.outpoint, record.contract_id) {
+                    return Err(StoreError::OutpointAlreadyOwned {
+                        outpoint: tracked.outpoint,
+                        owner,
+                    });
+                }
+                if let Some(owner) = read_fixed_from_write::<OutpointOwner, 36>(
+                    &write,
+                    OUTPOINT_OWNERS,
+                    &outpoint_fixed_key(tracked.outpoint),
+                )? {
+                    return Err(StoreError::OutpointAlreadyOwned {
+                        outpoint: tracked.outpoint,
+                        owner: owner.contract_id,
+                    });
+                }
+            }
+
+            new_progress.insert(
+                record.contract_id,
+                BackfillProgress {
+                    contract_id: record.contract_id,
+                    pinned_tip: tip,
+                    next_position: ChainPosition {
+                        block_height: record.creation_position.block_height,
+                        tx_index: record
+                            .creation_position
+                            .tx_index
+                            .checked_add(1)
+                            .ok_or(StoreError::PositionOverflow)?,
+                    },
+                    last_applied: None,
+                },
+            );
+            transaction_groups[group_index]
+                .new_contract_ids
+                .push(record.contract_id);
+        }
+
+        // Retain the normalized, verified semantics even when the contract was
+        // already found through automatic discovery. These rows are watch
+        // intent, not chain-derived state, and intentionally have no undo leg.
+        for declaration in &retained_declarations {
             write_fixed(
+                &write,
+                RETAINED_DECLARATIONS,
+                &declaration.contract_id.to_fixed_key(),
+                declaration,
+            )?;
+        }
+
+        let mut inserted_transaction_groups = Vec::new();
+        for (group_index, group) in transaction_groups.iter().enumerate() {
+            if merge_registration_transaction_group(&write, group)? {
+                inserted_transaction_groups.push(group_index);
+            }
+        }
+
+        for (record, _) in registrations {
+            let Some(progress) = new_progress.get(&record.contract_id) else {
+                continue;
+            };
+            insert_contract(&write, record)?;
+            write_fixed(
+                &write,
+                BACKFILL_PROGRESS,
+                &record.contract_id.to_fixed_key(),
+                progress,
+            )?;
+            if let Some(mut undo) = read_fixed_from_write::<UndoBlock, 4>(
                 &write,
                 UNDO_BLOCKS,
                 &record.creation_position.block_height.to_be_bytes(),
-                &undo,
+            )? {
+                undo.contract_changes.push(ContractUndo {
+                    contract_id: record.contract_id,
+                    before: None,
+                });
+                undo.backfill_progress_changes.push(BackfillProgressUndo {
+                    contract_id: record.contract_id,
+                    before: None,
+                });
+                write_fixed(
+                    &write,
+                    UNDO_BLOCKS,
+                    &record.creation_position.block_height.to_be_bytes(),
+                    &undo,
+                )?;
+            }
+            append_event(
+                &write,
+                StoredEvent::ContractRegistered {
+                    contract_id: record.contract_id,
+                },
             )?;
         }
-        append_event(
-            &write,
-            StoredEvent::ContractRegistered {
-                contract_id: record.contract_id,
-            },
-        )?;
+
+        // A composed creation transaction has one retained transaction/output
+        // leg in the block undo journal, independent of the number of newly
+        // registered contracts it created.
+        for group_index in inserted_transaction_groups {
+            let group = &transaction_groups[group_index];
+            if let Some(mut undo) = read_fixed_from_write::<UndoBlock, 4>(
+                &write,
+                UNDO_BLOCKS,
+                &group.position.block_height.to_be_bytes(),
+            )? {
+                undo.transaction_positions.push(group.position);
+                for vout in 0..group.output_count {
+                    undo.output_outpoints.push(OutPoint::new(group.txid, vout));
+                }
+                write_fixed(
+                    &write,
+                    UNDO_BLOCKS,
+                    &group.position.block_height.to_be_bytes(),
+                    &undo,
+                )?;
+            }
+        }
+
+        // Association is derivative, best-effort discovery metadata. Only a
+        // newly inserted contract may claim an unambiguous, matching and still
+        // unowned hint. Idempotent retries never mutate state without a
+        // corresponding registration event/high-watermark change.
+        for (record, evidence) in registrations {
+            if new_progress.contains_key(&record.contract_id)
+                && evidence
+                    .associated_hint
+                    .is_none_or(|location| !ambiguous_hint_locations.contains(&location))
+            {
+                associate_registration_hint(&write, record, evidence)?;
+            }
+        }
+
+        let results = registrations
+            .iter()
+            .map(|(record, _)| {
+                existing_records
+                    .get(&record.contract_id)
+                    .cloned()
+                    .map_or_else(
+                        || ContractRegistrationResult {
+                            record: record.clone(),
+                            inserted: true,
+                        },
+                        |record| ContractRegistrationResult {
+                            record,
+                            inserted: false,
+                        },
+                    )
+            })
+            .collect();
         write.commit()?;
-        Ok(true)
+        Ok(results)
     }
 
     /// Atomically replay one complete canonical block for one or more
@@ -1145,7 +1469,7 @@ impl Store {
         let mut progress = Vec::with_capacity(targets.len());
         let mut exact_retry = true;
         for contract_id in &targets {
-            let item = read_fixed_from_write::<BackfillProgress, 64>(
+            let item = read_fixed_from_write::<BackfillProgress, 36>(
                 &write,
                 BACKFILL_PROGRESS,
                 &contract_id.to_fixed_key(),
@@ -1296,11 +1620,8 @@ impl Store {
         })
     }
 
-    pub fn outpoint_owner(
-        &self,
-        outpoint: DeadcatOutPoint,
-    ) -> Result<Option<OutpointOwner>, StoreError> {
-        self.read_fixed(OUTPOINT_OWNERS, &outpoint.to_fixed_key())
+    pub fn outpoint_owner(&self, outpoint: OutPoint) -> Result<Option<OutpointOwner>, StoreError> {
+        self.read_fixed(OUTPOINT_OWNERS, &outpoint_fixed_key(outpoint))
     }
 
     pub fn recovery_hint(
@@ -1320,11 +1641,11 @@ impl Store {
         let mut history = Vec::new();
         for entry in table.iter()? {
             let (key, value) = entry?;
-            let key: [u8; 72] = key
+            let key: [u8; 44] = key
                 .value()
                 .try_into()
                 .map_err(|_| StoreError::CorruptIndexKey("contract_history"))?;
-            if key[..64] == prefix {
+            if key[..36] == prefix {
                 history.push(decode_record(value.value())?);
             }
         }
@@ -1359,11 +1680,11 @@ impl Store {
         let mut history = Vec::new();
         for entry in table.iter()? {
             let (key, value) = entry?;
-            let key: [u8; 72] = key
+            let key: [u8; 44] = key
                 .value()
                 .try_into()
                 .map_err(|_| StoreError::CorruptIndexKey("contract_history"))?;
-            if key[..64] == prefix {
+            if key[..36] == prefix {
                 history.push(decode_record(value.value())?);
             }
         }
@@ -1513,7 +1834,7 @@ impl Store {
                 remove_fixed(&write, TRANSACTIONS, &position.to_fixed_key())?;
             }
             for outpoint in &undo.output_outpoints {
-                remove_fixed(&write, OUTPUTS, &outpoint.to_fixed_key())?;
+                remove_fixed(&write, OUTPUTS, &outpoint_fixed_key(*outpoint))?;
             }
             for (contract_id, position) in &undo.history_keys {
                 remove_fixed(
@@ -1579,14 +1900,35 @@ impl Store {
         Ok(epoch)
     }
 
-    /// Explicitly discard chain-derived materialized state before replaying
-    /// from a verified full-state checkpoint or activation baseline.
+    /// Explicitly discard chain-derived materialized state before replaying.
+    /// When explicit declarations are retained, v1 requires an exact genesis
+    /// baseline because it has no authenticated post-genesis state checkpoint
+    /// from which pre-baseline contracts could be reconstructed safely.
     pub fn reset_for_rebuild(&self, baseline: ChainAnchor) -> Result<EventCursor, StoreError> {
         let write = self.database.begin_write()?;
         if read_meta_record_from_write::<SyncStatus>(&write, SYNC_STATUS_KEY)?
             != Some(SyncStatus::RescanRequired)
         {
             return Err(StoreError::RebuildNotRequired);
+        }
+        let has_retained_declarations = {
+            let table = write.open_table(RETAINED_DECLARATIONS)?;
+            table.iter()?.next().transpose()?.is_some()
+        };
+        if has_retained_declarations {
+            let identity =
+                read_meta_record_from_write::<ChainIdentity>(&write, CHAIN_IDENTITY_KEY)?
+                    .ok_or(StoreError::MissingMetadata(CHAIN_IDENTITY_KEY))?;
+            let expected = ChainAnchor {
+                height: 0,
+                hash: identity.genesis_hash,
+            };
+            if baseline != expected {
+                return Err(StoreError::RetainedDeclarationsRequireGenesis {
+                    expected,
+                    requested: baseline,
+                });
+            }
         }
         clear_chain_tables(&write)?;
         write_tip(&write, baseline)?;
@@ -1692,6 +2034,8 @@ fn validate_block_shape(delta: &BlockDelta) -> Result<(), StoreError> {
         let index = usize::try_from(transaction.position.tx_index).map_err(|_| {
             StoreError::InvalidBlock("transaction index does not fit usize".to_owned())
         })?;
+        let output_count = u32::try_from(transaction.raw_tx.output.len())
+            .map_err(|_| StoreError::InvalidBlock("output count exceeds u32".to_owned()))?;
         if transaction.position.block_height != delta.anchor.height
             || transaction.block_hash != delta.anchor.hash
             || index >= delta.ordered_txids.len()
@@ -1706,11 +2050,26 @@ fn validate_block_shape(delta: &BlockDelta) -> Result<(), StoreError> {
         let mut contracts = HashSet::new();
         for contract in &transaction.created_contracts {
             if contract.creation_position != transaction.position
-                || contract.contract_id.creation_txid != transaction.txid
+                || contract.contract_id.txid() != transaction.txid
                 || !contracts.insert(contract.contract_id)
             {
                 return Err(StoreError::InvalidBlock(
                     "created contract metadata is inconsistent or duplicated".to_owned(),
+                ));
+            }
+            let creation_anchor = contract.contract_id.creation_anchor();
+            if creation_anchor.vout >= output_count {
+                return Err(StoreError::InvalidBlock(
+                    "created contract anchor is absent from its creation transaction".to_owned(),
+                ));
+            }
+            if !contract
+                .outpoints
+                .iter()
+                .any(|tracked| tracked.outpoint == creation_anchor)
+            {
+                return Err(StoreError::InvalidBlock(
+                    "created contract anchor is not one of its initial live outputs".to_owned(),
                 ));
             }
             contract.validate()?;
@@ -1750,19 +2109,29 @@ fn validate_block_shape(delta: &BlockDelta) -> Result<(), StoreError> {
 }
 
 fn validate_registration_evidence(
-    write: &WriteTransaction,
     record: &ContractRecord,
-    evidence: &RegistrationEvidence,
+    txid: Txid,
+    output_count: u32,
 ) -> Result<(), StoreError> {
-    let txid = evidence.transaction.txid();
-    if txid != record.contract_id.creation_txid {
+    if txid != record.contract_id.txid() {
         return Err(StoreError::InvalidRegistrationEvidence(
             "creation transaction ID does not match the contract ID".to_owned(),
         ));
     }
-    let output_count = u32::try_from(evidence.transaction.output.len()).map_err(|_| {
-        StoreError::InvalidRegistrationEvidence("creation output count exceeds u32".to_owned())
-    })?;
+    if record.contract_id.vout() >= output_count {
+        return Err(StoreError::InvalidRegistrationEvidence(
+            "contract creation anchor is absent from the creation transaction".to_owned(),
+        ));
+    }
+    if !record
+        .outpoints
+        .iter()
+        .any(|tracked| tracked.outpoint == record.contract_id.creation_anchor())
+    {
+        return Err(StoreError::InvalidRegistrationEvidence(
+            "contract creation anchor is not one of the initial live outputs".to_owned(),
+        ));
+    }
     for tracked in &record.outpoints {
         if tracked.outpoint.txid != txid || tracked.outpoint.vout >= output_count {
             return Err(StoreError::InvalidRegistrationEvidence(
@@ -1770,24 +2139,98 @@ fn validate_registration_evidence(
             ));
         }
     }
-    if let Some(block) = read_fixed_from_write::<StoredBlock, 4>(
-        write,
-        BLOCKS,
-        &evidence.anchor.height.to_be_bytes(),
-    )? {
-        let index = usize::try_from(record.creation_position.tx_index).map_err(|_| {
+    Ok(())
+}
+
+fn validate_registration_transaction_position(
+    write: &WriteTransaction,
+    position: ChainPosition,
+    anchor: ChainAnchor,
+    txid: Txid,
+) -> Result<(), StoreError> {
+    if let Some(block) =
+        read_fixed_from_write::<StoredBlock, 4>(write, BLOCKS, &anchor.height.to_be_bytes())?
+    {
+        let index = usize::try_from(position.tx_index).map_err(|_| {
             StoreError::InvalidRegistrationEvidence(
                 "creation transaction index does not fit usize".to_owned(),
             )
         })?;
-        if block.anchor != evidence.anchor || block.ordered_txids.get(index).copied() != Some(txid)
-        {
+        if block.anchor != anchor || block.ordered_txids.get(index).copied() != Some(txid) {
             return Err(StoreError::InvalidRegistrationEvidence(
                 "creation transaction is not at its claimed canonical position".to_owned(),
             ));
         }
     }
     Ok(())
+}
+
+fn associate_registration_hint(
+    write: &WriteTransaction,
+    record: &ContractRecord,
+    evidence: &RegistrationEvidence,
+) -> Result<(), StoreError> {
+    let Some(location) = evidence.associated_hint else {
+        return Ok(());
+    };
+    if location.position != record.creation_position
+        || usize::try_from(location.output_index)
+            .map_or(true, |vout| vout >= evidence.transaction.output.len())
+    {
+        return Ok(());
+    }
+    let key = recovery_key(location);
+    let Some(mut hint) =
+        read_fixed_from_write::<StoredRecoveryHint, 12>(write, RECOVERY_HINTS, &key)?
+    else {
+        return Ok(());
+    };
+    let expected_family = match record.kind {
+        ContractKind::BinaryMarketV1 => RecoveryFamily::BinaryMarketV1,
+        ContractKind::MakerOrderV1 => RecoveryFamily::MakerOrderV1,
+        ContractKind::LmsrV1Reserved => return Ok(()),
+    };
+    if hint.location == location
+        && hint.creation_txid == record.contract_id.txid()
+        && hint.family == expected_family
+        && hint.associated_contract.is_none()
+    {
+        hint.associated_contract = Some(record.contract_id);
+        write_fixed(write, RECOVERY_HINTS, &key, &hint)?;
+    }
+    Ok(())
+}
+
+fn declaration_from_record(record: &ContractRecord) -> Result<ContractDeclaration, StoreError> {
+    let descriptor = match (
+        record.kind,
+        &record.params,
+        record.parent_market,
+        record.outcome_side,
+    ) {
+        (ContractKind::BinaryMarketV1, ContractParameters::BinaryMarket(params), None, None) => {
+            ContractDescriptor::BinaryMarketV1 { params: *params }
+        }
+        (
+            ContractKind::MakerOrderV1,
+            ContractParameters::MakerOrder(params),
+            Some(parent_market),
+            Some(side),
+        ) => ContractDescriptor::MakerOrderV1 {
+            parent_market,
+            side,
+            params: *params,
+        },
+        _ => {
+            return Err(StoreError::InvalidContract(
+                "contract cannot be normalized into a retained declaration".to_owned(),
+            ));
+        }
+    };
+    Ok(ContractDeclaration {
+        contract_id: record.contract_id,
+        descriptor,
+    })
 }
 
 fn registration_identity_matches(existing: &ContractRecord, registration: &ContractRecord) -> bool {
@@ -1801,46 +2244,20 @@ fn registration_identity_matches(existing: &ContractRecord, registration: &Contr
         && existing.assets == registration.assets
 }
 
-fn verify_existing_registration_evidence(
-    write: &WriteTransaction,
-    record: &ContractRecord,
-    evidence: &RegistrationEvidence,
-) -> Result<(), StoreError> {
-    let stored = read_fixed_from_write::<StoredTransaction, 8>(
-        write,
-        TRANSACTIONS,
-        &record.creation_position.to_fixed_key(),
-    )?
-    .ok_or(StoreError::MissingRegistrationTransaction(
-        record.creation_position,
-    ))?;
-    if stored.block_hash != evidence.anchor.hash
-        || stored.txid != evidence.transaction.txid()
-        || stored.raw_tx != encode::serialize(&evidence.transaction)
-        || !stored.affected_contract_ids.contains(&record.contract_id)
-    {
-        return Err(StoreError::RegistrationTransactionConflict(
-            record.creation_position,
-        ));
-    }
-    verify_registration_output_refs(write, record.creation_position, &evidence.transaction)
-}
-
 fn verify_registration_output_refs(
     write: &WriteTransaction,
     position: ChainPosition,
-    transaction: &Transaction,
+    txid: Txid,
+    output_count: u32,
 ) -> Result<(), StoreError> {
-    for (vout, _) in transaction.output.iter().enumerate() {
-        let outpoint = DeadcatOutPoint::new(
-            transaction.txid(),
-            u32::try_from(vout).map_err(|_| {
-                StoreError::InvalidRegistrationEvidence("creation vout exceeds u32".to_owned())
-            })?,
-        );
-        let reference =
-            read_fixed_from_write::<StoredOutputRef, 36>(write, OUTPUTS, &outpoint.to_fixed_key())?
-                .ok_or(StoreError::MissingOutput(outpoint))?;
+    for vout in 0..output_count {
+        let outpoint = OutPoint::new(txid, vout);
+        let reference = read_fixed_from_write::<StoredOutputRef, 36>(
+            write,
+            OUTPUTS,
+            &outpoint_fixed_key(outpoint),
+        )?
+        .ok_or(StoreError::MissingOutput(outpoint))?;
         if reference.position != position || reference.outpoint != outpoint {
             return Err(StoreError::RegistrationTransactionConflict(position));
         }
@@ -1848,73 +2265,77 @@ fn verify_registration_output_refs(
     Ok(())
 }
 
-/// Returns true only when this call created the position/output rows and must
-/// therefore add them to a retained undo journal.
-fn merge_registration_transaction(
+/// Merge one canonical creation transaction for every contract registered at
+/// its position. Returns true only when this call created the transaction and
+/// output-reference rows and must therefore add one leg to the retained undo
+/// journal.
+fn merge_registration_transaction_group(
     write: &WriteTransaction,
-    record: &ContractRecord,
-    evidence: &RegistrationEvidence,
+    group: &RegistrationTransactionGroup,
 ) -> Result<bool, StoreError> {
-    let raw_tx = encode::serialize(&evidence.transaction);
     if let Some(mut stored) = read_fixed_from_write::<StoredTransaction, 8>(
         write,
         TRANSACTIONS,
-        &record.creation_position.to_fixed_key(),
+        &group.position.to_fixed_key(),
     )? {
-        if stored.position != record.creation_position
-            || stored.block_hash != evidence.anchor.hash
-            || stored.txid != evidence.transaction.txid()
-            || stored.raw_tx != raw_tx
+        if stored.position != group.position
+            || stored.block_hash != group.anchor.hash
+            || stored.txid != group.txid
+            || stored.raw_tx != group.raw_tx
         {
-            return Err(StoreError::RegistrationTransactionConflict(
-                record.creation_position,
-            ));
+            return Err(StoreError::RegistrationTransactionConflict(group.position));
         }
-        verify_registration_output_refs(write, record.creation_position, &evidence.transaction)?;
-        stored.affected_contract_ids.push(record.contract_id);
+        verify_registration_output_refs(write, group.position, group.txid, group.output_count)?;
+        if group
+            .existing_contract_ids
+            .iter()
+            .any(|contract_id| !stored.affected_contract_ids.contains(contract_id))
+        {
+            return Err(StoreError::RegistrationTransactionConflict(group.position));
+        }
+        if group.new_contract_ids.is_empty() {
+            return Ok(false);
+        }
+        stored
+            .affected_contract_ids
+            .extend_from_slice(&group.new_contract_ids);
         sort_dedup_contracts(&mut stored.affected_contract_ids);
-        write_fixed(
-            write,
-            TRANSACTIONS,
-            &record.creation_position.to_fixed_key(),
-            &stored,
-        )?;
+        write_fixed(write, TRANSACTIONS, &group.position.to_fixed_key(), &stored)?;
         return Ok(false);
     }
 
+    if !group.existing_contract_ids.is_empty() {
+        return Err(StoreError::MissingRegistrationTransaction(group.position));
+    }
     let stored = StoredTransaction {
-        position: record.creation_position,
-        block_hash: evidence.anchor.hash,
-        txid: evidence.transaction.txid(),
-        raw_tx,
-        affected_contract_ids: vec![record.contract_id],
+        position: group.position,
+        block_hash: group.anchor.hash,
+        txid: group.txid,
+        raw_tx: group.raw_tx.clone(),
+        affected_contract_ids: {
+            let mut contract_ids = group.new_contract_ids.clone();
+            sort_dedup_contracts(&mut contract_ids);
+            contract_ids
+        },
     };
-    write_fixed(
-        write,
-        TRANSACTIONS,
-        &record.creation_position.to_fixed_key(),
-        &stored,
-    )?;
-    for (vout, _) in evidence.transaction.output.iter().enumerate() {
-        let outpoint = DeadcatOutPoint::new(
-            stored.txid,
-            u32::try_from(vout).map_err(|_| {
-                StoreError::InvalidRegistrationEvidence("creation vout exceeds u32".to_owned())
-            })?,
-        );
-        if read_fixed_from_write::<StoredOutputRef, 36>(write, OUTPUTS, &outpoint.to_fixed_key())?
-            .is_some()
+    write_fixed(write, TRANSACTIONS, &group.position.to_fixed_key(), &stored)?;
+    for vout in 0..group.output_count {
+        let outpoint = OutPoint::new(stored.txid, vout);
+        if read_fixed_from_write::<StoredOutputRef, 36>(
+            write,
+            OUTPUTS,
+            &outpoint_fixed_key(outpoint),
+        )?
+        .is_some()
         {
-            return Err(StoreError::RegistrationTransactionConflict(
-                record.creation_position,
-            ));
+            return Err(StoreError::RegistrationTransactionConflict(group.position));
         }
         write_fixed(
             write,
             OUTPUTS,
-            &outpoint.to_fixed_key(),
+            &outpoint_fixed_key(outpoint),
             &StoredOutputRef {
-                position: record.creation_position,
+                position: group.position,
                 outpoint,
             },
         )?;
@@ -2037,7 +2458,7 @@ fn apply_backfill_transaction(
             transition: update.transition.clone(),
         };
         let key = history_key(update.contract_id, delta.position);
-        if read_fixed_from_write::<StoredHistoryEntry, 72>(write, CONTRACT_HISTORY, &key)?.is_some()
+        if read_fixed_from_write::<StoredHistoryEntry, 44>(write, CONTRACT_HISTORY, &key)?.is_some()
         {
             return Err(StoreError::DuplicateHistory {
                 contract_id: update.contract_id,
@@ -2089,7 +2510,7 @@ fn apply_backfill_transaction(
                 undo.transaction_positions.push(delta.position);
             }
             for (vout, _) in delta.raw_tx.output.iter().enumerate() {
-                let outpoint = DeadcatOutPoint::new(
+                let outpoint = OutPoint::new(
                     delta.txid,
                     u32::try_from(vout)
                         .map_err(|_| StoreError::InvalidBlock("vout exceeds u32".to_owned()))?,
@@ -2097,7 +2518,7 @@ fn apply_backfill_transaction(
                 if read_fixed_from_write::<StoredOutputRef, 36>(
                     write,
                     OUTPUTS,
-                    &outpoint.to_fixed_key(),
+                    &outpoint_fixed_key(outpoint),
                 )?
                 .is_some()
                 {
@@ -2107,7 +2528,7 @@ fn apply_backfill_transaction(
                     position: delta.position,
                     outpoint,
                 };
-                write_fixed(write, OUTPUTS, &outpoint.to_fixed_key(), &reference)?;
+                write_fixed(write, OUTPUTS, &outpoint_fixed_key(outpoint), &reference)?;
                 if let Some(undo) = undo.as_deref_mut() {
                     undo.output_outpoints.push(outpoint);
                 }
@@ -2192,7 +2613,7 @@ fn apply_chain_transaction(
             transition: update.transition.clone(),
         };
         let history_key = history_key(update.contract_id, delta.position);
-        if read_fixed_from_write::<StoredHistoryEntry, 72>(write, CONTRACT_HISTORY, &history_key)?
+        if read_fixed_from_write::<StoredHistoryEntry, 44>(write, CONTRACT_HISTORY, &history_key)?
             .is_some()
         {
             return Err(StoreError::DuplicateHistory {
@@ -2218,7 +2639,7 @@ fn apply_chain_transaction(
     write_fixed(write, TRANSACTIONS, &delta.position.to_fixed_key(), &stored)?;
     undo.transaction_positions.push(delta.position);
     for (vout, _) in delta.raw_tx.output.iter().enumerate() {
-        let outpoint = DeadcatOutPoint::new(
+        let outpoint = OutPoint::new(
             delta.txid,
             u32::try_from(vout)
                 .map_err(|_| StoreError::InvalidBlock("vout exceeds u32".to_owned()))?,
@@ -2227,7 +2648,12 @@ fn apply_chain_transaction(
             position: delta.position,
             outpoint,
         };
-        write_fixed(write, OUTPUTS, &outpoint.to_fixed_key(), &stored_output)?;
+        write_fixed(
+            write,
+            OUTPUTS,
+            &outpoint_fixed_key(outpoint),
+            &stored_output,
+        )?;
         undo.output_outpoints.push(outpoint);
     }
     append_event(
@@ -2350,7 +2776,7 @@ fn validate_tracked_inputs(
         .raw_tx
         .input
         .iter()
-        .map(|input| DeadcatOutPoint::from(input.previous_output))
+        .map(|input| input.previous_output)
         .collect::<HashSet<_>>();
     for outpoint in declared.keys() {
         if !transaction_inputs.contains(outpoint) {
@@ -2363,7 +2789,7 @@ fn validate_tracked_inputs(
         let owner = read_fixed_from_write::<OutpointOwner, 36>(
             write,
             OUTPOINT_OWNERS,
-            &outpoint.to_fixed_key(),
+            &outpoint_fixed_key(outpoint),
         )?;
         match (owner, declared.remove(&outpoint)) {
             (Some(owner), Some(contract_id)) if owner.contract_id == contract_id => {}
@@ -2486,7 +2912,7 @@ fn insert_contract(write: &WriteTransaction, record: &ContractRecord) -> Result<
         return Err(StoreError::ContractAlreadyExists(record.contract_id));
     }
     for tracked in &record.outpoints {
-        let outpoint_key = tracked.outpoint.to_fixed_key();
+        let outpoint_key = outpoint_fixed_key(tracked.outpoint);
         if let Some(owner) =
             read_fixed_from_write::<OutpointOwner, 36>(write, OUTPOINT_OWNERS, &outpoint_key)?
         {
@@ -2554,7 +2980,11 @@ fn insert_contract(write: &WriteTransaction, record: &ContractRecord) -> Result<
 
 fn remove_contract(write: &WriteTransaction, record: &ContractRecord) -> Result<(), StoreError> {
     for tracked in &record.outpoints {
-        remove_fixed(write, OUTPOINT_OWNERS, &tracked.outpoint.to_fixed_key())?;
+        remove_fixed(
+            write,
+            OUTPOINT_OWNERS,
+            &outpoint_fixed_key(tracked.outpoint),
+        )?;
         remove_fixed(
             write,
             CONTRACT_OUTPOINTS,
@@ -2741,6 +3171,7 @@ fn create_tables(write: &WriteTransaction) -> Result<(), StoreError> {
     drop(write.open_table(TRANSACTIONS)?);
     drop(write.open_table(OUTPUTS)?);
     drop(write.open_table(CONTRACTS)?);
+    drop(write.open_table(RETAINED_DECLARATIONS)?);
     drop(write.open_table(OUTPOINT_OWNERS)?);
     drop(write.open_table(CONTRACT_OUTPOINTS)?);
     drop(write.open_table(SCRIPT_INDEX)?);
@@ -2807,6 +3238,7 @@ fn validate_query_limit(limit: usize) -> Result<(), StoreError> {
 fn validate_snapshot_cursor(
     cursor: Option<&StoreSnapshotCursor>,
     snapshot: StoreSnapshotMetadata,
+    scope: SnapshotScope,
     key_len: usize,
 ) -> Result<(), StoreError> {
     let Some(cursor) = cursor else {
@@ -2829,11 +3261,18 @@ fn validate_snapshot_cursor(
             actual: cursor.after_key.len(),
         });
     }
+    if cursor.scope != scope {
+        return Err(StoreError::SnapshotScopeMismatch {
+            expected: scope,
+            actual: cursor.scope,
+        });
+    }
     Ok(())
 }
 
 fn materialized_page<T>(
     snapshot: StoreSnapshotMetadata,
+    scope: SnapshotScope,
     mut rows: Vec<(Vec<u8>, T)>,
     limit: usize,
 ) -> Result<MaterializedPage<T>, StoreError> {
@@ -2844,6 +3283,7 @@ fn materialized_page<T>(
     let next = truncated.then(|| StoreSnapshotCursor {
         as_of: snapshot.as_of,
         event_high_watermark: snapshot.event_high_watermark,
+        scope,
         after_key: rows
             .last()
             .expect("a nonzero page limit retains a row")
@@ -2858,21 +3298,20 @@ fn materialized_page<T>(
 }
 
 fn decode_contract_key(bytes: &[u8]) -> Result<ContractId, StoreError> {
-    let bytes: [u8; 64] = bytes
-        .try_into()
-        .map_err(|_| StoreError::CorruptIndexKey("contract_id"))?;
-    let cmr = bytes[..32]
+    let bytes: [u8; 36] = bytes
         .try_into()
         .map_err(|_| StoreError::CorruptIndexKey("contract_id"))?;
     let txid = Txid::from_byte_array(
+        bytes[..32]
+            .try_into()
+            .map_err(|_| StoreError::CorruptIndexKey("contract_id"))?,
+    );
+    let vout = u32::from_be_bytes(
         bytes[32..]
             .try_into()
             .map_err(|_| StoreError::CorruptIndexKey("contract_id"))?,
     );
-    Ok(ContractId {
-        cmr,
-        creation_txid: txid,
-    })
+    Ok(ContractId::new(OutPoint::new(txid, vout)))
 }
 
 fn canonical_anchor_from_write(
@@ -3025,10 +3464,17 @@ fn decode_u64(bytes: &[u8]) -> Result<u64, ()> {
     Ok(u64::from_be_bytes(bytes.try_into().map_err(|_| ())?))
 }
 
-fn history_key(contract_id: ContractId, position: ChainPosition) -> [u8; 72] {
-    let mut key = [0_u8; 72];
-    key[..64].copy_from_slice(&contract_id.to_fixed_key());
-    key[64..].copy_from_slice(&position.to_fixed_key());
+fn outpoint_fixed_key(outpoint: OutPoint) -> [u8; 36] {
+    let mut key = [0_u8; 36];
+    key[..32].copy_from_slice(&outpoint.txid.to_byte_array());
+    key[32..].copy_from_slice(&outpoint.vout.to_be_bytes());
+    key
+}
+
+fn history_key(contract_id: ContractId, position: ChainPosition) -> [u8; 44] {
+    let mut key = [0_u8; 44];
+    key[..36].copy_from_slice(&contract_id.to_fixed_key());
+    key[36..].copy_from_slice(&position.to_fixed_key());
     key
 }
 
@@ -3039,10 +3485,10 @@ fn recovery_key(location: RecoveryHintLocation) -> [u8; 12] {
     key
 }
 
-fn contract_outpoint_key(contract_id: ContractId, role: u8) -> [u8; 65] {
-    let mut key = [0_u8; 65];
-    key[..64].copy_from_slice(&contract_id.to_fixed_key());
-    key[64] = role;
+fn contract_outpoint_key(contract_id: ContractId, role: u8) -> [u8; 37] {
+    let mut key = [0_u8; 37];
+    key[..36].copy_from_slice(&contract_id.to_fixed_key());
+    key[36] = role;
     key
 }
 
@@ -3050,46 +3496,46 @@ fn script_hash(script: &[u8]) -> [u8; 32] {
     Sha256::digest(script).into()
 }
 
-fn script_key(contract_id: ContractId, binding: &ScriptBinding) -> [u8; 97] {
-    let mut key = [0_u8; 97];
+fn script_key(contract_id: ContractId, binding: &ScriptBinding) -> [u8; 69] {
+    let mut key = [0_u8; 69];
     key[..32].copy_from_slice(&script_hash(&binding.script_pubkey));
-    key[32..96].copy_from_slice(&contract_id.to_fixed_key());
-    key[96] = binding.role;
+    key[32..68].copy_from_slice(&contract_id.to_fixed_key());
+    key[68] = binding.role;
     key
 }
 
-fn asset_key(contract_id: ContractId, binding: AssetBinding) -> [u8; 98] {
-    let mut key = [0_u8; 98];
+fn asset_key(contract_id: ContractId, binding: AssetBinding) -> [u8; 70] {
+    let mut key = [0_u8; 70];
     key[..32].copy_from_slice(&binding.asset_id.into_inner().to_byte_array());
     key[32] = binding.relation.tag();
-    key[33..97].copy_from_slice(&contract_id.to_fixed_key());
-    key[97] = binding.role;
+    key[33..69].copy_from_slice(&contract_id.to_fixed_key());
+    key[69] = binding.role;
     key
 }
 
-fn market_child_key(parent: ContractId, child: ContractId, side: OrderSide) -> [u8; 130] {
-    let mut key = [0_u8; 130];
-    key[..64].copy_from_slice(&parent.to_fixed_key());
-    key[64] = match side {
+fn market_child_key(parent: ContractId, child: ContractId, side: OrderSide) -> [u8; 74] {
+    let mut key = [0_u8; 74];
+    key[..36].copy_from_slice(&parent.to_fixed_key());
+    key[36] = match side {
         OrderSide::Yes => 0,
         OrderSide::No => 1,
     };
-    key[65] = 0; // v1 child kind: maker order
-    key[66..].copy_from_slice(&child.to_fixed_key());
+    key[37] = 0; // v1 child kind: maker order
+    key[38..].copy_from_slice(&child.to_fixed_key());
     key
 }
 
-fn order_key(contract_id: ContractId, order: OrderBookEntry) -> [u8; 142] {
-    let mut key = [0_u8; 142];
-    key[..64].copy_from_slice(&order.market_id.to_fixed_key());
-    key[64] = match order.side {
+fn order_key(contract_id: ContractId, order: OrderBookEntry) -> [u8; 86] {
+    let mut key = [0_u8; 86];
+    key[..36].copy_from_slice(&order.market_id.to_fixed_key());
+    key[36] = match order.side {
         OrderSide::Yes => 0,
         OrderSide::No => 1,
     };
-    key[65] = order.direction.protocol_byte();
-    key[66..70].copy_from_slice(&order.price.to_be_bytes());
-    key[70..78].copy_from_slice(&order.creation_position.to_fixed_key());
-    key[78..].copy_from_slice(&contract_id.to_fixed_key());
+    key[37] = order.direction.protocol_byte();
+    key[38..42].copy_from_slice(&order.price.to_be_bytes());
+    key[42..50].copy_from_slice(&order.creation_position.to_fixed_key());
+    key[50..].copy_from_slice(&contract_id.to_fixed_key());
     key
 }
 
@@ -3110,7 +3556,7 @@ pub enum StoreError {
     #[error("consensus transaction decode failed: {0}")]
     ConsensusDecode(String),
     #[error("output index is absent from its transaction: {0:?}")]
-    MissingOutput(DeadcatOutPoint),
+    MissingOutput(OutPoint),
     #[error("output references a missing canonical transaction at {0:?}")]
     MissingOutputTransaction(ChainPosition),
     #[error("redb schema version has an invalid encoding")]
@@ -3181,12 +3627,12 @@ pub enum StoreError {
     StateMismatch { contract_id: ContractId },
     #[error("outpoint {outpoint:?} is already owned by {owner:?}")]
     OutpointAlreadyOwned {
-        outpoint: DeadcatOutPoint,
+        outpoint: OutPoint,
         owner: ContractId,
     },
     #[error("tracked input {outpoint:?} owned by {owner:?} has no matching transition leg")]
     UnaccountedTrackedInput {
-        outpoint: DeadcatOutPoint,
+        outpoint: OutPoint,
         owner: ContractId,
     },
     #[error("duplicate contract history at {contract_id:?} {position:?}")]
@@ -3228,12 +3674,22 @@ pub enum StoreError {
         expected: Box<StoreSnapshotMetadata>,
         actual: Box<StoreSnapshotMetadata>,
     },
+    #[error("snapshot cursor scope mismatch: expected {expected:?}, got {actual:?}")]
+    SnapshotScopeMismatch {
+        expected: SnapshotScope,
+        actual: SnapshotScope,
+    },
     #[error("event sequence overflow")]
     EventSequenceOverflow,
     #[error("incremental block application is disabled until an explicit rebuild reset")]
     RebuildRequired,
     #[error("cannot reset canonical state when a rebuild is not required")]
     RebuildNotRequired,
+    #[error("retained declarations require a genesis rebuild from {expected:?}, not {requested:?}")]
+    RetainedDeclarationsRequireGenesis {
+        expected: ChainAnchor,
+        requested: ChainAnchor,
+    },
     #[error("invalid rollback target {ancestor:?} from {old_tip:?}")]
     InvalidRollbackTarget {
         old_tip: ChainAnchor,
@@ -3268,14 +3724,14 @@ mod tests {
         AssetId::from_slice(&[byte; 32]).expect("asset")
     }
 
-    fn transaction(tag: u32, inputs: &[DeadcatOutPoint], output_count: usize) -> Transaction {
+    fn transaction(tag: u32, inputs: &[OutPoint], output_count: usize) -> Transaction {
         Transaction {
             version: 2,
             lock_time: LockTime::from_consensus(tag),
             input: inputs
                 .iter()
                 .map(|outpoint| TxIn {
-                    previous_output: OutPoint::from(*outpoint),
+                    previous_output: *outpoint,
                     ..TxIn::default()
                 })
                 .collect(),
@@ -3298,10 +3754,7 @@ mod tests {
         outstanding_pairs: u64,
         synced_through: ChainAnchor,
     ) -> ContractRecord {
-        let contract_id = ContractId {
-            cmr: [marker; 32],
-            creation_txid: txid,
-        };
+        let contract_id = ContractId::new(OutPoint::new(txid, vout));
         ContractRecord {
             contract_id,
             kind: ContractKind::BinaryMarketV1,
@@ -3331,7 +3784,7 @@ mod tests {
             }],
             outpoints: vec![TrackedOutpoint {
                 role: 0,
-                outpoint: DeadcatOutPoint::new(txid, vout),
+                outpoint: OutPoint::new(txid, vout),
             }],
             order_book: None,
         }
@@ -3356,7 +3809,7 @@ mod tests {
                 .collect(),
             new_outpoints: vec![TrackedOutpoint {
                 role: 0,
-                outpoint: DeadcatOutPoint::new(spending_txid, vout),
+                outpoint: OutPoint::new(spending_txid, vout),
             }],
             order_remaining_base: None,
             transition: TransitionRecord {
@@ -3453,7 +3906,8 @@ mod tests {
 
         let evidence = RegistrationEvidence {
             anchor: anchor(0),
-            transaction: transaction.clone(),
+            transaction: Arc::new(transaction.clone()),
+            associated_hint: None,
         };
         assert!(
             store
@@ -3469,6 +3923,32 @@ mod tests {
             store.contract(market.contract_id).expect("read"),
             Some(market.clone())
         );
+        let expected_declaration = declaration_from_record(&market).expect("declaration");
+        assert_eq!(
+            store
+                .retained_declaration(market.contract_id)
+                .expect("retained declaration"),
+            Some(expected_declaration)
+        );
+        assert_eq!(
+            store
+                .retained_declarations_for_txid(transaction.txid())
+                .expect("declarations by txid"),
+            vec![expected_declaration]
+        );
+        let unrelated_txid = Txid::from_byte_array([0xee; 32]);
+        let prefetched = store
+            .retained_declarations_for_transactions(&[unrelated_txid, transaction.txid()])
+            .expect("block declaration prefetch");
+        assert_eq!(prefetched.len(), 1);
+        assert_eq!(
+            prefetched
+                .get(&transaction.txid())
+                .expect("matching prefetched transaction")
+                .as_slice(),
+            &[expected_declaration]
+        );
+        assert!(!prefetched.contains_key(&unrelated_txid));
         let events = store.events_after(None, 10).expect("events");
         assert!(matches!(
             events.as_slice(),
@@ -3488,7 +3968,60 @@ mod tests {
     }
 
     #[test]
-    fn script_index_allows_multiple_contract_instances_of_one_cmr() {
+    fn registration_is_rejected_without_mutation_while_rebuild_is_required() {
+        let (_dir, _path, store) = initialized_store();
+        let creation = transaction(770, &[], 1);
+        let position = ChainPosition {
+            block_height: 0,
+            tx_index: 0,
+        };
+        let mut market = market_record(0x6d, position, creation.txid(), 0, 0, anchor(0));
+        market.sync_state = ContractSyncState::CatchingUp {
+            synced_through: anchor(0),
+        };
+        let evidence = RegistrationEvidence {
+            anchor: anchor(0),
+            transaction: Arc::new(creation),
+            associated_hint: None,
+        };
+
+        store.invalidate_for_rebuild().expect("invalidate");
+        let high = store.event_high_watermark().expect("high watermark");
+        assert!(matches!(
+            store.register_contract(&market, &evidence),
+            Err(StoreError::RebuildRequired)
+        ));
+
+        assert_eq!(store.event_high_watermark().expect("high watermark"), high);
+        assert!(
+            store
+                .contract(market.contract_id)
+                .expect("contract")
+                .is_none()
+        );
+        assert!(store.transaction(position).expect("transaction").is_none());
+        assert!(
+            store
+                .output(market.contract_id.creation_anchor())
+                .expect("output")
+                .is_none()
+        );
+        assert!(
+            store
+                .outpoint_owner(market.contract_id.creation_anchor())
+                .expect("owner")
+                .is_none()
+        );
+        assert!(
+            store
+                .backfill_progress(market.contract_id)
+                .expect("progress")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn script_index_allows_multiple_contract_instances_of_one_script() {
         let (_dir, _path, store) = initialized_store();
         let first_tx = transaction(78, &[], 1);
         let second_tx = transaction(79, &[], 1);
@@ -3507,9 +4040,9 @@ mod tests {
             synced_through: anchor(0),
         };
         let mut second = first.clone();
-        second.contract_id.creation_txid = second_tx.txid();
+        second.contract_id = ContractId::new(OutPoint::new(second_tx.txid(), 0));
         second.creation_position.tx_index = 1;
-        second.outpoints[0].outpoint = DeadcatOutPoint::new(second_tx.txid(), 0);
+        second.outpoints[0].outpoint = OutPoint::new(second_tx.txid(), 0);
 
         assert!(
             store
@@ -3517,7 +4050,8 @@ mod tests {
                     &first,
                     &RegistrationEvidence {
                         anchor: anchor(0),
-                        transaction: first_tx,
+                        transaction: Arc::new(first_tx),
+                        associated_hint: None,
                     },
                 )
                 .expect("first")
@@ -3528,7 +4062,8 @@ mod tests {
                     &second,
                     &RegistrationEvidence {
                         anchor: anchor(0),
-                        transaction: second_tx,
+                        transaction: Arc::new(second_tx),
+                        associated_hint: None,
                     },
                 )
                 .expect("second")
@@ -3565,15 +4100,23 @@ mod tests {
         };
         let evidence = RegistrationEvidence {
             anchor: anchor(0),
-            transaction: creation.clone(),
+            transaction: Arc::new(creation.clone()),
+            associated_hint: None,
         };
 
-        store
-            .register_contract(&first, &evidence)
-            .expect("first registration");
-        store
-            .register_contract(&second, &evidence)
-            .expect("second registration");
+        let results = store
+            .register_contracts(&[
+                (first.clone(), evidence.clone()),
+                (second.clone(), evidence),
+            ])
+            .expect("atomic composed registration");
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| (result.record.contract_id, result.inserted))
+                .collect::<Vec<_>>(),
+            vec![(first.contract_id, true), (second.contract_id, true)]
+        );
 
         let stored = store.transaction(position).expect("transaction").unwrap();
         let mut expected_ids = vec![first.contract_id, second.contract_id];
@@ -3594,6 +4137,618 @@ mod tests {
                 .unwrap()
                 .output,
             creation.output[1]
+        );
+    }
+
+    #[test]
+    fn composed_registration_has_one_transaction_undo_leg_and_rolls_back_together() {
+        let (_dir, _path, store) = initialized_store();
+        let creation = transaction(800, &[], 3);
+        let position = ChainPosition {
+            block_height: 1,
+            tx_index: 0,
+        };
+        store
+            .apply_block(&BlockDelta {
+                anchor: anchor(1),
+                prev_block_hash: anchor(0).hash,
+                ordered_txids: vec![creation.txid()],
+                relevant_transactions: Vec::new(),
+                recovery_hints: Vec::new(),
+            })
+            .expect("index creation block before late registration");
+
+        let mut first = market_record(0x6d, position, creation.txid(), 0, 0, anchor(1));
+        first.sync_state = ContractSyncState::CatchingUp {
+            synced_through: anchor(1),
+        };
+        let mut second = market_record(0x7d, position, creation.txid(), 1, 0, anchor(1));
+        second.sync_state = ContractSyncState::CatchingUp {
+            synced_through: anchor(1),
+        };
+        let evidence = RegistrationEvidence {
+            anchor: anchor(1),
+            transaction: Arc::new(creation.clone()),
+            associated_hint: None,
+        };
+        store
+            .register_contracts(&[
+                (first.clone(), evidence.clone()),
+                (second.clone(), evidence),
+            ])
+            .expect("register composed creation");
+
+        let stored = store.transaction(position).expect("transaction").unwrap();
+        let mut expected_ids = vec![first.contract_id, second.contract_id];
+        sort_dedup_contracts(&mut expected_ids);
+        assert_eq!(stored.affected_contract_ids, expected_ids);
+        let undo = store
+            .read_fixed::<UndoBlock, 4>(UNDO_BLOCKS, &1_u32.to_be_bytes())
+            .expect("undo read")
+            .expect("height-one undo");
+        assert_eq!(undo.transaction_positions, vec![position]);
+        assert_eq!(
+            undo.output_outpoints,
+            (0..3)
+                .map(|vout| OutPoint::new(creation.txid(), vout))
+                .collect::<Vec<_>>()
+        );
+
+        let result = store
+            .rollback_to(anchor(0))
+            .expect("rollback creation block");
+        assert!(matches!(
+            result,
+            RollbackResult::RolledBack {
+                orphaned_positions,
+                ..
+            } if orphaned_positions == vec![position]
+        ));
+        assert!(store.transaction(position).expect("transaction").is_none());
+        assert!(store.contract(first.contract_id).expect("first").is_none());
+        assert!(
+            store
+                .contract(second.contract_id)
+                .expect("second")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .retained_declaration(first.contract_id)
+                .expect("first retained declaration"),
+            Some(declaration_from_record(&first).expect("first declaration"))
+        );
+        assert_eq!(
+            store
+                .retained_declaration(second.contract_id)
+                .expect("second retained declaration"),
+            Some(declaration_from_record(&second).expect("second declaration"))
+        );
+        for vout in 0..3 {
+            assert!(
+                store
+                    .output(OutPoint::new(creation.txid(), vout))
+                    .expect("output")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn registration_batch_conflict_leaves_no_partial_rows_or_events() {
+        let (_dir, _path, store) = initialized_store();
+        let creation = transaction(801, &[], 2);
+        let position = ChainPosition {
+            block_height: 0,
+            tx_index: 0,
+        };
+        let mut first = market_record(0x61, position, creation.txid(), 0, 0, anchor(0));
+        first.sync_state = ContractSyncState::CatchingUp {
+            synced_through: anchor(0),
+        };
+        let mut second = market_record(0x62, position, creation.txid(), 1, 0, anchor(0));
+        second.sync_state = ContractSyncState::CatchingUp {
+            synced_through: anchor(0),
+        };
+        second.outpoints.push(TrackedOutpoint {
+            role: 1,
+            outpoint: first.outpoints[0].outpoint,
+        });
+        let evidence = RegistrationEvidence {
+            anchor: anchor(0),
+            transaction: Arc::new(creation),
+            associated_hint: None,
+        };
+
+        assert!(matches!(
+            store.register_contracts(&[
+                (first.clone(), evidence.clone()),
+                (second.clone(), evidence),
+            ]),
+            Err(StoreError::OutpointAlreadyOwned { outpoint, owner })
+                if outpoint == first.outpoints[0].outpoint && owner == first.contract_id
+        ));
+        assert!(store.contract(first.contract_id).expect("first").is_none());
+        assert!(
+            store
+                .contract(second.contract_id)
+                .expect("second")
+                .is_none()
+        );
+        assert!(store.transaction(position).expect("transaction").is_none());
+        assert!(
+            store
+                .outpoint_owner(first.outpoints[0].outpoint)
+                .expect("owner")
+                .is_none()
+        );
+        assert!(
+            store
+                .backfill_progress(first.contract_id)
+                .expect("first progress")
+                .is_none()
+        );
+        assert!(store.events_after(None, 10).expect("events").is_empty());
+        assert!(
+            store
+                .retained_declaration(first.contract_id)
+                .expect("first retained declaration")
+                .is_none()
+        );
+        assert!(
+            store
+                .retained_declaration(second.contract_id)
+                .expect("second retained declaration")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn destructive_rebuild_retains_watch_intent_and_requires_genesis() {
+        let (directory, path, store) = initialized_store();
+        let identity = ChainIdentity {
+            network: LiquidNetwork::ElementsRegtest,
+            genesis_hash: anchor(0).hash,
+            policy_asset: asset(0xaa),
+        };
+        store.bind_chain(identity).expect("bind chain");
+        let creation = transaction(8_020, &[], 1);
+        let mut market = market_record(
+            0x67,
+            ChainPosition {
+                block_height: 0,
+                tx_index: 0,
+            },
+            creation.txid(),
+            0,
+            0,
+            anchor(0),
+        );
+        market.sync_state = ContractSyncState::CatchingUp {
+            synced_through: anchor(0),
+        };
+        store
+            .register_contract(
+                &market,
+                &RegistrationEvidence {
+                    anchor: anchor(0),
+                    transaction: Arc::new(creation),
+                    associated_hint: None,
+                },
+            )
+            .expect("register watched market");
+        let declaration = declaration_from_record(&market).expect("declaration");
+
+        store.invalidate_for_rebuild().expect("invalidate");
+        assert!(matches!(
+            store.reset_for_rebuild(anchor(1)),
+            Err(StoreError::RetainedDeclarationsRequireGenesis {
+                expected,
+                requested,
+            }) if expected == anchor(0) && requested == anchor(1)
+        ));
+        assert_eq!(
+            store.sync_status().expect("status after rejected reset"),
+            SyncStatus::RescanRequired
+        );
+
+        store
+            .reset_for_rebuild(anchor(0))
+            .expect("genesis rebuild reset");
+        assert!(
+            store
+                .contract(market.contract_id)
+                .expect("contract")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .retained_declaration(market.contract_id)
+                .expect("retained declaration"),
+            Some(declaration)
+        );
+        drop(store);
+
+        let reopened = Store::open(path).expect("reopen");
+        assert_eq!(
+            reopened
+                .retained_declaration(market.contract_id)
+                .expect("reopened retained declaration"),
+            Some(declaration)
+        );
+        drop(reopened);
+        drop(directory);
+    }
+
+    #[test]
+    fn registration_batch_mixes_ready_idempotent_and_new_shared_evidence() {
+        let (_dir, _path, store) = initialized_store();
+        let creation = transaction(802, &[], 2);
+        let position = ChainPosition {
+            block_height: 0,
+            tx_index: 0,
+        };
+        let mut existing = market_record(0x63, position, creation.txid(), 0, 0, anchor(0));
+        existing.sync_state = ContractSyncState::CatchingUp {
+            synced_through: anchor(0),
+        };
+        let mut new = market_record(0x64, position, creation.txid(), 1, 0, anchor(0));
+        new.sync_state = ContractSyncState::CatchingUp {
+            synced_through: anchor(0),
+        };
+        let evidence = RegistrationEvidence {
+            anchor: anchor(0),
+            transaction: Arc::new(creation.clone()),
+            associated_hint: None,
+        };
+        store
+            .register_contract(&existing, &evidence)
+            .expect("initial registration");
+        store
+            .apply_backfill_block(
+                &[existing.contract_id],
+                &BlockDelta {
+                    anchor: anchor(0),
+                    prev_block_hash: block_hash(0xff),
+                    ordered_txids: vec![creation.txid()],
+                    relevant_transactions: Vec::new(),
+                    recovery_hints: Vec::new(),
+                },
+            )
+            .expect("complete initial backfill");
+
+        let results = store
+            .register_contracts(&[
+                (existing.clone(), evidence.clone()),
+                (new.clone(), evidence.clone()),
+            ])
+            .expect("mixed batch");
+        assert!(!results[0].inserted);
+        assert!(matches!(
+            results[0].record.sync_state,
+            ContractSyncState::Ready { synced_through } if synced_through == anchor(0)
+        ));
+        assert!(results[1].inserted);
+        assert_eq!(results[1].record, new);
+
+        let stored = store.transaction(position).expect("transaction").unwrap();
+        let mut expected_ids = vec![existing.contract_id, new.contract_id];
+        sort_dedup_contracts(&mut expected_ids);
+        assert_eq!(stored.affected_contract_ids, expected_ids);
+        assert!(store.contract(new.contract_id).expect("new").is_some());
+
+        let retry = store
+            .register_contracts(&[(existing, evidence.clone()), (new, evidence)])
+            .expect("idempotent retry");
+        assert!(retry.iter().all(|result| !result.inserted));
+        assert!(matches!(
+            retry[0].record.sync_state,
+            ContractSyncState::Ready { .. }
+        ));
+        assert!(matches!(
+            retry[1].record.sync_state,
+            ContractSyncState::CatchingUp { .. }
+        ));
+    }
+
+    #[test]
+    fn ambiguous_and_idempotent_hint_claims_do_not_mutate_association() {
+        let (_dir, _path, store) = initialized_store();
+        let creation = transaction(803, &[], 2);
+        let position = ChainPosition {
+            block_height: 1,
+            tx_index: 0,
+        };
+        let location = RecoveryHintLocation {
+            position,
+            output_index: 1,
+        };
+        store
+            .apply_block(&BlockDelta {
+                anchor: anchor(1),
+                prev_block_hash: anchor(0).hash,
+                ordered_txids: vec![creation.txid()],
+                relevant_transactions: Vec::new(),
+                recovery_hints: vec![RecoveryHintDelta {
+                    location,
+                    creation_txid: creation.txid(),
+                    family: RecoveryFamily::BinaryMarketV1,
+                    payload: vec![0x10, 0x01],
+                    associated_contract: None,
+                }],
+            })
+            .expect("index unassociated hint");
+
+        let mut market = market_record(0x65, position, creation.txid(), 0, 0, anchor(1));
+        market.sync_state = ContractSyncState::CatchingUp {
+            synced_through: anchor(1),
+        };
+        let unassociated = RegistrationEvidence {
+            anchor: anchor(1),
+            transaction: Arc::new(creation.clone()),
+            associated_hint: None,
+        };
+        let associated = RegistrationEvidence {
+            associated_hint: Some(location),
+            ..unassociated.clone()
+        };
+        let mut other = market_record(0x66, position, creation.txid(), 1, 0, anchor(1));
+        other.sync_state = ContractSyncState::CatchingUp {
+            synced_through: anchor(1),
+        };
+        let results = store
+            .register_contracts(&[
+                (market.clone(), associated.clone()),
+                (other.clone(), associated.clone()),
+            ])
+            .expect("ambiguous hint claims do not invalidate contracts");
+        assert!(results.iter().all(|result| result.inserted));
+        assert!(
+            store
+                .contract(market.contract_id)
+                .expect("market")
+                .is_some()
+        );
+        assert!(store.contract(other.contract_id).expect("other").is_some());
+        assert_eq!(
+            store
+                .recovery_hint(location)
+                .expect("hint")
+                .expect("stored hint")
+                .associated_contract,
+            None
+        );
+
+        let high = store.event_high_watermark().expect("high watermark");
+        let results = store
+            .register_contracts(&[(market.clone(), associated)])
+            .expect("idempotent hint claim");
+        assert!(!results[0].inserted);
+        assert_eq!(results[0].record, market);
+        assert_eq!(
+            store
+                .recovery_hint(location)
+                .expect("hint")
+                .expect("stored hint")
+                .associated_contract,
+            None
+        );
+        assert_eq!(store.event_high_watermark().expect("high watermark"), high);
+
+        // The unassociated evidence remains an equivalent idempotent retry.
+        assert!(
+            !store
+                .register_contract(&market, &unassociated)
+                .expect("unassociated retry")
+        );
+    }
+
+    #[test]
+    fn new_registration_and_recovery_hint_association_commit_together() {
+        let (_dir, _path, store) = initialized_store();
+        let creation = transaction(804, &[], 2);
+        let position = ChainPosition {
+            block_height: 1,
+            tx_index: 0,
+        };
+        let location = RecoveryHintLocation {
+            position,
+            output_index: 1,
+        };
+        store
+            .apply_block(&BlockDelta {
+                anchor: anchor(1),
+                prev_block_hash: anchor(0).hash,
+                ordered_txids: vec![creation.txid()],
+                relevant_transactions: Vec::new(),
+                recovery_hints: vec![
+                    RecoveryHintDelta {
+                        location: RecoveryHintLocation {
+                            position,
+                            output_index: 0,
+                        },
+                        creation_txid: creation.txid(),
+                        family: RecoveryFamily::BinaryMarketV1,
+                        payload: vec![0x10, 0x01],
+                        associated_contract: None,
+                    },
+                    RecoveryHintDelta {
+                        location,
+                        creation_txid: creation.txid(),
+                        family: RecoveryFamily::BinaryMarketV1,
+                        payload: vec![0x10, 0x02],
+                        associated_contract: None,
+                    },
+                ],
+            })
+            .expect("index hint");
+        let first_page = store
+            .scan_recovery_hints(None, None, 1)
+            .expect("first recovery-hint page");
+        assert_eq!(first_page.items.len(), 1);
+        let cursor = first_page.next.expect("continuation cursor");
+        assert!(matches!(
+            store.scan_recovery_hints(Some(RecoveryFamily::BinaryMarketV1), Some(&cursor), 1),
+            Err(StoreError::SnapshotScopeMismatch { .. })
+        ));
+        let second_page = store
+            .scan_recovery_hints(None, Some(&cursor), 1)
+            .expect("stable continuation");
+        assert_eq!(second_page.snapshot, first_page.snapshot);
+        assert_eq!(second_page.items.len(), 1);
+        assert!(second_page.next.is_none());
+
+        let mut market = market_record(0x67, position, creation.txid(), 0, 0, anchor(1));
+        market.sync_state = ContractSyncState::CatchingUp {
+            synced_through: anchor(1),
+        };
+        let evidence = RegistrationEvidence {
+            anchor: anchor(1),
+            transaction: Arc::new(creation.clone()),
+            associated_hint: Some(location),
+        };
+
+        let results = store
+            .register_contracts(&[(market.clone(), evidence)])
+            .expect("register and associate");
+        assert!(results[0].inserted);
+        assert_eq!(results[0].record, market);
+        assert_eq!(
+            store
+                .recovery_hint(location)
+                .expect("hint")
+                .expect("stored hint")
+                .associated_contract,
+            Some(market.contract_id)
+        );
+        let current_snapshot = store.snapshot_metadata().expect("current snapshot");
+        assert_eq!(current_snapshot.as_of, first_page.snapshot.as_of);
+        assert_ne!(
+            current_snapshot.event_high_watermark,
+            first_page.snapshot.event_high_watermark
+        );
+        assert!(matches!(
+            store.scan_recovery_hints(None, Some(&cursor), 1),
+            Err(StoreError::StaleSnapshotCursor { .. })
+        ));
+
+        let mut other = market_record(0x68, position, creation.txid(), 1, 0, anchor(1));
+        other.sync_state = ContractSyncState::CatchingUp {
+            synced_through: anchor(1),
+        };
+        let competing = RegistrationEvidence {
+            anchor: anchor(1),
+            transaction: Arc::new(creation),
+            associated_hint: Some(location),
+        };
+        assert!(
+            store
+                .register_contract(&other, &competing)
+                .expect("already-owned hint is advisory")
+        );
+        assert_eq!(
+            store
+                .recovery_hint(location)
+                .expect("hint")
+                .expect("stored hint")
+                .associated_contract,
+            Some(market.contract_id)
+        );
+    }
+
+    #[test]
+    fn missing_and_mismatched_hints_do_not_block_registration() {
+        let (_dir, _path, store) = initialized_store();
+        let missing_tx = transaction(805, &[], 2);
+        let mismatched_tx = transaction(806, &[], 2);
+        let missing_position = ChainPosition {
+            block_height: 1,
+            tx_index: 0,
+        };
+        let mismatched_position = ChainPosition {
+            block_height: 1,
+            tx_index: 1,
+        };
+        let missing_location = RecoveryHintLocation {
+            position: missing_position,
+            output_index: 1,
+        };
+        let mismatched_location = RecoveryHintLocation {
+            position: mismatched_position,
+            output_index: 1,
+        };
+        store
+            .apply_block(&BlockDelta {
+                anchor: anchor(1),
+                prev_block_hash: anchor(0).hash,
+                ordered_txids: vec![missing_tx.txid(), mismatched_tx.txid()],
+                relevant_transactions: Vec::new(),
+                recovery_hints: vec![RecoveryHintDelta {
+                    location: mismatched_location,
+                    creation_txid: mismatched_tx.txid(),
+                    family: RecoveryFamily::MakerOrderV1,
+                    payload: vec![0x20, 0x01],
+                    associated_contract: None,
+                }],
+            })
+            .expect("index mismatched-family hint");
+
+        let mut missing = market_record(0x69, missing_position, missing_tx.txid(), 0, 0, anchor(1));
+        missing.sync_state = ContractSyncState::CatchingUp {
+            synced_through: anchor(1),
+        };
+        let mut mismatched = market_record(
+            0x6a,
+            mismatched_position,
+            mismatched_tx.txid(),
+            0,
+            0,
+            anchor(1),
+        );
+        mismatched.sync_state = ContractSyncState::CatchingUp {
+            synced_through: anchor(1),
+        };
+
+        let results = store
+            .register_contracts(&[
+                (
+                    missing.clone(),
+                    RegistrationEvidence {
+                        anchor: anchor(1),
+                        transaction: Arc::new(missing_tx),
+                        associated_hint: Some(missing_location),
+                    },
+                ),
+                (
+                    mismatched.clone(),
+                    RegistrationEvidence {
+                        anchor: anchor(1),
+                        transaction: Arc::new(mismatched_tx),
+                        associated_hint: Some(mismatched_location),
+                    },
+                ),
+            ])
+            .expect("advisory hint failures do not invalidate registration");
+        assert!(results.iter().all(|result| result.inserted));
+        assert!(
+            store
+                .contract(missing.contract_id)
+                .expect("missing")
+                .is_some()
+        );
+        assert!(
+            store
+                .contract(mismatched.contract_id)
+                .expect("mismatched")
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .recovery_hint(mismatched_location)
+                .expect("hint")
+                .expect("stored hint")
+                .associated_contract,
+            None
         );
     }
 
@@ -3780,7 +4935,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .outpoint_owner(DeadcatOutPoint::new(composed.txid(), 1))
+                .outpoint_owner(OutPoint::new(composed.txid(), 1))
                 .expect("owner")
                 .expect("tracked")
                 .contract_id,
@@ -3797,7 +4952,7 @@ mod tests {
         );
         assert!(
             store
-                .output(DeadcatOutPoint::new(composed.txid(), 0))
+                .output(OutPoint::new(composed.txid(), 0))
                 .expect("output")
                 .is_some()
         );
@@ -3826,6 +4981,80 @@ mod tests {
         let reopened = Store::open(&path).expect("reopen");
         assert_eq!(reopened.tip().expect("tip"), Some(anchor(2)));
         assert_eq!(reopened.event_high_watermark().expect("cursor"), cursor);
+    }
+
+    #[test]
+    fn block_rejects_creation_anchor_not_tracked_as_an_initial_output() {
+        let (_dir, _path, store) = initialized_store();
+        let creation = transaction(299, &[], 2);
+        let position = ChainPosition {
+            block_height: 1,
+            tx_index: 0,
+        };
+        let mut market = market_record(0x2a, position, creation.txid(), 0, 0, anchor(1));
+        market.outpoints[0].outpoint = OutPoint::new(creation.txid(), 1);
+        let contract_id = market.contract_id;
+
+        assert!(matches!(
+            store.apply_block(&block(
+                1,
+                vec![ChainTxDelta {
+                    position,
+                    block_hash: anchor(1).hash,
+                    txid: creation.txid(),
+                    raw_tx: creation,
+                    created_contracts: vec![market],
+                    state_updates: Vec::new(),
+                }],
+                Vec::new(),
+            )),
+            Err(StoreError::InvalidBlock(message))
+                if message.contains("anchor is not one of its initial live outputs")
+        ));
+        assert_eq!(store.tip().expect("tip"), Some(anchor(0)));
+        assert!(store.contract(contract_id).expect("contract").is_none());
+        assert!(store.transaction(position).expect("transaction").is_none());
+        assert!(store.events_after(None, 10).expect("events").is_empty());
+    }
+
+    #[test]
+    fn block_rejects_creation_anchor_outside_the_creation_transaction() {
+        let (_dir, _path, store) = initialized_store();
+        let creation = transaction(300, &[], 1);
+        let position = ChainPosition {
+            block_height: 1,
+            tx_index: 0,
+        };
+        let absent_anchor = OutPoint::new(creation.txid(), 1);
+        let mut market = market_record(0x2b, position, creation.txid(), 0, 0, anchor(1));
+        market.contract_id = ContractId::new(absent_anchor);
+        market.outpoints[0].outpoint = absent_anchor;
+
+        assert!(matches!(
+            store.apply_block(&block(
+                1,
+                vec![ChainTxDelta {
+                    position,
+                    block_hash: anchor(1).hash,
+                    txid: creation.txid(),
+                    raw_tx: creation,
+                    created_contracts: vec![market],
+                    state_updates: Vec::new(),
+                }],
+                Vec::new(),
+            )),
+            Err(StoreError::InvalidBlock(message))
+                if message.contains("anchor is absent from its creation transaction")
+        ));
+        assert_eq!(store.tip().expect("tip"), Some(anchor(0)));
+        assert!(
+            store
+                .contract(ContractId::new(absent_anchor))
+                .expect("contract")
+                .is_none()
+        );
+        assert!(store.transaction(position).expect("transaction").is_none());
+        assert!(store.events_after(None, 10).expect("events").is_empty());
     }
 
     #[test]
@@ -3965,7 +5194,7 @@ mod tests {
         );
         assert!(
             store
-                .outpoint_owner(DeadcatOutPoint::new(tx3.txid(), 0))
+                .outpoint_owner(OutPoint::new(tx3.txid(), 0))
                 .expect("owner")
                 .is_none()
         );
@@ -3980,7 +5209,7 @@ mod tests {
         );
         assert!(
             store
-                .output(DeadcatOutPoint::new(tx3.txid(), 0))
+                .output(OutPoint::new(tx3.txid(), 0))
                 .expect("output")
                 .is_none()
         );

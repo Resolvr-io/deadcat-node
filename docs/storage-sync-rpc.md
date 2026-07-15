@@ -3,10 +3,8 @@
 ## Canonical types
 
 ```rust
-pub struct ContractId {
-    pub cmr: [u8; 32],
-    pub creation_txid: Txid,
-}
+#[repr(transparent)]
+pub struct ContractId(elements::OutPoint); // canonical creation anchor
 
 pub struct ChainPosition {
     pub block_height: u32,
@@ -19,13 +17,59 @@ pub struct ChainAnchor {
 }
 ```
 
-`ContractId` is not the oracle `market_id`. The former identifies a compiled
-on-chain contract instance; the latter is the binary asset-pair digest signed by
-the oracle.
+`ContractId` is not the oracle `market_id`. The former identifies an on-chain
+contract instance by one exact creation-anchor output; the latter is the binary
+asset-pair digest signed by the oracle. Market ContractIds anchor at the initial
+dormant YES RT output; maker ContractIds anchor at the initial order output.
+The ID remains stable as live outpoints change and is not itself proof that the
+claimed contract is valid.
 
 Keys use stable, manually encoded big-endian components. Rust struct
 serialization is not used directly for redb keys. Values use an explicitly
-versioned encoding.
+versioned encoding. A ContractId key is 36 bytes:
+`txid_internal_bytes[32] || vout_be_u32[4]`. Its strict human-readable RPC form
+is `{"txid":"...","vout":n}`.
+
+Ordinary chain and live-state references use `elements::OutPoint` directly.
+Only the creation anchor receives the nominal ContractId wrapper, preventing a
+current or wallet outpoint from being used accidentally as identity without
+duplicating rust-elements' native Liquid transaction type or coupling storage
+to a wallet library.
+
+### Portable registration types
+
+```rust
+pub enum ContractDescriptor {
+    BinaryMarketV1 { params: BinaryMarketParams },
+    MakerOrderV1 {
+        parent_market: ContractId,
+        side: OrderSide,
+        params: MakerOrderParams,
+    },
+}
+
+pub struct ContractDeclaration {
+    pub contract_id: ContractId,
+    pub descriptor: ContractDescriptor,
+}
+
+pub struct ContractPackage {
+    pub format_version: u16, // exactly 1 in v1
+    pub chain: ChainIdentity, // network + genesis hash
+    pub roots: Vec<ContractId>,
+    pub declarations: Vec<ContractDeclaration>,
+}
+```
+
+The descriptor says what to compile, the declaration claims where it was
+created, and the package carries the requested roots plus any parent dependency
+closure. All are untrusted input. V1 accepts 1..=16 unique declared roots and
+1..=64 unique declarations. It rejects duplicate IDs/roots, self-dependencies,
+undeclared roots, and declarations unreachable from a root. A referenced parent
+must be declared in the package or already verified in this node; an included
+maker parent must be a binary market. Package order is irrelevant to dependency
+verification. A successful receipt returns roots in package root order and
+per-contract results in declaration order, including idempotent results.
 
 ## Redb schema
 
@@ -37,6 +81,7 @@ The initial schema contains:
 | `chain_tip` | singleton indexed canonical tip |
 | `chain_checkpoints` | height to block hash and previous hash |
 | `contracts` | immutable params, kind/version, creation, current state, provenance |
+| `retained_contract_declarations` | explicitly registered, normalized declarations retained across rollback/rebuild |
 | `outpoint_owners` | outpoint to contract and slot/role |
 | `contract_outpoints` | contract and slot/role to current outpoint |
 | `script_index` | script hash, contract, and role multimap |
@@ -53,6 +98,14 @@ The initial schema contains:
 Current state is materialized for read performance. `chain_transactions` and
 `contract_history` are the canonical audit trail and are retained indefinitely
 in v1. Undo retention is a separate two-block operational window.
+
+`retained_contract_declarations` is the deliberate exception to the
+chain-derived tables. A declaration is written only after its package has been
+fully verified, but it remains watch intent rather than chain authority. A
+rollback or rebuild preserves it and canonical replay recompiles it against the
+replacement branch before recreating any materialized contract state. Package
+roots and boundaries are not retained: the normalized union of accepted
+declarations is the dependency/watch set.
 
 The asset index is many-to-many. A market token can be referenced by its parent
 market and by many orders, and later by pools.
@@ -163,11 +216,11 @@ pinned tip. During the same ordered pass the node:
   public fields are insufficient for the node to compile the order.
 
 Automatic market discovery accepts only the fixed standalone creation shape.
-Composed creations use full manual registration, avoiding combinatorial scans
-over attacker-supplied issuance sets. A standard Esplora service has no global
-OP_RETURN-prefix index, so activation-to-tip scanning requires downloading all
-raw blocks and may be unavailable or operationally expensive. Nostr and manual
-registration remain fast-start paths.
+Composed creations use complete contract-package registration, avoiding
+combinatorial scans over attacker-supplied issuance sets. A standard Esplora
+service has no global OP_RETURN-prefix index, so activation-to-tip scanning
+requires downloading all raw blocks and may be unavailable or operationally
+expensive. Nostr and manual registration remain fast-start paths.
 
 `GetInfo` reports discovery coverage separately from contract synchronization:
 
@@ -182,7 +235,16 @@ canonical_market_complete: bool
 A node can be fully synchronized for every registered contract while its global
 market discovery remains incomplete.
 
-### Late registration and backfill
+### Package registration, late registration, and backfill
+
+The verifier checks the package's exact chain identity and dependency graph,
+fetches confirmed creation evidence from its configured chain source, resolves
+parents before children, compiles each canonical descriptor, and validates each
+nominated anchor plus the full family-specific creation invariant. The market
+anchor must be the exact initial dormant YES RT output; the maker anchor must be
+the exact initial order output. Every declaration is verified before one redb
+transaction inserts the complete package, so failure cannot leave a partial
+dependency graph. An identical retry is idempotent.
 
 Registration initially stores a verified contract as `CatchingUp`, excluded
 from active listings, order routing, and current snapshots. A backfill worker:
@@ -224,10 +286,14 @@ If no common ancestor exists in the retained window:
 1. set `SyncStatus::RescanRequired`;
 2. mark the node unready and stop claiming current state;
 3. rotate the durable-event epoch;
-4. rebuild chain-derived materialized tables and histories from genesis or a
-   configured full-state checkpoint whose anchor is verified against the
-   selected chain source; and
+4. rebuild chain-derived materialized tables and histories from genesis; and
 5. rescan before returning to `Ready`.
+
+V1 requires the exact genesis anchor whenever retained declarations exist.
+Starting later could skip a watched contract's creation and no authenticated
+post-genesis contract-state checkpoint exists yet. A future full-state
+checkpoint format may relax this only by authenticating all pre-checkpoint
+contract state and declaration coverage.
 
 Two-block undo data is not claimed to restore an older checkpoint. The rebuild
 is explicit and observable. The node never silently wipes, guesses, or
@@ -239,7 +305,7 @@ The transport-neutral request set begins with:
 
 ```text
 GetInfo
-RegisterContract
+RegisterContractPackage
 GetContract
 ListMarkets
 GetMarketSnapshot
@@ -263,11 +329,21 @@ Snapshot and list responses come from one redb read transaction and include an
 exact `as_of` anchor plus durable-event high-watermark. Pagination never splits
 a block's canonical ordering semantics.
 
-Every page cursor binds to that original anchor and event watermark. Because v1
-does not retain arbitrary materialized snapshots, a subsequent page is rejected
+Every page cursor binds to that original anchor, event watermark, and exact
+query scope. The scope records the endpoint and every result-set filter: the
+market ID, side, and direction for orders, or the optional family for recovery
+hints. Reusing a continuation with different filters is rejected rather than
+silently skipping matches before its opaque `after_key`. Because v1 does not
+retain arbitrary materialized snapshots, a subsequent page is also rejected
 with `SnapshotInvalidated` if the indexed tip no longer exactly equals the
 cursor anchor, including an ordinary tip advance. The client restarts from a
 fresh snapshot rather than mixing versions or skipping entries.
+
+`ListRecoveryHints` uses this same `PageRequest` / `SnapshotCursor` contract;
+its optional family filter is part of the cursor's `RecoveryHints` scope. A
+contract registration or recovery-hint association advances the durable-event
+watermark, so a continuation created before that write is invalidated even when
+the chain tip itself has not changed.
 
 `InterpretTransaction` returns every recognized contract transition, not the
 first match. It is a pure advisory RPC; canonical state changes only through the
@@ -275,7 +351,11 @@ coordinator.
 
 Evidence responses contain raw creation/transition transactions, block hash,
 chain position, parameters, CMR/script data, and typed input/output roles. The
-client recompiles and replays locally.
+client recompiles and replays locally. Before replay, an independent chain
+source must authenticate the complete consensus transaction (including all
+witnesses) at the reported block position. Matching only `txid` is insufficient
+because Elements transaction IDs exclude the witness data that selects and
+parameterizes Deadcat covenant transitions.
 
 Typed errors include at least:
 

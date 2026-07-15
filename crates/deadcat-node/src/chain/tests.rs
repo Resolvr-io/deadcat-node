@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
-use deadcat_types::{ChainAnchor, DeadcatOutPoint};
+use deadcat_types::ChainAnchor;
 use elements::encode::serialize;
 use elements::{BlockHash, LockTime, OutPoint, Script, Transaction, TxIn, TxOut, Txid};
 use serde_json::{Value, json};
@@ -145,7 +145,7 @@ async fn both_backends_return_a_canonical_confirmed_position() {
 #[tokio::test]
 async fn both_backends_identify_an_unconfirmed_outspend() {
     let source_transaction = fixture_transaction();
-    let source_outpoint = DeadcatOutPoint::new(source_transaction.txid(), 0);
+    let source_outpoint = OutPoint::new(source_transaction.txid(), 0);
     let spender = spending_transaction(source_outpoint);
     let expected = Some(Outspend {
         spending_txid: spender.txid(),
@@ -322,9 +322,9 @@ fn fixture_transaction() -> Transaction {
     }
 }
 
-fn spending_transaction(outpoint: DeadcatOutPoint) -> Transaction {
+fn spending_transaction(outpoint: OutPoint) -> Transaction {
     let input = TxIn {
-        previous_output: OutPoint::from(outpoint),
+        previous_output: outpoint,
         ..TxIn::default()
     };
     Transaction {
