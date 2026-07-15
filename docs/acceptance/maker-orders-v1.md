@@ -4,8 +4,8 @@ Status: Complete for the local Elements protocol gate.
 
 This packet records the production-shaped boundary for the v1 maker-order
 covenant. It complements the pure Rust, generated Simplicity, interpreter,
-store, RPC, and randomized tests with transactions accepted by an isolated
-`elementsd` liquidregtest chain.
+store, RPC, and deterministic integration tests with transactions accepted by
+an isolated `elementsd` liquidregtest chain.
 
 ## Accepted live lifecycle
 
@@ -97,9 +97,9 @@ Run every required local/CI gate:
 nix develop .#default --command just ci
 ```
 
-`.github/workflows/ci.yml` invokes `just regtest`, which includes both the
-binary-market A/B and maker-order live suites. The test is ignored only for
-ordinary `cargo test`; it is mandatory in CI.
+`.github/workflows/ci.yml` invokes `just regtest`, which includes the
+binary-market A/B, maker-order, and multi-contract live suites. The test is
+ignored only for ordinary `cargo test`; it is mandatory in CI.
 
 ## Deliberate boundaries
 

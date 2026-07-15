@@ -312,9 +312,12 @@ surjection proofs were rejected.
 
 Concrete-block sync tests start with no registered contract and exercise
 OP_RETURN recovery through `SyncCoordinator + DeadcatInterpreter`, redb reopen,
-idempotent replay, and coordinator-driven one-/two-block branch replacement. A
-separate two-market transaction proves atomic interpreter/store orchestration.
-Exact full-market and live measurements are preserved in
+idempotent replay, and coordinator-driven one-/two-block branch replacement.
+Deterministic fixtures prove two-market atomic interpreter/store orchestration;
+the mandatory [multi-contract live gate](../acceptance/multi-contract-v1.md)
+adds a real composed covenant transaction accepted by Elements and processed
+as one atomic interpreter/store batch. Exact full-market and live
+measurements are preserved in
 [`../measurements/binary-market-ab-v1.json`](../measurements/binary-market-ab-v1.json)
 and the acceptance packet.
 
@@ -380,11 +383,16 @@ full checklist and evidence locations live in
    mining, and confirmation across every lifecycle class. The deterministic
    corpus emits machine-readable metrics, and one live run preserves txids,
    block hashes, sizes, weights, and proof bytes.
-5. **Complete — recovery and orchestration:** zero-seed concrete-block recovery,
-   generic chain-verified registration, restart, direct and coordinator-driven
-   one-/two-block reorg replay, live wallet composition, and two-market atomic
-   indexing pass the candidate corpus.
-6. **Partially complete — review and approval:** Tommy Volk approved the
+5. **Complete — recovery and deterministic orchestration:** zero-seed
+   concrete-block recovery, generic chain-verified registration, restart,
+   direct and coordinator-driven one-/two-block reorg replay, live wallet
+   composition, and deterministic two-market atomic indexing pass the
+   candidate corpus.
+6. **Complete — live composed orchestration:** one real transaction advances a
+   market and two maker orders through Elements acceptance,
+   transaction-atomic indexing, restart, reorg replay, and independent client
+   validation in the mandatory multi-contract gate.
+7. **Partially complete — review and approval:** Tommy Volk approved the
    protocol-owner checklist on 2026-07-14 against
    `7ed20b8b81306eaf81ee49b80b4ea65b49804871`. The constants, scalar byte
    order, complementary-CBF algebra, derived commitments, CMR change, and clean

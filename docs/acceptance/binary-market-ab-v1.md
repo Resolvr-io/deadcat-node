@@ -12,7 +12,7 @@ This packet is the acceptance boundary for replacing the experimental rolling
 reissuance-token (RT) blinding schedule with fixed complementary A/B blinders
 in binary-market v1. It covers the consensus design and its node/client
 integration. It is not a claim that the entire Deadcat node is production
-ready; broader operational shakedowns and maker-order ownership recovery remain
+ready; broader operational shakedowns and focused external review remain
 separate release work.
 
 ADR 0005 remains Proposed until a focused reviewer records a conclusion. Tommy
@@ -61,7 +61,7 @@ The CMR above is not universal across market parameters.
 | Golden integration identity | Complete | Constants, six fixture commitments, six independently derived nonuniform-ID commitments, CMR, eight scripts, and eight control blocks are literal regression vectors |
 | Market public recovery and registration | Complete | Unchanged 38/70-byte hints; zero-seed concrete-block discovery through `SyncCoordinator + DeadcatInterpreter`; generic `ChainSource -> verify_and_register -> redb -> reopen`; backend transaction/status adapters tested separately |
 | Restart and retained reorg depth | Complete | Two real A/B markets survive redb reopen; direct store and coordinator-driven one-/two-block branch replacement restore exact state, history, outputs, and raw evidence |
-| Composition/orchestration | Complete for v1 gate | Live confidential wallet input/change composition; one synthetic transaction updates two markets atomically through the real interpreter/store |
+| Composition/orchestration | Complete for v1 gate | Live confidential wallet input/change composition and deterministic synthetic two-market atomic indexing; the mandatory multi-contract liquidregtest gate mines and atomically indexes a real market-plus-two-orders transaction |
 | Full-market before/after measurements | Captured with provenance limitation | A/B reporter is reproducible; exact rolling rows are a preserved capture from temporary baseline instrumentation whose patch was not committed; isolated rolling/A-B study remains reproducible |
 | Rolling retirement | Complete | No rolling implementation, compatibility mode, study crate, or schema migration remains in the candidate tree |
 | Clean pinned-Nix CI | Passed on 2026-07-13 | `nix develop path:.#default --command just ci`; rerun after freezing nonuniform commitment vectors |
@@ -69,11 +69,14 @@ The CMR above is not universal across market parameters.
 | Focused external human review | Pending | Reviewer record below |
 | Protocol-owner approval | Complete | Tommy Volk; 2026-07-14; candidate implementation commit below |
 
-The node-level composition fixture is intentionally distinguished from mined
-multi-covenant evidence: it proves atomic orchestration of two contracts, while
-the live harness proves Elements-valid composition with unrelated explicit and
-confidential wallet inputs/change. Mining two covenants in one transaction is
-additional assurance, not a distinct A/B consensus rule.
+The original node-level composition fixture proves atomic orchestration of two
+contracts, while the binary-market lifecycle harness proves Elements-valid
+composition with unrelated explicit and confidential wallet inputs/change. The
+[multi-contract live gate](multi-contract-v1.md) adds the cross-layer evidence:
+a real transaction advances multiple covenant instances through Elements
+consensus, one interpreter batch, atomic redb indexing, and independent client
+replay. This is additional orchestration assurance, not a distinct A/B
+consensus rule.
 
 ## Reproduction environment
 
