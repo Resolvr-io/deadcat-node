@@ -27,6 +27,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+use crate::activation::{PolicyAssetError, validate_policy_asset};
+
 pub const SCHEMA_VERSION: u32 = 1;
 pub const UNDO_RETENTION_BLOCKS: u32 = 2;
 const RECORD_VERSION: u8 = 1;
@@ -62,6 +64,92 @@ const SYNC_STATUS_KEY: &str = "sync_status";
 const CHAIN_IDENTITY_KEY: &str = "chain_identity";
 const ACTIVATION_ANCHOR_KEY: &str = "v1_activation_anchor";
 const TIP_KEY: &str = "tip";
+
+/// Named mutation boundaries used by the store assurance tests. Both this
+/// module and every call site are removed from non-test builds, so production
+/// writes do not pay for failpoint checks or carry mutable global state.
+#[cfg(test)]
+mod mutation_failpoints {
+    use std::cell::RefCell;
+
+    use super::StoreError;
+
+    pub(super) const APPLY_AFTER_TRANSACTION: &str = "apply_block.after_transaction";
+    pub(super) const APPLY_AFTER_RECOVERY_HINT: &str = "apply_block.after_recovery_hint";
+    pub(super) const APPLY_AFTER_CATCH_UP: &str = "apply_block.after_catch_up";
+    pub(super) const APPLY_AFTER_BLOCK: &str = "apply_block.after_block";
+    pub(super) const APPLY_AFTER_UNDO: &str = "apply_block.after_undo";
+    pub(super) const APPLY_AFTER_TIP: &str = "apply_block.after_tip";
+    pub(super) const APPLY_AFTER_PRUNE: &str = "apply_block.after_prune";
+    pub(super) const APPLY_BEFORE_COMMIT: &str = "apply_block.before_commit";
+    pub(super) const ROLLBACK_AFTER_REBUILD_MARK: &str = "rollback.after_rebuild_mark";
+    pub(super) const ROLLBACK_AFTER_BLOCK: &str = "rollback.after_block";
+    pub(super) const ROLLBACK_AFTER_TIP: &str = "rollback.after_tip";
+    pub(super) const ROLLBACK_AFTER_STATUS: &str = "rollback.after_status";
+    pub(super) const ROLLBACK_AFTER_EVENT: &str = "rollback.after_event";
+    pub(super) const ROLLBACK_BEFORE_COMMIT: &str = "rollback.before_commit";
+    pub(super) const INVALIDATE_AFTER_REBUILD_MARK: &str = "invalidate.after_rebuild_mark";
+    pub(super) const INVALIDATE_BEFORE_COMMIT: &str = "invalidate.before_commit";
+    pub(super) const RESET_AFTER_CLEAR: &str = "reset.after_clear";
+    pub(super) const RESET_AFTER_TIP: &str = "reset.after_tip";
+    pub(super) const RESET_AFTER_STATUS: &str = "reset.after_status";
+    pub(super) const RESET_AFTER_EVENT: &str = "reset.after_event";
+    pub(super) const RESET_BEFORE_COMMIT: &str = "reset.before_commit";
+
+    #[derive(Clone, Copy)]
+    struct Active {
+        name: &'static str,
+        remaining_hits: usize,
+    }
+
+    thread_local! {
+        static ACTIVE: RefCell<Option<Active>> = const { RefCell::new(None) };
+    }
+
+    pub(super) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| *active.borrow_mut() = None);
+        }
+    }
+
+    /// Arm a single failpoint. `occurrence` is zero-based, which lets tests
+    /// stop after each item in mutation loops such as per-transaction apply or
+    /// per-block rollback.
+    pub(super) fn arm(name: &'static str, occurrence: usize) -> Guard {
+        ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            assert!(
+                active.is_none(),
+                "a store mutation failpoint is already armed"
+            );
+            *active = Some(Active {
+                name,
+                remaining_hits: occurrence,
+            });
+        });
+        Guard
+    }
+
+    pub(super) fn hit(name: &'static str) -> Result<(), StoreError> {
+        ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            let Some(specification) = active.as_mut() else {
+                return Ok(());
+            };
+            if specification.name != name {
+                return Ok(());
+            }
+            if specification.remaining_hits != 0 {
+                specification.remaining_hits -= 1;
+                return Ok(());
+            }
+            *active = None;
+            Err(StoreError::InjectedMutationFailure(name))
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainIdentity {
@@ -562,7 +650,7 @@ impl Store {
     }
 
     #[cfg(test)]
-    fn bind_chain(&self, identity: ChainIdentity) -> Result<(), StoreError> {
+    pub(crate) fn bind_chain(&self, identity: ChainIdentity) -> Result<(), StoreError> {
         let write = self.database.begin_write()?;
         {
             let mut meta = write.open_table(META)?;
@@ -600,6 +688,9 @@ impl Store {
         identity: ChainIdentity,
         activation_anchor: ChainAnchor,
     ) -> Result<(), StoreError> {
+        // Resolve this invariant before opening a redb write transaction. A
+        // malformed production identity must never partially bind a database.
+        validate_policy_asset(identity.network, identity.policy_asset)?;
         let write = self.database.begin_write()?;
         let existing_identity =
             read_meta_record_from_write::<ChainIdentity>(&write, CHAIN_IDENTITY_KEY)?;
@@ -1850,12 +1941,18 @@ impl Store {
         transactions.sort_by_key(|transaction| transaction.position.tx_index);
         for transaction in transactions {
             apply_chain_transaction(&write, delta.anchor, transaction, &mut undo)?;
+            #[cfg(test)]
+            mutation_failpoints::hit(mutation_failpoints::APPLY_AFTER_TRANSACTION)?;
         }
         for hint in &delta.recovery_hints {
             insert_recovery_hint(&write, hint)?;
             undo.recovery_locations.push(hint.location);
+            #[cfg(test)]
+            mutation_failpoints::hit(mutation_failpoints::APPLY_AFTER_RECOVERY_HINT)?;
         }
         advance_catching_through_canonical_block(&write, delta, delta_digest, &mut undo)?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::APPLY_AFTER_CATCH_UP)?;
 
         let stored_block = StoredBlock {
             anchor: delta.anchor,
@@ -1869,15 +1966,25 @@ impl Store {
             &delta.anchor.height.to_be_bytes(),
             &stored_block,
         )?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::APPLY_AFTER_BLOCK)?;
         write_fixed(
             &write,
             UNDO_BLOCKS,
             &delta.anchor.height.to_be_bytes(),
             &undo,
         )?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::APPLY_AFTER_UNDO)?;
         write_tip(&write, delta.anchor)?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::APPLY_AFTER_TIP)?;
         prune_undo(&write, delta.anchor.height)?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::APPLY_AFTER_PRUNE)?;
         let high = high_watermark_from_write(&write)?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::APPLY_BEFORE_COMMIT)?;
         write.commit()?;
         Ok(ApplyBlockResult {
             applied: true,
@@ -1906,6 +2013,10 @@ impl Store {
             || !undo_range_available(&write, old_tip.height, ancestor.height)?
         {
             let epoch = mark_rebuild_required(&write)?;
+            #[cfg(test)]
+            mutation_failpoints::hit(mutation_failpoints::ROLLBACK_AFTER_REBUILD_MARK)?;
+            #[cfg(test)]
+            mutation_failpoints::hit(mutation_failpoints::ROLLBACK_BEFORE_COMMIT)?;
             write.commit()?;
             return Ok(RollbackResult::RebuildRequired {
                 old_tip,
@@ -1967,6 +2078,8 @@ impl Store {
             remove_fixed(&write, BLOCKS, &height.to_be_bytes())?;
             remove_fixed(&write, UNDO_BLOCKS, &height.to_be_bytes())?;
             current_tip = undo.previous_tip;
+            #[cfg(test)]
+            mutation_failpoints::hit(mutation_failpoints::ROLLBACK_AFTER_BLOCK)?;
         }
         if current_tip != ancestor {
             return Err(StoreError::AncestorMismatch {
@@ -1978,7 +2091,11 @@ impl Store {
         sort_dedup_contracts(&mut affected_market_ids);
         orphaned_positions.sort();
         write_tip(&write, ancestor)?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::ROLLBACK_AFTER_TIP)?;
         write_meta_record(&write, SYNC_STATUS_KEY, &SyncStatus::Syncing)?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::ROLLBACK_AFTER_STATUS)?;
         let event = StoredEvent::ChainRolledBack {
             old_tip,
             new_tip: ancestor,
@@ -1987,6 +2104,10 @@ impl Store {
             affected_market_ids,
         };
         let high = append_event(&write, event)?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::ROLLBACK_AFTER_EVENT)?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::ROLLBACK_BEFORE_COMMIT)?;
         write.commit()?;
         Ok(RollbackResult::RolledBack {
             old_tip,
@@ -1999,6 +2120,10 @@ impl Store {
     pub fn invalidate_for_rebuild(&self) -> Result<[u8; 16], StoreError> {
         let write = self.database.begin_write()?;
         let epoch = mark_rebuild_required(&write)?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::INVALIDATE_AFTER_REBUILD_MARK)?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::INVALIDATE_BEFORE_COMMIT)?;
         write.commit()?;
         Ok(epoch)
     }
@@ -2017,14 +2142,24 @@ impl Store {
         let baseline = read_meta_record_from_write::<ChainAnchor>(&write, ACTIVATION_ANCHOR_KEY)?
             .ok_or(StoreError::MissingMetadata(ACTIVATION_ANCHOR_KEY))?;
         clear_chain_tables(&write)?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::RESET_AFTER_CLEAR)?;
         write_tip(&write, baseline)?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::RESET_AFTER_TIP)?;
         write_meta_record(&write, SYNC_STATUS_KEY, &SyncStatus::Syncing)?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::RESET_AFTER_STATUS)?;
         let cursor = append_event(
             &write,
             StoredEvent::SyncStatusChanged {
                 status: SyncStatus::Syncing,
             },
         )?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::RESET_AFTER_EVENT)?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::RESET_BEFORE_COMMIT)?;
         write.commit()?;
         Ok(cursor)
     }
@@ -3673,6 +3808,9 @@ fn order_key(contract_id: ContractId, order: OrderBookEntry) -> [u8; 86] {
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[cfg(test)]
+    #[error("injected store mutation failure at {0}")]
+    InjectedMutationFailure(&'static str),
     #[error("redb database error: {0}")]
     Database(#[from] redb::DatabaseError),
     #[error("redb transaction error: {0}")]
@@ -3713,6 +3851,8 @@ pub enum StoreError {
     EmptyRecord,
     #[error("record version mismatch: expected {expected}, found {actual}")]
     RecordVersionMismatch { expected: u8, actual: u8 },
+    #[error("network policy asset validation failed: {0}")]
+    NetworkPolicy(#[from] PolicyAssetError),
     #[error("chain identity mismatch: database has {expected:?}, requested {actual:?}")]
     ChainIdentityMismatch {
         expected: Box<ChainIdentity>,
@@ -3851,6 +3991,9 @@ pub enum StoreError {
         restored: ChainAnchor,
     },
 }
+
+#[cfg(test)]
+mod assurance_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5713,5 +5856,44 @@ mod tests {
             partial.initialize_chain(identity, anchor(0)),
             Err(StoreError::IncompleteChainConfiguration)
         ));
+    }
+
+    #[test]
+    fn production_policy_asset_is_validated_before_chain_binding() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("deadcat.redb")).expect("open");
+        let activation = anchor(0);
+        let wrong_identity = ChainIdentity {
+            network: LiquidNetwork::Liquid,
+            genesis_hash: activation.hash,
+            policy_asset: crate::activation::production_policy_asset(LiquidNetwork::LiquidTestnet)
+                .expect("testnet policy asset"),
+        };
+
+        assert!(matches!(
+            store.initialize_chain(wrong_identity, activation),
+            Err(StoreError::NetworkPolicy(
+                PolicyAssetError::ProductionPolicyAssetMismatch {
+                    network: LiquidNetwork::Liquid,
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(store.chain_identity().expect("identity"), None);
+        assert_eq!(store.activation_anchor().expect("activation"), None);
+        assert_eq!(store.tip().expect("tip"), None);
+
+        let correct_identity = ChainIdentity {
+            policy_asset: crate::activation::production_policy_asset(LiquidNetwork::Liquid)
+                .expect("mainnet policy asset"),
+            ..wrong_identity
+        };
+        store
+            .initialize_chain(correct_identity, activation)
+            .expect("initialize after rejected policy asset");
+        assert_eq!(
+            store.chain_identity().expect("identity"),
+            Some(correct_identity)
+        );
     }
 }

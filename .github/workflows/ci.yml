@@ -18,7 +18,7 @@ jobs:
         run: nix flake check --print-build-logs
       - name: Rust and contract checks
         run: nix develop .#default --command just ci-checks
-      - name: Live Elements protocol regtests
+      - name: Live Elements and Esplora protocol regtests
         timeout-minutes: 15
         env:
           RUST_BACKTRACE: "1"

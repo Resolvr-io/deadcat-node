@@ -1,4 +1,4 @@
-//! Network-specific v1 activation checkpoints.
+//! Network-specific v1 activation checkpoints and native policy assets.
 //!
 //! A production checkpoint is the final block before Deadcat v1 contract
 //! discovery begins. The first valid v1 creation height is therefore
@@ -7,7 +7,7 @@
 use std::str::FromStr as _;
 
 use deadcat_types::{ChainAnchor, LiquidNetwork};
-use elements::BlockHash;
+use elements::{AssetId, BlockHash};
 use thiserror::Error;
 
 use crate::chain::{ChainSource, ChainSourceError};
@@ -18,6 +18,14 @@ pub const LIQUID_V1_ACTIVATION_HASH: &str =
 pub const LIQUID_TESTNET_V1_ACTIVATION_HEIGHT: u32 = 2_529_866;
 pub const LIQUID_TESTNET_V1_ACTIVATION_HASH: &str =
     "78fe3d5ce6a0df49e7f41adf2e20e610f34f2813dfeaaf50be869ad0e32f510e";
+/// Liquid Bitcoin asset ID documented in Blockstream's Liquid network support
+/// reference and independently encoded by the `elements` crate.
+pub const LIQUID_POLICY_ASSET: &str =
+    "6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d";
+/// Liquid testnet Bitcoin asset ID documented in Blockstream's Liquid network
+/// support reference and independently encoded by Blockstream's LWK.
+pub const LIQUID_TESTNET_POLICY_ASSET: &str =
+    "144c654344aa716d6f3abcc1ca90e5641e4e2a7f633bc09fe3baf64585819a49";
 
 /// Return the immutable production checkpoint for a network.
 ///
@@ -37,6 +45,53 @@ pub fn production_activation_anchor(network: LiquidNetwork) -> Option<ChainAncho
         height,
         hash: BlockHash::from_str(hash).expect("hard-coded activation hash is valid"),
     })
+}
+
+/// Return the immutable native policy asset for a production Liquid network.
+///
+/// Elements regtest chains choose their policy asset when the chain is
+/// created, so callers must supply it explicitly.
+#[must_use]
+pub fn production_policy_asset(network: LiquidNetwork) -> Option<AssetId> {
+    let asset = match network {
+        LiquidNetwork::Liquid => LIQUID_POLICY_ASSET,
+        LiquidNetwork::LiquidTestnet => LIQUID_TESTNET_POLICY_ASSET,
+        LiquidNetwork::ElementsRegtest => return None,
+    };
+    Some(AssetId::from_str(asset).expect("hard-coded policy asset is valid"))
+}
+
+/// Resolve a CLI or embedder-supplied policy asset against network policy.
+///
+/// Production networks always use their compiled immutable policy asset. An
+/// explicit matching value remains accepted for operational compatibility,
+/// but a conflicting value is rejected. Dynamically-created Elements regtest
+/// chains require an explicit value.
+pub fn resolve_policy_asset(
+    network: LiquidNetwork,
+    supplied: Option<AssetId>,
+) -> Result<AssetId, PolicyAssetError> {
+    match production_policy_asset(network) {
+        Some(expected) => match supplied {
+            Some(actual) if actual != expected => {
+                Err(PolicyAssetError::ProductionPolicyAssetMismatch {
+                    network,
+                    expected,
+                    actual,
+                })
+            }
+            _ => Ok(expected),
+        },
+        None => supplied.ok_or(PolicyAssetError::ElementsRegtestPolicyAssetRequired),
+    }
+}
+
+/// Verify that a persisted or embedded chain identity follows network policy.
+pub fn validate_policy_asset(
+    network: LiquidNetwork,
+    actual: AssetId,
+) -> Result<(), PolicyAssetError> {
+    resolve_policy_asset(network, Some(actual)).map(drop)
 }
 
 /// Resolve and verify the checkpoint against the configured backend.
@@ -107,6 +162,18 @@ pub enum ActivationError {
         expected: BlockHash,
         actual: BlockHash,
     },
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum PolicyAssetError {
+    #[error("policy asset {actual} conflicts with immutable {network:?} policy asset {expected}")]
+    ProductionPolicyAssetMismatch {
+        network: LiquidNetwork,
+        expected: AssetId,
+        actual: AssetId,
+    },
+    #[error("--policy-asset is required for elements-regtest")]
+    ElementsRegtestPolicyAssetRequired,
 }
 
 #[cfg(test)]
@@ -207,6 +274,53 @@ mod tests {
         assert_eq!(
             production_activation_anchor(LiquidNetwork::ElementsRegtest),
             None
+        );
+    }
+
+    #[test]
+    fn production_policy_assets_are_exact_and_regtest_is_dynamic() {
+        let liquid = AssetId::from_str(LIQUID_POLICY_ASSET).expect("mainnet asset");
+        let testnet = AssetId::from_str(LIQUID_TESTNET_POLICY_ASSET).expect("testnet asset");
+        assert_eq!(liquid, AssetId::LIQUID_BTC);
+        assert_eq!(production_policy_asset(LiquidNetwork::Liquid), Some(liquid));
+        assert_eq!(
+            production_policy_asset(LiquidNetwork::LiquidTestnet),
+            Some(testnet)
+        );
+        assert_eq!(
+            production_policy_asset(LiquidNetwork::ElementsRegtest),
+            None
+        );
+    }
+
+    #[test]
+    fn policy_asset_resolution_binds_production_and_requires_regtest_input() {
+        let liquid = production_policy_asset(LiquidNetwork::Liquid).expect("mainnet asset");
+        let testnet = production_policy_asset(LiquidNetwork::LiquidTestnet).expect("testnet asset");
+
+        assert_eq!(
+            resolve_policy_asset(LiquidNetwork::Liquid, None),
+            Ok(liquid)
+        );
+        assert_eq!(
+            resolve_policy_asset(LiquidNetwork::Liquid, Some(liquid)),
+            Ok(liquid)
+        );
+        assert_eq!(
+            resolve_policy_asset(LiquidNetwork::Liquid, Some(testnet)),
+            Err(PolicyAssetError::ProductionPolicyAssetMismatch {
+                network: LiquidNetwork::Liquid,
+                expected: liquid,
+                actual: testnet,
+            })
+        );
+        assert_eq!(
+            resolve_policy_asset(LiquidNetwork::ElementsRegtest, None),
+            Err(PolicyAssetError::ElementsRegtestPolicyAssetRequired)
+        );
+        assert_eq!(
+            resolve_policy_asset(LiquidNetwork::ElementsRegtest, Some(testnet)),
+            Ok(testnet)
         );
     }
 

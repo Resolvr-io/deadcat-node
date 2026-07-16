@@ -362,8 +362,7 @@ impl ChainSource for EsploraChainSource {
     }
 
     async fn script_history(&self, script: &Script) -> Result<Vec<Txid>, ChainSourceError> {
-        let mut digest = sha256::Hash::hash(script.as_bytes()).to_byte_array();
-        digest.reverse();
+        let digest = sha256::Hash::hash(script.as_bytes()).to_byte_array();
         let script_hash = hex::encode(digest);
 
         let mut entries = Vec::new();

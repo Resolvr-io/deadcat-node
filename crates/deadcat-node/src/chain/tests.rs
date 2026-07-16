@@ -197,6 +197,44 @@ async fn both_backends_identify_an_unconfirmed_outspend() {
 }
 
 #[tokio::test]
+async fn elements_outspend_falls_back_from_http_404_method_not_found() {
+    let source_transaction = fixture_transaction();
+    let source_outpoint = OutPoint::new(source_transaction.txid(), 0);
+    let (url, requests, server) = MockServer::start(vec![
+        MockResponse::rpc(
+            1,
+            Value::String(hex::encode(serialize(&source_transaction))),
+        ),
+        MockResponse::json(
+            404,
+            json!({
+                "result": null,
+                "error": {"code": -32601, "message": "Method not found"},
+                "id": 2,
+            }),
+        ),
+        MockResponse::rpc(3, json!({})),
+    ])
+    .await;
+    let source = ElementsRpcChainSource::new(ElementsRpcConfig::new(url, ElementsRpcAuth::None))
+        .expect("valid config");
+
+    assert_eq!(source.outspend(source_outpoint).await.unwrap(), None);
+    server.await.expect("mock server");
+    let requests = requests.lock().expect("requests");
+    assert_rpc_request(
+        &requests[1],
+        "gettxspendingprevout",
+        json!([[{"txid": source_outpoint.txid, "vout": 0}]]),
+    );
+    assert_rpc_request(
+        &requests[2],
+        "gettxout",
+        json!([source_outpoint.txid, source_outpoint.vout, true]),
+    );
+}
+
+#[tokio::test]
 async fn esplora_history_excludes_mempool_and_returns_canonical_order() {
     let older = repeated_txid(0x31);
     let newer = repeated_txid(0x32);
@@ -245,7 +283,7 @@ async fn esplora_history_excludes_mempool_and_returns_canonical_order() {
 }
 
 #[tokio::test]
-async fn esplora_uses_electrum_scripthash_byte_order() {
+async fn esplora_uses_rest_scripthash_byte_order() {
     let (url, requests, server) = MockServer::start(vec![MockResponse::json(200, json!([]))]).await;
     let source = EsploraChainSource::new(EsploraConfig::new(url)).expect("valid config");
 
@@ -262,7 +300,7 @@ async fn esplora_uses_electrum_scripthash_byte_order() {
     assert_request(
         &requests[0],
         "GET",
-        "/scripthash/55b852781b9995a44c939b64e441ae2724b96f99c8f4fb9a141cfc9842c4b0e3/txs",
+        "/scripthash/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855/txs",
     );
 }
 

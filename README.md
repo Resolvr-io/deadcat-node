@@ -54,11 +54,34 @@ transaction. That gate also drives a real three-block fork through
 `RescanRequired`, stale-read refusal, an activation-checkpoint reset, process
 reopen, retained-declaration replay, and return to `Ready` on the replacement
 branch.
+The mandatory backend-equivalence gate feeds one canonical chain and a real
+alternate-hash replacement through both production chain sources. Elements RPC
+and Esplora must produce identical synchronized market state, history, and raw
+evidence; the gate also exercises live Esplora broadcast, transaction status,
+outspend, issuance, script-history, and fee endpoints.
+The redb assurance suite independently drives the store against a deterministic
+seeded in-memory model across apply, retry, reopen, shallow/deep rollback, and
+rebuild paths. Test-only failpoints abort every named pre-commit mutation
+boundary and require an exact pre-state after reopen followed by an exact
+post-state after retry; no failpoint code is present in production builds.
+The mandatory process-boundary gate then spawns the production daemon and CLI
+as separate processes over direct Iroh. It proves live synchronization,
+registration, evidence queries, durable cursor replay, signed-transaction
+relay, stable node identity across restart, deep-reorg fail-closed behavior,
+the operator rebuild command, and stale-cursor rejection after rebuild.
 
 V1 activation is immutable per production network. Liquid mainnet begins after
 block `3974391` (`705d699f…890c35`) and Liquid testnet begins after block
 `2529866` (`78fe3d5c…2f510e`). The exact checkpoint is verified against the
 backend and bound atomically with chain identity and the initial redb tip.
+The native policy asset is equally immutable: Liquid uses
+`6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d`
+and Liquid testnet uses
+`144c654344aa716d6f3abcc1ca90e5641e4e2a7f633bc09fe3baf64585819a49`.
+The daemon derives these values from `--network`; an explicit matching
+`--policy-asset` is accepted, while a conflicting value is rejected before
+backend access or database creation. Elements regtest remains dynamic and
+requires `--policy-asset`.
 
 This is not yet a production release. Public Liquid testnet shakedowns,
 operational backup/restore tooling, Nostr announcement ingestion, browser
@@ -94,6 +117,8 @@ The focused live-chain gates can be run independently:
 just regtest-market-ab
 just regtest-maker-orders
 just regtest-multi-contract
+just regtest-backend-equivalence
+just regtest-process-boundary
 ```
 
 Run against Elements Core:
@@ -110,19 +135,19 @@ Or use a lightweight Esplora source:
 ```sh
 just node run \
   --network liquid \
-  --policy-asset <asset-id> \
   esplora --url https://<liquid-esplora>/api/
 ```
 
 The daemon prints its serialized Iroh endpoint address on startup and persists
 a stable endpoint secret beside the database. Production networks always use
-their compiled activation checkpoint. A dynamically-created Elements regtest
-chain defaults to genesis; `--baseline-height` is available only on regtest
-when a later explicit test checkpoint is useful. Scanning and valid v1
-creation begin strictly after that checkpoint. Elements-backed nodes report
-full public market hint coverage only when their persisted indexed tip is
-`Ready` at the current source tip; Esplora-backed nodes support chain-validated
-contract-package registration and report advisory discovery coverage.
+their compiled activation checkpoint and policy asset. A dynamically-created
+Elements regtest chain defaults to genesis; `--baseline-height` is available
+only on regtest when a later explicit test checkpoint is useful. Scanning and
+valid v1 creation begin strictly after that checkpoint. Elements-backed nodes
+report full public market hint coverage only when their persisted indexed tip
+is `Ready` at the current source tip; Esplora-backed nodes support
+chain-validated contract-package registration and report advisory discovery
+coverage.
 
 After a fork exceeds the two-block undo window, stop the daemon and run the
 local maintenance command with a backend for the same chain:
@@ -133,10 +158,11 @@ just node rebuild \
   elements --url http://127.0.0.1:7041 --cookie-file <cookie-path>
 ```
 
-The command verifies the stored network genesis and activation hash before any
-destructive write, clears chain materialization, history, index, and undo
-tables, preserves normalized declarations and the durable event journal, and
-replays in complete-block commits. It is safe to rerun after interruption.
+The command verifies the stored network policy asset, genesis, and activation
+hash before any destructive write, clears chain materialization, history,
+index, and undo tables, preserves normalized declarations and the durable event
+journal, and replays in complete-block commits. It is safe to rerun after
+interruption.
 Until reset, `RescanRequired` is sticky and chain-derived RPCs fail closed;
 `GetInfo`, subscriptions, fee estimation, and signed-transaction relay remain
 available.
@@ -173,3 +199,5 @@ Start with:
 - [Binary-market A/B acceptance packet](docs/acceptance/binary-market-ab-v1.md)
 - [Maker-order live acceptance packet](docs/acceptance/maker-orders-v1.md)
 - [Multi-contract live acceptance packet](docs/acceptance/multi-contract-v1.md)
+- [Elements RPC and Esplora backend-equivalence packet](docs/acceptance/backend-equivalence-v1.md)
+- [Daemon/Iroh/CLI process-boundary packet](docs/acceptance/process-boundary-v1.md)

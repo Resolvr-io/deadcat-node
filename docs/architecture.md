@@ -152,6 +152,17 @@ backend compliance suite.
 The hosted production service should use its own Elements Core backend. Esplora
 is the low-operations option for ordinary self-hosting and development.
 
+`ChainIdentity` stores the selected network, genesis hash, and native policy
+asset. Liquid and Liquid testnet policy assets are compiled network constants,
+not operator-selected configuration. The CLI derives them when omitted and
+rejects a conflicting override before database creation; Elements regtest
+requires an explicit asset because its chain parameters are dynamic. The store
+rechecks this invariant before opening its initialization write transaction,
+and the RPC handler rechecks persisted identity before exposing any capability.
+Consequently an embedder or malformed legacy database cannot advertise
+`FullHintScan` while interpreting contracts against the wrong production
+collateral asset.
+
 Full public market recovery is a separate backend capability. With archival
 Elements Core, the node scans complete blocks strictly after the exclusive v1
 activation anchor,
