@@ -52,8 +52,8 @@ the constants final or authorize deployment. Tommy Volk recorded protocol-owner
 approval on 2026-07-14 against the candidate implementation commit. ADR
 acceptance still requires the focused external review.
 
-For the committed golden test parameter set, the candidate binary-market CMR
-is:
+For the committed golden test parameter set, the original A/B candidate's
+binary-market CMR was:
 
 ```text
 74031c77c0d4e678913f7a8685425fea07458851e0246496fd3174d734379301
@@ -62,6 +62,13 @@ is:
 That value is parameterized-vector evidence, not a universal CMR for every
 market. The rolling baseline remains available at the commit above for an
 exact source and covenant/witness diff audit.
+
+On 2026-07-22, before any deployment, the candidate covenant was hardened so
+one coordinator input validates the complete transition and every sibling
+validates its exact membership in the coordinator's three-input market group.
+This does not alter the A/B blinding decision recorded here. It changes the
+parameterized golden CMR to
+`ebbd8f3001141120edb0880c8e14f40d2054018116627624fc31c1bcf73af473`.
 
 ## Candidate schedule
 
@@ -270,6 +277,12 @@ A/B implementation.
 ## Full-market implementation and local evidence
 
 The candidate is integrated across the production-shaped binary-market stack:
+
+- The lowest-index market input is the coordinator. It derives the market
+  input base from its own index, checks the selected transition, all three
+  market inputs, every issuance prohibition or exact reissuance field, and all
+  required outputs. The two followers ignore transition witnesses but require
+  their exact role, position, and coordinator-group outpoint relationship.
 
 - SimplicityHL receives the two asset commitments and one value commitment for
   each RT role as derived compile-time arguments. It recognizes the raw input

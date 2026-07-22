@@ -355,7 +355,6 @@ fn execute_active_expiry(
         let witness = derived_binary_market::BinaryMarketWitness {
             path: 6,
             slot: slot as u8,
-            input_base: 0,
             output_base: 0,
             oracle_outcome_yes: false,
             oracle_signature: [0; 64],
@@ -475,7 +474,6 @@ fn execute_initial_issuance(
         let witness = derived_binary_market::BinaryMarketWitness {
             path: 0,
             slot: slot as u8,
-            input_base: 0,
             output_base: 0,
             oracle_outcome_yes: false,
             oracle_signature: [0; 64],

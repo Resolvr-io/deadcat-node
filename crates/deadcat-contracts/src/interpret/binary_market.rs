@@ -108,9 +108,6 @@ pub fn interpret_binary_market_spend(
     if decoded.cmr() != compiled.cmr() {
         return Err(InterpretError::CmrMismatch);
     }
-    if !decoded.u32_values().contains(&input_base) {
-        return Err(InterpretError::MissingWitness("INPUT_BASE"));
-    }
     let expected_slot = primary_slot(before);
     if decoded.control_block() != compiled.slot(expected_slot).control_block().serialize() {
         return Err(InterpretError::Inconsistent(

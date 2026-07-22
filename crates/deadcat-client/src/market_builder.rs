@@ -597,27 +597,25 @@ impl BinaryMarketTransitionPlan {
         }
 
         let compiled = compile(self.params)?;
-        let input_base_u32 =
-            u32::try_from(input_base).map_err(|_| MarketBuilderError::IndexOverflow)?;
         let output_base_u32 =
             u32::try_from(output_base).map_err(|_| MarketBuilderError::IndexOverflow)?;
         let input_slots = self.input_slots();
         let mut finalized = Vec::with_capacity(input_slots.len());
         for (offset, slot) in input_slots.iter().copied().enumerate() {
             let input_index = add_index(input_base, offset)?;
+            let oracle_outcome_yes = self.redeem_yes
+                || matches!(
+                    self.applied.transition,
+                    BinaryMarketTransition::Resolved {
+                        outcome: BinaryOutcome::Yes,
+                        ..
+                    }
+                );
             let witness = derived_binary_market::BinaryMarketWitness {
                 path: self.path as u8,
                 slot: slot as u8,
-                input_base: input_base_u32,
                 output_base: output_base_u32,
-                oracle_outcome_yes: self.redeem_yes
-                    || matches!(
-                        self.applied.transition,
-                        BinaryMarketTransition::Resolved {
-                            outcome: BinaryOutcome::Yes,
-                            ..
-                        }
-                    ),
+                oracle_outcome_yes,
                 oracle_signature: self.oracle_signature,
                 tokens_burned: self.tokens_burned,
                 redeem_yes: self.redeem_yes,
