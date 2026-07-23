@@ -341,7 +341,6 @@ fn resolved_redemption_scenario(full: bool, decoy: bool, annex: bool) -> BinaryS
     let witness = derived_binary_market::BinaryMarketWitness {
         path: 8,
         slot: BinaryMarketSlot::ResolvedYesCollateral as u8,
-        input_base: 0,
         output_base,
         oracle_outcome_yes: false,
         oracle_signature: [0; 64],
@@ -565,7 +564,6 @@ fn finalized_active_expiry(side: RtSide) -> BinaryScenario {
     let witness = derived_binary_market::BinaryMarketWitness {
         path: 6,
         slot: BinaryMarketSlot::UnresolvedYesRt as u8,
-        input_base: 0,
         output_base: 2,
         oracle_outcome_yes: false,
         oracle_signature: [0; 64],
@@ -738,7 +736,6 @@ fn interprets_partial_cancellation_when_path_equals_slot_and_bases_are_shared() 
     let witness = derived_binary_market::BinaryMarketWitness {
         path: 2,
         slot: 2,
-        input_base: 0,
         output_base: 0,
         oracle_outcome_yes: false,
         oracle_signature: [0; 64],

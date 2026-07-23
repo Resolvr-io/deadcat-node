@@ -52,8 +52,8 @@ the constants final or authorize deployment. Tommy Volk recorded protocol-owner
 approval on 2026-07-14 against the candidate implementation commit. ADR
 acceptance still requires the focused external review.
 
-For the committed golden test parameter set, the candidate binary-market CMR
-is:
+For the committed golden test parameter set, the original A/B candidate's
+binary-market CMR was:
 
 ```text
 74031c77c0d4e678913f7a8685425fea07458851e0246496fd3174d734379301
@@ -62,6 +62,13 @@ is:
 That value is parameterized-vector evidence, not a universal CMR for every
 market. The rolling baseline remains available at the commit above for an
 exact source and covenant/witness diff audit.
+
+On 2026-07-22, before any deployment, the candidate covenant was hardened so
+one coordinator input validates the complete two-input dormant transition or
+three-input unresolved transition and every sibling validates its exact
+membership in the coordinator's market group. This does not alter the A/B
+blinding decision recorded here. It changes the parameterized golden CMR to
+`ebbd8f3001141120edb0880c8e14f40d2054018116627624fc31c1bcf73af473`.
 
 ## Candidate schedule
 
@@ -271,6 +278,12 @@ A/B implementation.
 
 The candidate is integrated across the production-shaped binary-market stack:
 
+- The lowest-index market input is the coordinator. It derives the market
+  input base from its own index, checks the selected transition, every required
+  market input, every issuance prohibition or exact reissuance field, and all
+  required outputs. Followers ignore transition witnesses but require their
+  exact role, position, and coordinator-group outpoint relationship.
+
 - SimplicityHL receives the two asset commitments and one value commitment for
   each RT role as derived compile-time arguments. It recognizes the raw input
   side, requires the opposite output side, requires the role-specific value
@@ -300,6 +313,12 @@ reversal observable.
 Adversarial cases reject same-side output/burn, mixed live sides,
 wrong-role CBF/value commitments, wrong input-side reissuance nonces, malformed
 creation side, sibling substitution, and designated-output tampering.
+The strict coordinator/follower review additionally mutates solvency equations,
+issuance amounts and asset identities, collateral conservation, burn scripts,
+oracle signatures, expiry sequencing, redemption payouts, wrong slots, and
+follower source witnesses. It also executes a live partial-cancellation
+transaction whose follower stacks were rebuilt from divergent source witnesses
+and confirms the same stack is invalid in the coordinator input.
 
 The production-shaped live harness additionally mined three markets through 15
 market transactions plus one shared setup-funding transaction. It covers
@@ -308,7 +327,8 @@ partial/full cancellation, return to Dormant, B-side Dormant reissuance, YES/NO
 resolution, active expiry, both terminal flip directions, and partial/full
 redemption. Every valid stage passed
 `testmempoolaccept`, broadcast, mining, and confirmation; missing and corrupted
-surjection proofs were rejected.
+surjection proofs were rejected, and the strict rerun also rejected a malformed
+coordinator/follower stack arrangement before broadcast.
 
 Concrete-block sync tests start with no registered contract and exercise
 OP_RETURN recovery through `SyncCoordinator + DeadcatInterpreter`, redb reopen,

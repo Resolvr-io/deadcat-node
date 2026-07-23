@@ -1,12 +1,13 @@
 # Binary-market A/B v1 acceptance packet
 
 - Status: Engineering candidate complete; protocol-owner approved; focused external review pending
-- Prepared: 2026-07-13
+- Prepared: 2026-07-13; strict coordinator hardening updated 2026-07-22
 - Protocol-owner approval: Tommy Volk; 2026-07-14
 - Decision record: [ADR 0005](../adr/0005-rt-blinding-schedule.md)
 - Protocol specification: [Deadcat protocol v1](../protocol-v1.md)
 - Hardened rolling baseline: `ed6de4c4c8a177b4a4ba92c2bac17f55b324781f`
-- Candidate implementation commit: `7ed20b8b81306eaf81ee49b80b4ea65b49804871`
+- Pre-hardening candidate commit: `7ed20b8b81306eaf81ee49b80b4ea65b49804871`
+- Strict canonical implementation: `044fdf07d92217df7ad794ff2a9dff0fc9ae62b2`
 
 This packet is the acceptance boundary for replacing the experimental rolling
 reissuance-token (RT) blinding schedule with fixed complementary A/B blinders
@@ -14,6 +15,12 @@ in binary-market v1. It covers the consensus design and its node/client
 integration. It is not a claim that the entire Deadcat node is production
 ready; broader operational shakedowns and focused external review remain
 separate release work.
+
+Before deployment, the canonical v1 covenant was replaced with the stricter
+coordinator/follower design. The coordinator validates the complete two-input
+dormant transition or three-input unresolved transition, while each follower
+proves it belongs to that exact coordinator group. No compatibility path or
+migration is required because the superseded candidate was never deployed.
 
 ADR 0005 remains Proposed until a focused reviewer records a conclusion. Tommy
 Volk approved every protocol-owner choice below on 2026-07-14 against the
@@ -26,7 +33,7 @@ For the golden fixture in `deadcat-contracts/tests/golden_vectors.rs`, the
 parameterized binary-market CMR is:
 
 ```text
-74031c77c0d4e678913f7a8685425fea07458851e0246496fd3174d734379301
+ebbd8f3001141120edb0880c8e14f40d2054018116627624fc31c1bcf73af473
 ```
 
 The v1 consensus scalars are big-endian 32-byte integers:
@@ -55,17 +62,17 @@ The CMR above is not universal across market parameters.
 | Creation authority exhaustion | Complete | Each unique defining issuance creates no initial outcome tokens and exactly one RT atom, whose exact value-one commitment is locked at its compiled dormant script; Elements consensus then precludes any additional spendable RT authority |
 | Mandatory synchronized flip/burn | Complete | SimplicityHL and Rust checks plus A→B, B→A, same-side, mixed-side, wrong-role, malformed-commitment, and terminal-burn tests |
 | Input-side reissuance nonce | Complete | Covenant/builder/interpreter adversarial tests and live A/B issuances inspect the exact nonce |
-| Every lifecycle shape | Complete | All 18 builder/BitMachine/interpreter shapes execute; every RT-consuming shape executes on both A and B, every sibling, with sufficient Simplicity budget |
-| Elements consensus and policy | Complete | Three full-contract chains, 15 market transactions plus one setup-funding transaction confirmed; every valid stage through `testmempoolaccept`, broadcast, mining, and confirmation |
+| Every lifecycle shape | Complete | All 18 builder/BitMachine/interpreter shapes execute; every RT-consuming shape executes on both A and B, every sibling, with sufficient Simplicity budget; direct mutation tests cover solvency, issuance authority, terminal burns, oracle/expiry, redemption arithmetic, wrong slots, and follower source-witness independence |
+| Elements consensus and policy | Complete | Three full-contract chains, 15 market transactions plus one setup-funding transaction confirmed; every valid stage through `testmempoolaccept`, broadcast, mining, and confirmation; strict rerun adds a divergent-follower-stack transaction and rejects follower stacks transplanted into the coordinator input |
 | Confidential proofs | Complete | Creation/continuation/burn rangeproofs and complete-domain surjection proofs accepted live; missing and parseable-corrupt proofs rejected |
 | Golden integration identity | Complete | Constants, six fixture commitments, six independently derived nonuniform-ID commitments, CMR, eight scripts, and eight control blocks are literal regression vectors |
 | Market public recovery and registration | Complete | Unchanged 38/70-byte hints; zero-seed concrete-block discovery through `SyncCoordinator + DeadcatInterpreter`; generic `ChainSource -> verify_and_register -> redb -> reopen`; backend transaction/status adapters tested separately |
 | Restart and retained reorg depth | Complete | Two real A/B markets survive redb reopen; direct store and coordinator-driven one-/two-block branch replacement restore exact state, history, outputs, and raw evidence |
 | Composition/orchestration | Complete for v1 gate | Live confidential wallet input/change composition and deterministic synthetic two-market atomic indexing; the mandatory multi-contract liquidregtest gate mines and atomically indexes a real market-plus-two-orders transaction |
-| Full-market before/after measurements | Captured with provenance limitation | A/B reporter is reproducible; exact rolling rows are a preserved capture from temporary baseline instrumentation whose patch was not committed; isolated rolling/A-B study remains reproducible |
+| Full-market before/after measurements | Captured with provenance limitation | A/B reporter is reproducible; exact rolling rows are a preserved capture from temporary baseline instrumentation whose patch was not committed; the strict live rerun passed locally but its per-transaction raw JSON is not committed; isolated rolling/A-B study remains reproducible |
 | Rolling retirement | Complete | No rolling implementation, compatibility mode, study crate, or schema migration remains in the candidate tree |
-| Clean pinned-Nix CI | Passed on 2026-07-13 | `nix develop path:.#default --command just ci`; rerun after freezing nonuniform commitment vectors |
-| Independent implementation review | Complete | Plain-integer scalar arithmetic, direct C libsecp256k1-zkp commitments, and isolated pinned-compiler CMR reproduction all match |
+| Clean pinned-Nix CI | Passed on 2026-07-13; strict local rerun on 2026-07-22 | `nix develop path:.#default --command just ci`; rerun after freezing nonuniform commitment vectors; `nix develop .#default --command just ci-checks` validates the strict contract review update |
+| Independent implementation review | Complete for A/B vectors and pre-strict CMR; current strict CMR is regression-tested | Plain-integer scalar arithmetic, direct C libsecp256k1-zkp commitments, and isolated pinned-compiler CMR reproduction all matched on 2026-07-13; the strict CMR and eight scripts/control blocks are covered by committed golden vectors |
 | Focused external human review | Pending | Reviewer record below |
 | Protocol-owner approval | Complete | Tommy Volk; 2026-07-14; candidate implementation commit below |
 
@@ -100,17 +107,26 @@ nix develop path:.#default --command cargo test --locked \
 | Simplex CLI / smplx crates | `0.0.6` |
 | Elements Core | `23.3.3` |
 | Electrs | `0.4.1` |
-| Expanded live run | Passed, 44.81 seconds, 2026-07-13 |
+| Original expanded live record | Passed, 44.81 seconds, 2026-07-13 |
+| Strict canonical rerun | Passed, 46.93 seconds, 2026-07-22 |
 
 ## Live Elements record
 
-The accepted run starts isolated Elements Core and Electrs instances. Every
+The preserved per-transaction record below is from the pre-hardening A/B
+candidate. It starts isolated Elements Core and Electrs instances. Every
 row was accepted by `testmempoolaccept`, broadcast, mined, and read back with a
 confirmation. Exact size, weight, discounted size, proof bytes, covenant stack
 bytes, asset IDs, block hashes, and negative results are preserved in
 [`binary-market-ab-live-2026-07-13.json`](../measurements/binary-market-ab-live-2026-07-13.json).
 The table lists the 15 market transactions; the JSON also records the initial
 confirmed setup-funding transaction, for 16 confirmed transactions total.
+
+The same production-shaped gate was rerun against the strict canonical
+contract on 2026-07-22: all 16 transactions confirmed, both malformed-proof
+variants were rejected, and a coordinator/follower pruning negative was rejected.
+Transaction identifiers are intentionally treated as run-local; the deterministic
+strict covenant metrics and CMR are recorded in the current measurement and
+golden-vector files.
 
 | Chain | Stage | Side | Height | Txid |
 |---|---|---|---:|---|
@@ -131,9 +147,12 @@ confirmed setup-funding transaction, for 16 confirmed transactions total.
 | Active expiry | lock-height terminal burn | B→A | 119 | `f6ff8237a18f52ddd99f970576e4565b2bc67838f0c490e20aaf767df155bc37` |
 
 The expiry spend uses the exact market lock height and `0xfffffffe` on every
-contract input. The two negative initial-issuance variants were rejected with
-`bad-txns-in-ne-out` after respectively removing and corrupting a surjection
-proof.
+contract input. The preserved pre-hardening run rejected the two negative
+initial-issuance variants with `bad-txns-in-ne-out` after respectively removing
+and corrupting a surjection proof. The strict run retains those checks and adds
+a live partial-cancellation transaction whose follower inputs are rebuilt from
+divergent source witnesses; transplanting one follower stack into the
+coordinator input is rejected before broadcast.
 
 ## Full-market measurements
 
@@ -150,19 +169,20 @@ individual shape are in
 
 | Metric | Rolling | A/B side A | Reduction | A/B side B | Reduction |
 |---|---:|---:|---:|---:|---:|
-| Covenant cost, milliweight | 55,547,413 | 38,446,095 | 30.8% | 38,428,635 | 30.8% |
-| Program bytes | 62,873 | 61,332 | 2.5% | 61,276 | 2.5% |
-| Witness bytes | 3,592 | 520 | 85.5% | 520 | 85.5% |
-| Serialized stack bytes | 70,326 | 64,556 | 8.2% | 64,500 | 8.3% |
+| Covenant cost, milliweight | 55,547,413 | 34,688,018 | 37.6% | 34,676,378 | 37.6% |
+| Program bytes | 62,873 | 48,193 | 23.3% | 48,165 | 23.4% |
+| Witness bytes | 3,592 | 336 | 90.6% | 336 | 90.6% |
+| Serialized stack bytes | 70,326 | 51,233 | 27.1% | 51,205 | 27.2% |
 | Budget-padding bytes | 1,135 | 0 | 100% | 0 | 100% |
-| Transaction bytes | 161,288 | 155,518 | 3.6% | 155,462 | 3.6% |
-| Transaction vsize | 43,792 | 42,352 | 3.3% | 42,337 | 3.3% |
-| Discounted vsize | 21,780 | 20,336 | 6.6% | 20,322 | 6.7% |
+| Transaction bytes | 161,288 | 142,195 | 11.8% | 142,167 | 11.9% |
+| Transaction vsize | 43,792 | 39,021 | 10.9% | 39,014 | 10.9% |
+| Discounted vsize | 21,780 | 17,004 | 21.9% | 16,999 | 22.0% |
 
 The engineering case is primarily reduced consensus/witness complexity and
-direct recoverability, not fee savings alone. Prebound commitments make program
-bytes fall only modestly, while removing eight factor words cuts covenant
-witness bytes by 85.5% and eliminates required annex padding in this corpus.
+direct recoverability, not fee savings alone. In addition to prebound A/B
+commitments and removal of factor words, pruning two inputs to small follower
+programs and deriving the input base from the coordinator removes duplicated
+transition logic and witness data. This corpus needs no annex padding.
 
 ## Protocol-owner checklist
 
@@ -207,8 +227,12 @@ The external reviewer should work from the recorded implementation commit:
 - [ ] Confirm creation validation binds each unique defining issuance of exactly
   one RT atom to the exact value-one side-A dormant output and, given Elements
   consensus, thereby exhausts all spendable RT authority.
-- [ ] Confirm the covenant recognizes exactly one role-specific input side,
-  synchronizes both legs, and requires the opposite continuation/burn side.
+- [ ] Confirm the lowest-index market input is the sole coordinator, derives
+  the group base from its own index, checks every required market input and the
+  complete transition, and prohibits issuance on every market input when
+  appropriate.
+- [ ] Confirm each follower ignores path/output witnesses yet requires its
+  exact role, position, and sibling outpoints in the same coordinator group.
 - [ ] Confirm issuance binds the nonce to the input side for both legs.
 - [ ] Confirm rangeproof VBFs and the complete canonical surjection domain agree
   with Elements serialization and proof APIs.
@@ -227,22 +251,24 @@ The external reviewer should work from the recorded implementation commit:
 
 ## Review and acceptance record
 
-An automated read-only audit traced the scalar algebra through compiler,
-Simplicity covenant, proof builder, Rust interpreter, registration, and client
-replay and found no production-code defect. This is implementation assurance,
-not a substitute for the focused human review above.
+Automated audits traced the scalar algebra through compiler, Simplicity covenant,
+proof builder, Rust interpreter, registration, client replay, and live
+coordinator/follower pruning. The strict-contract pass found no production-code
+defect; it did find test-evidence and documentation gaps, which were closed in
+the 2026-07-22 review update. This is implementation assurance, not a substitute
+for the focused human review above.
 
 | Field | Value |
 |---|---|
-| Independent vector method/result | Python big integers reproduced all CBF/VBF arithmetic; standalone C using upstream libsecp256k1-zkp reproduced the fixture and nonuniform-asset-ID commitment sets; isolated Simplex 0.0.6 build reproduced the CMR; all matched on 2026-07-13 |
-| Automated implementation audit | No production A/B findings; 2026-07-13 |
+| Independent vector method/result | Python big integers reproduced all CBF/VBF arithmetic; standalone C using upstream libsecp256k1-zkp reproduced the fixture and nonuniform-asset-ID commitment sets; isolated Simplex 0.0.6 build reproduced the pre-strict CMR; all matched on 2026-07-13 |
+| Automated implementation audit | No production A/B findings on 2026-07-13; no strict-contract production findings on 2026-07-22, with adversarial BitMachine/regtest coverage added |
 | External reviewer | `<PENDING>` |
 | Commit reviewed | `<PENDING>` |
 | Review date | `<PENDING>` |
 | Findings and dispositions | `<PENDING>` |
 | Reviewer conclusion | `<PENDING>` |
 
-- [x] Clean pinned-Nix CI is recorded against the candidate commit.
+- [x] Clean pinned-Nix CI is recorded against the candidate and strict contract commits.
 - [ ] Every focused-review finding has a disposition.
 - [x] Every protocol-owner checkbox is checked.
 - [ ] ADR 0005 is changed from Proposed to Accepted only after those reviews.
@@ -250,6 +276,7 @@ not a substitute for the focused human review above.
 | Role | Name | Date | Commit | Decision |
 |---|---|---|---|---|
 | Implementation owner | Codex candidate | 2026-07-13 | `7ed20b8b81306eaf81ee49b80b4ea65b49804871` | Engineering-complete |
+| Implementation owner | Codex strict hardening review | 2026-07-22 | `044fdf07d92217df7ad794ff2a9dff0fc9ae62b2` | Engineering-complete; external review still pending |
 | External reviewer | `<PENDING>` | `<PENDING>` | `<PENDING>` | `<PENDING>` |
 | Protocol owner | Tommy Volk | 2026-07-14 | `7ed20b8b81306eaf81ee49b80b4ea65b49804871` | Approved |
 

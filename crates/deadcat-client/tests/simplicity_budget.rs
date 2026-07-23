@@ -6,7 +6,7 @@ use deadcat_client::market_builder::{
 use deadcat_contracts::SimplicityNetwork;
 use deadcat_contracts::binary_market::{
     BinaryMarketAction, BinaryMarketEconomics, BinaryMarketSlot, BinaryOutcome,
-    CompiledBinaryMarket,
+    CompiledBinaryMarket, derived_binary_market,
 };
 use deadcat_contracts::interpret::strip_taproot_annex;
 use deadcat_contracts::interpret::{
@@ -22,9 +22,10 @@ use elements::confidential::{Asset, Nonce, Value};
 use elements::hashes::Hash as _;
 use elements::pset::{Input as PsetInput, Output as PsetOutput, PartiallySignedTransaction};
 use elements::secp256k1_zkp::{Keypair, Message, Secp256k1, Tweak};
-use elements::{AssetId, OutPoint, Script, TxOut, TxOutWitness, Txid};
+use elements::{AssetId, LockTime, OutPoint, Script, Sequence, TxOut, TxOutWitness, Txid};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
+use simplex::program::{ProgramTrait as _, WitnessTrait as _};
 use simplex::simplicityhl::simplicity::jet::Elements;
 use simplex::simplicityhl::simplicity::{BitIter, RedeemNode};
 
@@ -409,6 +410,106 @@ fn interpreter_live_outputs(
     }
 }
 
+fn direct_market_witness(
+    plan: &BinaryMarketTransitionPlan,
+    action: BinaryMarketAction,
+    attestation: Option<OracleAttestation>,
+    slot: BinaryMarketSlot,
+    output_base: usize,
+) -> derived_binary_market::BinaryMarketWitness {
+    let (tokens_burned, redeem_yes) = match action {
+        BinaryMarketAction::Redeem { outcome, tokens } => (tokens, outcome == BinaryOutcome::Yes),
+        _ => (0, false),
+    };
+    let oracle_outcome_yes = redeem_yes
+        || matches!(
+            action,
+            BinaryMarketAction::Resolve {
+                outcome: BinaryOutcome::Yes
+            }
+        );
+    derived_binary_market::BinaryMarketWitness {
+        path: plan.path() as u8,
+        slot: slot as u8,
+        output_base: u32::try_from(output_base).expect("test output index fits u32"),
+        oracle_outcome_yes,
+        oracle_signature: attestation.map_or([0; 64], |value| value.signature),
+        tokens_burned,
+        redeem_yes,
+    }
+}
+
+fn attach_dummy_issuance(input: &mut PsetInput) {
+    input.issuance_value_amount = Some(1);
+    input.issuance_value_comm = None;
+    input.issuance_inflation_keys = Some(0);
+    input.issuance_inflation_keys_comm = None;
+    input.issuance_blinding_nonce = Some(Tweak::from_inner([0x21; 32]).expect("valid tweak"));
+    input.issuance_asset_entropy = Some([0x31; 32]);
+    input.blinded_issuance = Some(0);
+}
+
+fn replace_confidential_output_commitments(
+    pset: &mut PartiallySignedTransaction,
+    output_index: usize,
+    asset: Asset,
+    value: Value,
+) {
+    let Asset::Confidential(asset) = asset else {
+        panic!("test RT asset must be confidential");
+    };
+    let Value::Confidential(value) = value else {
+        panic!("test RT value must be confidential");
+    };
+    let output = &mut pset.outputs_mut()[output_index];
+    output.asset = None;
+    output.asset_comm = Some(asset);
+    output.amount = None;
+    output.amount_comm = Some(value);
+}
+
+fn finalized_market_fixture(
+    params: BinaryMarketParams,
+    before: BinaryMarketState,
+    action: BinaryMarketAction,
+    side: RtSide,
+    input_base: usize,
+    output_base: usize,
+) -> (
+    BinaryMarketTransitionPlan,
+    Option<OracleAttestation>,
+    PartiallySignedTransaction,
+) {
+    let attestation = match action {
+        BinaryMarketAction::Resolve { outcome } => Some(sign_attestation(params, outcome)),
+        _ => None,
+    };
+    let live = live_inputs(params, before, side);
+    let plan = BinaryMarketTransitionPlan::new(params, before, action, live.clone(), attestation)
+        .expect("market transition plan");
+    let mut pset = market_pset(params, before, &live, &plan, input_base, output_base);
+    if matches!(action, BinaryMarketAction::Issue { .. }) {
+        let entropies = MarketIssuanceEntropies::from_defining_outpoints(
+            params,
+            defining_outpoints().0,
+            defining_outpoints().1,
+        )
+        .expect("issuance entropies");
+        plan.configure_reissuance_inputs(&mut pset, input_base, entropies)
+            .expect("configure reissuance");
+    }
+    if matches!(action, BinaryMarketAction::Expire) {
+        plan.prepare_expiry(&mut pset, input_base)
+            .expect("prepare expiry");
+    }
+    let network = SimplicityNetwork::ElementsRegtest {
+        policy_asset: params.collateral_asset_id,
+    };
+    plan.finalize(&mut pset, input_base, output_base, &network)
+        .expect("finalize market fixture");
+    (plan, attestation, pset)
+}
+
 #[test]
 fn every_finalized_market_stack_has_sufficient_simplicity_budget() {
     let params = market_params();
@@ -602,6 +703,7 @@ fn every_finalized_market_stack_has_sufficient_simplicity_budget() {
     };
     let mut failures = Vec::new();
     let mut measurements = Vec::new();
+    let compiled = CompiledBinaryMarket::new(params).expect("compile canonical market");
     for side in [RtSide::A, RtSide::B] {
         for &(label, before, action, attestation) in &cases {
             let live = live_inputs(params, before, side);
@@ -621,6 +723,60 @@ fn every_finalized_market_stack_has_sufficient_simplicity_budget() {
             }
             plan.finalize(&mut pset, input_base, output_base, &network)
                 .unwrap_or_else(|error| panic!("{label}/{side:?}: finalize: {error}"));
+            let slots = market_input_slots(before);
+            for (offset, slot) in slots.iter().copied().enumerate() {
+                let witness = direct_market_witness(&plan, action, attestation, slot, output_base);
+                compiled
+                    .program(slot)
+                    .as_ref()
+                    .execute(
+                        &pset,
+                        &witness.build_witness(),
+                        input_base + offset,
+                        &network,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("{label}/{side:?}/{slot:?}: direct execution: {error}")
+                    });
+            }
+
+            let mut unrelated_issuance = pset.clone();
+            attach_dummy_issuance(&mut unrelated_issuance.inputs_mut()[0]);
+            for (offset, slot) in slots.iter().copied().enumerate() {
+                let witness = direct_market_witness(&plan, action, attestation, slot, output_base);
+                compiled
+                    .program(slot)
+                    .as_ref()
+                    .execute(
+                        &unrelated_issuance,
+                        &witness.build_witness(),
+                        input_base + offset,
+                        &network,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("{label}/{side:?}/{slot:?}: unrelated issuance: {error}")
+                    });
+            }
+
+            if !matches!(action, BinaryMarketAction::Issue { .. }) {
+                let coordinator = slots[0];
+                let witness =
+                    direct_market_witness(&plan, action, attestation, coordinator, output_base);
+                for issuance_offset in 0..slots.len() {
+                    let mut malicious = pset.clone();
+                    attach_dummy_issuance(
+                        &mut malicious.inputs_mut()[input_base + issuance_offset],
+                    );
+                    assert!(
+                        compiled
+                            .program(coordinator)
+                            .as_ref()
+                            .execute(&malicious, &witness.build_witness(), input_base, &network,)
+                            .is_err(),
+                        "{label}/{side:?}: coordinator accepted issuance on market input offset {issuance_offset}"
+                    );
+                }
+            }
             let mut covenant = CovenantMetrics::default();
             for (offset, _) in market_input_slots(before).iter().enumerate() {
                 let input_index = input_base + offset;
@@ -664,10 +820,34 @@ fn every_finalized_market_stack_has_sufficient_simplicity_budget() {
             );
 
             if matches!(before, BinaryMarketState::Trading { .. }) {
-                let mut same_side_output = transaction.clone();
+                let coordinator = slots[0];
+                let witness =
+                    direct_market_witness(&plan, action, attestation, coordinator, output_base);
+                let mut same_side_pset = pset.clone();
                 let (asset, value) =
                     commitments(params.yes_reissuance_token_id, factors(RtLeg::Yes, side))
                         .expect("same-side commitments");
+                replace_confidential_output_commitments(
+                    &mut same_side_pset,
+                    output_base,
+                    asset,
+                    value,
+                );
+                assert!(
+                    compiled
+                        .program(coordinator)
+                        .as_ref()
+                        .execute(
+                            &same_side_pset,
+                            &witness.build_witness(),
+                            input_base,
+                            &network,
+                        )
+                        .is_err(),
+                    "{label}/{side:?}: covenant accepted same-side RT output"
+                );
+
+                let mut same_side_output = transaction.clone();
                 same_side_output.output[output_base].asset = asset;
                 same_side_output.output[output_base].value = value;
                 assert!(
@@ -683,7 +863,27 @@ fn every_finalized_market_stack_has_sufficient_simplicity_budget() {
             }
 
             if matches!(action, BinaryMarketAction::Issue { .. }) {
+                let coordinator = slots[0];
+                let witness =
+                    direct_market_witness(&plan, action, attestation, coordinator, output_base);
                 for offset in 0..2 {
+                    let mut wrong_nonce_pset = pset.clone();
+                    wrong_nonce_pset.inputs_mut()[input_base + offset].issuance_blinding_nonce =
+                        Some(Tweak::from_inner(side.flip().abf()).expect("opposite public ABF"));
+                    assert!(
+                        compiled
+                            .program(coordinator)
+                            .as_ref()
+                            .execute(
+                                &wrong_nonce_pset,
+                                &witness.build_witness(),
+                                input_base,
+                                &network,
+                            )
+                            .is_err(),
+                        "{label}/{side:?}: covenant accepted wrong nonce at sibling {offset}"
+                    );
+
                     let mut wrong_nonce = transaction.clone();
                     wrong_nonce.input[input_base + offset]
                         .asset_issuance
@@ -712,6 +912,906 @@ fn every_finalized_market_stack_has_sufficient_simplicity_budget() {
         "DEADCAT_AB_MARKET_METRICS={}",
         serde_json::to_string(&measurements).expect("serialize market measurements")
     );
+}
+
+#[test]
+fn market_coordinator_rejects_adversarial_solvency_and_authorization_mutations() {
+    let params = market_params();
+    let compiled = CompiledBinaryMarket::new(params).expect("compile canonical market");
+    let network = SimplicityNetwork::ElementsRegtest {
+        policy_asset: params.collateral_asset_id,
+    };
+    let input_base = 1;
+    let output_base = 1;
+    let assert_rejected = |before: BinaryMarketState,
+                           action: BinaryMarketAction,
+                           attestation: Option<OracleAttestation>,
+                           plan: &BinaryMarketTransitionPlan,
+                           candidate: &PartiallySignedTransaction,
+                           label: &str| {
+        let coordinator = market_input_slots(before)[0];
+        let witness = direct_market_witness(plan, action, attestation, coordinator, output_base);
+        assert!(
+            compiled
+                .program(coordinator)
+                .as_ref()
+                .execute(candidate, &witness.build_witness(), input_base, &network)
+                .is_err(),
+            "coordinator accepted {label}"
+        );
+    };
+
+    let dormant = BinaryMarketState::Trading {
+        outstanding_pairs: 0,
+    };
+    let issue_two = BinaryMarketAction::Issue { pairs: 2 };
+    let (initial_plan, initial_attestation, initial) = finalized_market_fixture(
+        params,
+        dormant,
+        issue_two,
+        RtSide::A,
+        input_base,
+        output_base,
+    );
+
+    let mut unequal_issuance = initial.clone();
+    unequal_issuance.inputs_mut()[input_base + 1].issuance_value_amount = Some(3);
+    assert_rejected(
+        dormant,
+        issue_two,
+        initial_attestation,
+        &initial_plan,
+        &unequal_issuance,
+        "unequal YES/NO issuance",
+    );
+
+    let mut zero_issuance = initial.clone();
+    for offset in 0..2 {
+        zero_issuance.inputs_mut()[input_base + offset].issuance_value_amount = Some(0);
+    }
+    zero_issuance.outputs_mut()[output_base + 2].amount = Some(0);
+    assert_rejected(
+        dormant,
+        issue_two,
+        initial_attestation,
+        &initial_plan,
+        &zero_issuance,
+        "equal zero issuance with zero collateral",
+    );
+
+    let Value::Confidential(confidential_amount) = initial.inputs()[input_base]
+        .witness_utxo
+        .as_ref()
+        .expect("YES RT witness UTXO")
+        .value
+    else {
+        panic!("YES RT value must be confidential");
+    };
+    let mut confidential_issuance = initial.clone();
+    confidential_issuance.inputs_mut()[input_base].issuance_value_amount = None;
+    confidential_issuance.inputs_mut()[input_base].issuance_value_comm = Some(confidential_amount);
+    assert_rejected(
+        dormant,
+        issue_two,
+        initial_attestation,
+        &initial_plan,
+        &confidential_issuance,
+        "confidential issuance amount",
+    );
+
+    let mut token_issuance_builder = initial.clone();
+    token_issuance_builder.inputs_mut()[input_base].issuance_inflation_keys = Some(1);
+    assert!(
+        initial_plan
+            .finalize(
+                &mut token_issuance_builder,
+                input_base,
+                output_base,
+                &network
+            )
+            .is_err(),
+        "builder accepted raw non-null reissuance-token field",
+    );
+    let mut token_issuance_interpreter = initial.clone();
+    token_issuance_interpreter.inputs_mut()[input_base].issuance_inflation_keys = Some(1);
+    let token_issuance_tx = token_issuance_interpreter
+        .extract_tx()
+        .expect("extract raw token-issuance transaction");
+    let live = live_inputs(params, dormant, RtSide::A);
+    assert!(
+        interpret_binary_market_spend(
+            params,
+            dormant,
+            &interpreter_live_outputs(params, dormant, &live),
+            &token_issuance_tx,
+        )
+        .is_err(),
+        "interpreter accepted raw non-null reissuance-token field",
+    );
+
+    let mut wrong_issuance_identity = initial.clone();
+    wrong_issuance_identity.inputs_mut()[input_base].issuance_asset_entropy = Some([0x91; 32]);
+    assert_rejected(
+        dormant,
+        issue_two,
+        initial_attestation,
+        &initial_plan,
+        &wrong_issuance_identity,
+        "wrong issued asset and token identity",
+    );
+
+    let mut wrong_initial_collateral = initial;
+    wrong_initial_collateral.outputs_mut()[output_base + 2].amount = Some(401);
+    assert_rejected(
+        dormant,
+        issue_two,
+        initial_attestation,
+        &initial_plan,
+        &wrong_initial_collateral,
+        "initial issuance collateral off by one",
+    );
+
+    let active = BinaryMarketState::Trading {
+        outstanding_pairs: 3,
+    };
+    let (subsequent_plan, subsequent_attestation, subsequent) = finalized_market_fixture(
+        params,
+        active,
+        issue_two,
+        RtSide::B,
+        input_base,
+        output_base,
+    );
+    let mut issuance_on_collateral = subsequent.clone();
+    attach_dummy_issuance(&mut issuance_on_collateral.inputs_mut()[input_base + 2]);
+    assert_rejected(
+        active,
+        issue_two,
+        subsequent_attestation,
+        &subsequent_plan,
+        &issuance_on_collateral,
+        "issuance on the subsequent-issuance collateral input",
+    );
+
+    let mut wrong_subsequent_collateral = subsequent;
+    wrong_subsequent_collateral.outputs_mut()[output_base + 2].amount = Some(1_001);
+    assert_rejected(
+        active,
+        issue_two,
+        subsequent_attestation,
+        &subsequent_plan,
+        &wrong_subsequent_collateral,
+        "subsequent issuance collateral off by one",
+    );
+
+    let cancel_one = BinaryMarketAction::Cancel { pairs: 1 };
+    let (partial_plan, partial_attestation, partial) = finalized_market_fixture(
+        params,
+        active,
+        cancel_one,
+        RtSide::A,
+        input_base,
+        output_base,
+    );
+    let mut unequal_burn = partial.clone();
+    unequal_burn.outputs_mut()[output_base + 4].amount = Some(2);
+    assert_rejected(
+        active,
+        cancel_one,
+        partial_attestation,
+        &partial_plan,
+        &unequal_burn,
+        "unequal cancellation burns",
+    );
+
+    let mut wrong_burn_script = partial.clone();
+    wrong_burn_script.outputs_mut()[output_base + 3].script_pubkey = Script::from(vec![0x51]);
+    assert_rejected(
+        active,
+        cancel_one,
+        partial_attestation,
+        &partial_plan,
+        &wrong_burn_script,
+        "cancellation burn sent to a spendable script",
+    );
+
+    let mut wrong_partial_collateral = partial.clone();
+    wrong_partial_collateral.outputs_mut()[output_base + 2].amount = Some(401);
+    assert_rejected(
+        active,
+        cancel_one,
+        partial_attestation,
+        &partial_plan,
+        &wrong_partial_collateral,
+        "partial cancellation collateral off by one",
+    );
+
+    let mut drained_partial = partial;
+    drained_partial.inputs_mut()[input_base + 2]
+        .witness_utxo
+        .as_mut()
+        .expect("collateral witness UTXO")
+        .value = Value::Explicit(200);
+    drained_partial.outputs_mut()[output_base + 2].amount = Some(0);
+    assert_rejected(
+        active,
+        cancel_one,
+        partial_attestation,
+        &partial_plan,
+        &drained_partial,
+        "partial cancellation that drains the state to zero",
+    );
+
+    let cancel_all = BinaryMarketAction::Cancel { pairs: 3 };
+    let (full_plan, full_attestation, mut wrong_full_collateral) = finalized_market_fixture(
+        params,
+        active,
+        cancel_all,
+        RtSide::B,
+        input_base,
+        output_base,
+    );
+    wrong_full_collateral.inputs_mut()[input_base + 2]
+        .witness_utxo
+        .as_mut()
+        .expect("collateral witness UTXO")
+        .value = Value::Explicit(601);
+    assert_rejected(
+        active,
+        cancel_all,
+        full_attestation,
+        &full_plan,
+        &wrong_full_collateral,
+        "full cancellation with excess collateral",
+    );
+
+    let resolve_yes = BinaryMarketAction::Resolve {
+        outcome: BinaryOutcome::Yes,
+    };
+    let (resolution_plan, resolution_attestation, resolution) = finalized_market_fixture(
+        params,
+        active,
+        resolve_yes,
+        RtSide::A,
+        input_base,
+        output_base,
+    );
+    let coordinator = BinaryMarketSlot::UnresolvedYesRt;
+    let mut bad_signature = direct_market_witness(
+        &resolution_plan,
+        resolve_yes,
+        resolution_attestation,
+        coordinator,
+        output_base,
+    );
+    bad_signature.oracle_signature[0] ^= 1;
+    assert!(
+        compiled
+            .program(coordinator)
+            .as_ref()
+            .execute(
+                &resolution,
+                &bad_signature.build_witness(),
+                input_base,
+                &network,
+            )
+            .is_err(),
+        "coordinator accepted a bad oracle signature"
+    );
+
+    let resolve_no = BinaryMarketAction::Resolve {
+        outcome: BinaryOutcome::No,
+    };
+    let no_attestation = Some(sign_attestation(params, BinaryOutcome::No));
+    let wrong_outcome = direct_market_witness(
+        &resolution_plan,
+        resolve_no,
+        no_attestation,
+        coordinator,
+        output_base,
+    );
+    assert!(
+        compiled
+            .program(coordinator)
+            .as_ref()
+            .execute(
+                &resolution,
+                &wrong_outcome.build_witness(),
+                input_base,
+                &network,
+            )
+            .is_err(),
+        "coordinator accepted a valid NO attestation with a YES continuation"
+    );
+
+    let mut wrong_resolution_collateral = resolution.clone();
+    wrong_resolution_collateral.outputs_mut()[output_base + 2].amount = Some(601);
+    assert_rejected(
+        active,
+        resolve_yes,
+        resolution_attestation,
+        &resolution_plan,
+        &wrong_resolution_collateral,
+        "resolution collateral off by one",
+    );
+
+    let mut spendable_rt_burn = resolution;
+    spendable_rt_burn.outputs_mut()[output_base].script_pubkey = Script::from(vec![0x51]);
+    assert_rejected(
+        active,
+        resolve_yes,
+        resolution_attestation,
+        &resolution_plan,
+        &spendable_rt_burn,
+        "terminal RT sent to a spendable script",
+    );
+
+    let expire = BinaryMarketAction::Expire;
+    let (expiry_plan, expiry_attestation, expiry) =
+        finalized_market_fixture(params, active, expire, RtSide::B, input_base, output_base);
+    let mut early_expiry = expiry.clone();
+    early_expiry.global.tx_data.fallback_locktime =
+        Some(LockTime::from_height(params.expiry_height - 1).expect("prior height"));
+    assert_rejected(
+        active,
+        expire,
+        expiry_attestation,
+        &expiry_plan,
+        &early_expiry,
+        "expiry below the committed height",
+    );
+
+    let mut final_sequence_expiry = expiry;
+    for offset in 0..3 {
+        final_sequence_expiry.inputs_mut()[input_base + offset].sequence = Some(Sequence::MAX);
+    }
+    assert_rejected(
+        active,
+        expire,
+        expiry_attestation,
+        &expiry_plan,
+        &final_sequence_expiry,
+        "expiry whose transaction has only final sequences",
+    );
+
+    let resolved = BinaryMarketState::ResolvedYes {
+        collateral_unredeemed: 600,
+    };
+    let redeem_yes = BinaryMarketAction::Redeem {
+        outcome: BinaryOutcome::Yes,
+        tokens: 1,
+    };
+    let (redemption_plan, redemption_attestation, redemption) = finalized_market_fixture(
+        params,
+        resolved,
+        redeem_yes,
+        RtSide::A,
+        input_base,
+        output_base,
+    );
+    let resolved_slot = BinaryMarketSlot::ResolvedYesCollateral;
+    for tokens in [0, 4] {
+        let mut witness = direct_market_witness(
+            &redemption_plan,
+            redeem_yes,
+            redemption_attestation,
+            resolved_slot,
+            output_base,
+        );
+        witness.tokens_burned = tokens;
+        assert!(
+            compiled
+                .program(resolved_slot)
+                .as_ref()
+                .execute(&redemption, &witness.build_witness(), input_base, &network,)
+                .is_err(),
+            "resolved redemption accepted {tokens} adversarial tokens"
+        );
+    }
+
+    let mut wrong_resolved_formula = redemption.clone();
+    wrong_resolved_formula.outputs_mut()[output_base].amount = Some(500);
+    assert_rejected(
+        resolved,
+        redeem_yes,
+        redemption_attestation,
+        &redemption_plan,
+        &wrong_resolved_formula,
+        "resolved redemption using the one-sided expiry payout",
+    );
+
+    let mut wrong_winner = redemption.clone();
+    wrong_winner.outputs_mut()[output_base + 1].asset = Some(params.no_token_asset_id);
+    assert_rejected(
+        resolved,
+        redeem_yes,
+        redemption_attestation,
+        &redemption_plan,
+        &wrong_winner,
+        "resolved redemption burning the losing token",
+    );
+
+    let mut wrong_redemption_slot = redemption;
+    wrong_redemption_slot.outputs_mut()[output_base].script_pubkey = compiled
+        .slot(BinaryMarketSlot::ResolvedNoCollateral)
+        .script_pubkey()
+        .clone();
+    assert_rejected(
+        resolved,
+        redeem_yes,
+        redemption_attestation,
+        &redemption_plan,
+        &wrong_redemption_slot,
+        "resolved redemption continuing in the wrong slot",
+    );
+
+    let expired = BinaryMarketState::Expired {
+        collateral_unredeemed: 300,
+    };
+    let redeem_expired_no = BinaryMarketAction::Redeem {
+        outcome: BinaryOutcome::No,
+        tokens: 1,
+    };
+    let (expired_plan, expired_attestation, expired_redemption) = finalized_market_fixture(
+        params,
+        expired,
+        redeem_expired_no,
+        RtSide::A,
+        input_base,
+        output_base,
+    );
+    let mut wrong_expiry_formula = expired_redemption.clone();
+    wrong_expiry_formula.outputs_mut()[output_base].amount = Some(100);
+    assert_rejected(
+        expired,
+        redeem_expired_no,
+        expired_attestation,
+        &expired_plan,
+        &wrong_expiry_formula,
+        "expiry redemption using the resolved-market payout",
+    );
+
+    let mut wrong_expiry_token = expired_redemption;
+    wrong_expiry_token.outputs_mut()[output_base + 1].asset = Some(params.yes_token_asset_id);
+    assert_rejected(
+        expired,
+        redeem_expired_no,
+        expired_attestation,
+        &expired_plan,
+        &wrong_expiry_token,
+        "expiry redemption burning the other outcome token",
+    );
+}
+
+#[test]
+fn market_followers_ignore_transition_witnesses_but_require_the_exact_coordinator_group() {
+    let params = market_params();
+    let network = SimplicityNetwork::ElementsRegtest {
+        policy_asset: params.collateral_asset_id,
+    };
+    let compiled = CompiledBinaryMarket::new(params).expect("compile canonical market");
+    let input_base = 1;
+    let output_base = 1;
+
+    let active_before = BinaryMarketState::Trading {
+        outstanding_pairs: 5,
+    };
+    let active_action = BinaryMarketAction::Cancel { pairs: 2 };
+    let active_live = live_inputs(params, active_before, RtSide::A);
+    let active_plan = BinaryMarketTransitionPlan::new(
+        params,
+        active_before,
+        active_action,
+        active_live.clone(),
+        None,
+    )
+    .expect("partial cancellation plan");
+    let active_pset = market_pset(
+        params,
+        active_before,
+        &active_live,
+        &active_plan,
+        input_base,
+        output_base,
+    );
+    let active_slots = [
+        BinaryMarketSlot::UnresolvedYesRt,
+        BinaryMarketSlot::UnresolvedNoRt,
+        BinaryMarketSlot::UnresolvedCollateral,
+    ];
+
+    for (offset, slot) in active_slots.into_iter().enumerate() {
+        let witness = direct_market_witness(&active_plan, active_action, None, slot, output_base);
+        compiled
+            .program(slot)
+            .as_ref()
+            .execute(
+                &active_pset,
+                &witness.build_witness(),
+                input_base + offset,
+                &network,
+            )
+            .unwrap_or_else(|error| panic!("valid {slot:?} spend: {error}"));
+    }
+
+    for (offset, slot) in [
+        BinaryMarketSlot::UnresolvedNoRt,
+        BinaryMarketSlot::UnresolvedCollateral,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for path in (0_u8..=9).chain([u8::MAX]) {
+            let mut witness =
+                direct_market_witness(&active_plan, active_action, None, slot, output_base);
+            witness.path = path;
+            witness.output_base = u32::MAX;
+            witness.oracle_outcome_yes = true;
+            witness.oracle_signature = [0xa5; 64];
+            witness.tokens_burned = u64::MAX;
+            witness.redeem_yes = true;
+            compiled
+                .program(slot)
+                .as_ref()
+                .execute(
+                    &active_pset,
+                    &witness.build_witness(),
+                    input_base + offset + 1,
+                    &network,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("path-independent follower {slot:?} rejected path {path}: {error}")
+                });
+        }
+    }
+
+    for wrong_path in (0_u8..=9).filter(|path| *path != 2).chain([u8::MAX]) {
+        let mut witness = direct_market_witness(
+            &active_plan,
+            active_action,
+            None,
+            BinaryMarketSlot::UnresolvedYesRt,
+            output_base,
+        );
+        witness.path = wrong_path;
+        assert!(
+            compiled
+                .program(BinaryMarketSlot::UnresolvedYesRt)
+                .as_ref()
+                .execute(&active_pset, &witness.build_witness(), input_base, &network,)
+                .is_err(),
+            "coordinator accepted partial cancellation under path {wrong_path}"
+        );
+    }
+
+    for (offset, slot) in active_slots.into_iter().enumerate() {
+        let mut witness =
+            direct_market_witness(&active_plan, active_action, None, slot, output_base);
+        witness.slot = ((slot as u8) + 1) % (BinaryMarketSlot::ALL.len() as u8);
+        assert!(
+            compiled
+                .program(slot)
+                .as_ref()
+                .execute(
+                    &active_pset,
+                    &witness.build_witness(),
+                    input_base + offset,
+                    &network,
+                )
+                .is_err(),
+            "{slot:?} accepted the wrong committed SLOT"
+        );
+    }
+
+    let mut wrong_active_group = active_pset.clone();
+    wrong_active_group.inputs_mut()[input_base + 1].previous_txid =
+        Txid::from_byte_array([0xf1; 32]);
+    for (offset, slot) in active_slots.into_iter().enumerate() {
+        let witness = direct_market_witness(&active_plan, active_action, None, slot, output_base);
+        assert!(
+            compiled
+                .program(slot)
+                .as_ref()
+                .execute(
+                    &wrong_active_group,
+                    &witness.build_witness(),
+                    input_base + offset,
+                    &network,
+                )
+                .is_err(),
+            "{slot:?} accepted a sibling from another contract group"
+        );
+    }
+
+    let mut wrong_no_vout = active_pset.clone();
+    wrong_no_vout.inputs_mut()[input_base + 1].previous_output_index += 1;
+    for (offset, slot) in active_slots.into_iter().enumerate() {
+        let witness = direct_market_witness(&active_plan, active_action, None, slot, output_base);
+        assert!(
+            compiled
+                .program(slot)
+                .as_ref()
+                .execute(
+                    &wrong_no_vout,
+                    &witness.build_witness(),
+                    input_base + offset,
+                    &network,
+                )
+                .is_err(),
+            "{slot:?} accepted a nonconsecutive NO sibling"
+        );
+    }
+
+    let mut wrong_collateral_vout = active_pset.clone();
+    wrong_collateral_vout.inputs_mut()[input_base + 2].previous_output_index += 1;
+    for (offset, slot) in active_slots.into_iter().enumerate() {
+        let witness = direct_market_witness(&active_plan, active_action, None, slot, output_base);
+        assert!(
+            compiled
+                .program(slot)
+                .as_ref()
+                .execute(
+                    &wrong_collateral_vout,
+                    &witness.build_witness(),
+                    input_base + offset,
+                    &network,
+                )
+                .is_err(),
+            "{slot:?} accepted a nonconsecutive collateral sibling"
+        );
+    }
+
+    let mut wrong_no_script = active_pset.clone();
+    wrong_no_script.inputs_mut()[input_base + 1]
+        .witness_utxo
+        .as_mut()
+        .expect("NO witness UTXO")
+        .script_pubkey = Script::from(vec![0x51]);
+    for (offset, slot) in active_slots.into_iter().enumerate() {
+        let witness = direct_market_witness(&active_plan, active_action, None, slot, output_base);
+        assert!(
+            compiled
+                .program(slot)
+                .as_ref()
+                .execute(
+                    &wrong_no_script,
+                    &witness.build_witness(),
+                    input_base + offset,
+                    &network,
+                )
+                .is_err(),
+            "{slot:?} accepted a sibling with the wrong role script"
+        );
+    }
+
+    let mut mixed_witness_pset = active_pset;
+    active_plan
+        .finalize(&mut mixed_witness_pset, input_base, output_base, &network)
+        .expect("finalize canonical coordinator and followers");
+    for (offset, slot, path, signature) in [
+        (1, BinaryMarketSlot::UnresolvedNoRt, u8::MAX, [0xb6; 64]),
+        (2, BinaryMarketSlot::UnresolvedCollateral, 9, [0xc7; 64]),
+    ] {
+        let input_index = input_base + offset;
+        let mut witness =
+            direct_market_witness(&active_plan, active_action, None, slot, output_base);
+        witness.path = path;
+        witness.output_base = u32::MAX - u32::try_from(offset).expect("small offset");
+        witness.oracle_outcome_yes = offset == 1;
+        witness.oracle_signature = signature;
+        witness.tokens_burned = u64::MAX - u64::try_from(offset).expect("small offset");
+        witness.redeem_yes = offset == 2;
+        compiled
+            .program(slot)
+            .as_ref()
+            .execute(
+                &mixed_witness_pset,
+                &witness.build_witness(),
+                input_index,
+                &network,
+            )
+            .unwrap_or_else(|error| panic!("mixed follower {slot:?}: {error}"));
+        let canonical_stack = mixed_witness_pset.inputs()[input_index]
+            .final_script_witness
+            .as_ref()
+            .expect("canonical follower stack")
+            .clone();
+        let mut mixed_stack = compiled
+            .program(slot)
+            .as_ref()
+            .finalize(
+                &mixed_witness_pset,
+                &witness.build_witness(),
+                input_index,
+                &network,
+            )
+            .expect("finalize mixed follower");
+        if canonical_stack.len() == 5 {
+            mixed_stack.push(canonical_stack[4].clone());
+        }
+        let mut failures = Vec::new();
+        record_budget(
+            format!("mixed-follower-{slot:?}"),
+            &mixed_stack,
+            &mut failures,
+        );
+        assert!(
+            failures.is_empty(),
+            "mixed follower is underbudget: {}",
+            failure_report(&failures)
+        );
+        mixed_witness_pset.inputs_mut()[input_index].final_script_witness = Some(mixed_stack);
+    }
+    let mixed_transaction = mixed_witness_pset
+        .extract_tx()
+        .expect("extract mixed-witness transaction");
+    let interpreted = interpret_binary_market_spend(
+        params,
+        active_before,
+        &interpreter_live_outputs(params, active_before, &active_live),
+        &mixed_transaction,
+    )
+    .expect("interpret mixed-witness transaction from its coordinator");
+    assert_eq!(interpreted.action, active_action);
+    assert_eq!(interpreted.after, active_plan.after());
+
+    let dormant_before = BinaryMarketState::Trading {
+        outstanding_pairs: 0,
+    };
+    let dormant_action = BinaryMarketAction::Expire;
+    let dormant_live = live_inputs(params, dormant_before, RtSide::A);
+    let dormant_plan = BinaryMarketTransitionPlan::new(
+        params,
+        dormant_before,
+        dormant_action,
+        dormant_live.clone(),
+        None,
+    )
+    .expect("dormant expiry plan");
+    let mut dormant_pset = market_pset(
+        params,
+        dormant_before,
+        &dormant_live,
+        &dormant_plan,
+        input_base,
+        output_base,
+    );
+    dormant_plan
+        .prepare_expiry(&mut dormant_pset, input_base)
+        .expect("prepare dormant expiry");
+    let dormant_follower = BinaryMarketSlot::DormantNoRt;
+    for path in (0_u8..=9).chain([u8::MAX]) {
+        let mut witness = direct_market_witness(
+            &dormant_plan,
+            dormant_action,
+            None,
+            dormant_follower,
+            output_base,
+        );
+        witness.path = path;
+        witness.output_base = u32::MAX;
+        witness.oracle_outcome_yes = true;
+        witness.oracle_signature = [0xd8; 64];
+        witness.tokens_burned = u64::MAX;
+        witness.redeem_yes = true;
+        compiled
+            .program(dormant_follower)
+            .as_ref()
+            .execute(
+                &dormant_pset,
+                &witness.build_witness(),
+                input_base + 1,
+                &network,
+            )
+            .unwrap_or_else(|error| {
+                panic!("dormant path-independent follower rejected path {path}: {error}")
+            });
+    }
+
+    for (offset, slot) in [
+        BinaryMarketSlot::DormantYesRt,
+        BinaryMarketSlot::DormantNoRt,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut witness =
+            direct_market_witness(&dormant_plan, dormant_action, None, slot, output_base);
+        witness.slot = ((slot as u8) + 1) % (BinaryMarketSlot::ALL.len() as u8);
+        assert!(
+            compiled
+                .program(slot)
+                .as_ref()
+                .execute(
+                    &dormant_pset,
+                    &witness.build_witness(),
+                    input_base + offset,
+                    &network,
+                )
+                .is_err(),
+            "{slot:?} accepted the wrong committed SLOT"
+        );
+    }
+
+    let mut wrong_dormant_group = dormant_pset;
+    wrong_dormant_group.inputs_mut()[input_base].previous_txid = Txid::from_byte_array([0xf2; 32]);
+    let witness = direct_market_witness(
+        &dormant_plan,
+        dormant_action,
+        None,
+        dormant_follower,
+        output_base,
+    );
+    assert!(
+        compiled
+            .program(dormant_follower)
+            .as_ref()
+            .execute(
+                &wrong_dormant_group,
+                &witness.build_witness(),
+                input_base + 1,
+                &network,
+            )
+            .is_err(),
+        "dormant follower accepted a coordinator from another group"
+    );
+}
+
+#[test]
+fn every_terminal_market_slot_rejects_a_false_slot_witness() {
+    let params = market_params();
+    let compiled = CompiledBinaryMarket::new(params).expect("compile canonical market");
+    let network = SimplicityNetwork::ElementsRegtest {
+        policy_asset: params.collateral_asset_id,
+    };
+    let input_base = 1;
+    let output_base = 1;
+    let cases = [
+        (
+            BinaryMarketState::ResolvedYes {
+                collateral_unredeemed: 600,
+            },
+            BinaryMarketAction::Redeem {
+                outcome: BinaryOutcome::Yes,
+                tokens: 1,
+            },
+            BinaryMarketSlot::ResolvedYesCollateral,
+        ),
+        (
+            BinaryMarketState::ResolvedNo {
+                collateral_unredeemed: 600,
+            },
+            BinaryMarketAction::Redeem {
+                outcome: BinaryOutcome::No,
+                tokens: 1,
+            },
+            BinaryMarketSlot::ResolvedNoCollateral,
+        ),
+        (
+            BinaryMarketState::Expired {
+                collateral_unredeemed: 300,
+            },
+            BinaryMarketAction::Redeem {
+                outcome: BinaryOutcome::Yes,
+                tokens: 1,
+            },
+            BinaryMarketSlot::ExpiredCollateral,
+        ),
+    ];
+    for (before, action, slot) in cases {
+        let (plan, attestation, pset) =
+            finalized_market_fixture(params, before, action, RtSide::A, input_base, output_base);
+        let mut witness = direct_market_witness(&plan, action, attestation, slot, output_base);
+        witness.slot = ((slot as u8) + 1) % (BinaryMarketSlot::ALL.len() as u8);
+        assert!(
+            compiled
+                .program(slot)
+                .as_ref()
+                .execute(&pset, &witness.build_witness(), input_base, &network)
+                .is_err(),
+            "{slot:?} accepted a false SLOT witness"
+        );
+    }
 }
 
 fn maker_receive_script() -> Script {

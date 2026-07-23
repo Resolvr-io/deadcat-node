@@ -1,9 +1,11 @@
 {
   "schema": "deadcat.binary-market-ab-v1.measurements.v1",
-  "recorded_date": "2026-07-13",
+  "recorded_date": "2026-07-22",
   "rolling_baseline_commit": "ed6de4c4c8a177b4a4ba92c2bac17f55b324781f",
   "candidate_base_commit": "25ad4092293e86d71108cf6d10f490ed4d65dc4b",
-  "candidate_implementation_commit": "7ed20b8b81306eaf81ee49b80b4ea65b49804871",
+  "pre_strict_candidate_commit": "7ed20b8b81306eaf81ee49b80b4ea65b49804871",
+  "strict_canonical_implementation": "044fdf07d92217df7ad794ff2a9dff0fc9ae62b2",
+  "strict_canonical_cmr": "ebbd8f3001141120edb0880c8e14f40d2054018116627624fc31c1bcf73af473",
   "toolchain": {
     "flake_lock_sha256": "39cb5ac107c5930e0184e9d01a43f7ee7ae3229a230e0f6e37b3cf6cebe3d0d7",
     "nixpkgs_revision": "50ab793786d9de88ee30ec4e4c24fb4236fc2674",
@@ -26,7 +28,7 @@
     "tx_discount_vsize": "discounted virtual bytes"
   },
   "deterministic_full_market_fixture": {
-    "description": "Identical finalized binary-market PSET shapes at the hardened rolling baseline and A/B candidate. Covenant metrics are aggregated over every market input in the operation. Redemption paths have no live RT input and are side-independent.",
+    "description": "Identical finalized binary-market PSET shapes at the hardened rolling baseline and the canonical strict coordinator/follower A/B contract. Covenant metrics are aggregated over every market input in the operation. Redemption paths have no live RT input and are side-independent.",
     "ab_reproduction_command": "cargo test --locked -p deadcat-client --test simplicity_budget every_finalized_market_stack_has_sufficient_simplicity_budget -- --exact --nocapture",
     "rolling_capture_provenance": {
       "source_commit": "ed6de4c4c8a177b4a4ba92c2bac17f55b324781f",
@@ -67,64 +69,64 @@
       "expiry_no_full_redemption": [454927, 2147, 19, 2270, 0, 2464, 3013, 754, 3013, 754]
     },
     "ab_side_a_rt_inputs": {
-      "initial_issuance": [3304123, 4634, 20, 4862, 0, 14103, 15930, 3983, 7124, 1781],
-      "subsequent_issuance": [5337818, 7051, 30, 7393, 0, 16678, 18628, 4657, 9822, 2456],
-      "partial_cancellation": [5305427, 6898, 30, 7240, 0, 16471, 18247, 4562, 9441, 2361],
-      "full_cancellation": [4748215, 6818, 30, 7160, 0, 16311, 17853, 4464, 9047, 2262],
-      "active_resolution_yes": [4355300, 7230, 95, 7637, 0, 16708, 18016, 4504, 9210, 2303],
-      "active_resolution_no": [4355300, 7230, 95, 7637, 0, 16708, 18016, 4504, 9210, 2303],
-      "dormant_resolution_yes": [2325277, 4846, 85, 5139, 0, 14086, 15037, 3760, 6231, 1558],
-      "dormant_resolution_no": [2325277, 4846, 85, 5139, 0, 14086, 15037, 3760, 6231, 1558],
-      "active_expiry": [4207578, 7100, 30, 7442, 0, 16513, 17821, 4456, 9015, 2254],
-      "dormant_expiry": [2181780, 4679, 20, 4907, 0, 13854, 14805, 3702, 5999, 1500]
+      "initial_issuance": [2835508, 3670, 7, 3885, 0, 13126, 14953, 3739, 6147, 1537],
+      "subsequent_issuance": [4539779, 5729, 8, 6049, 0, 15334, 17284, 4321, 8478, 2120],
+      "partial_cancellation": [4557857, 5606, 8, 5926, 0, 15157, 16933, 4234, 8127, 2032],
+      "full_cancellation": [4276910, 5561, 8, 5881, 0, 15032, 16574, 4144, 7768, 1942],
+      "active_resolution_yes": [4127299, 5838, 73, 6223, 0, 15294, 16602, 4151, 7796, 1949],
+      "active_resolution_no": [4127299, 5838, 73, 6223, 0, 15294, 16602, 4151, 7796, 1949],
+      "dormant_resolution_yes": [2134887, 3608, 72, 3888, 0, 12835, 13786, 3447, 4980, 1245],
+      "dormant_resolution_no": [2134887, 3608, 72, 3888, 0, 12835, 13786, 3447, 4980, 1245],
+      "active_expiry": [3966132, 5452, 8, 5772, 0, 14843, 16151, 4038, 7345, 1837],
+      "dormant_expiry": [1987460, 3283, 7, 3498, 0, 12445, 13396, 3349, 4590, 1148]
     },
     "ab_side_b_rt_inputs": {
-      "initial_issuance": [3302377, 4628, 20, 4856, 0, 14097, 15924, 3981, 7118, 1780],
-      "subsequent_issuance": [5336072, 7045, 30, 7387, 0, 16672, 18622, 4656, 9816, 2454],
-      "partial_cancellation": [5303681, 6892, 30, 7234, 0, 16465, 18241, 4561, 9435, 2359],
-      "full_cancellation": [4746469, 6813, 30, 7155, 0, 16306, 17848, 4462, 9042, 2261],
-      "active_resolution_yes": [4353554, 7224, 95, 7631, 0, 16702, 18010, 4503, 9204, 2301],
-      "active_resolution_no": [4353554, 7224, 95, 7631, 0, 16702, 18010, 4503, 9204, 2301],
-      "dormant_resolution_yes": [2323531, 4840, 85, 5133, 0, 14080, 15031, 3758, 6225, 1557],
-      "dormant_resolution_no": [2323531, 4840, 85, 5133, 0, 14080, 15031, 3758, 6225, 1557],
-      "active_expiry": [4205832, 7096, 30, 7438, 0, 16509, 17817, 4455, 9011, 2253],
-      "dormant_expiry": [2180034, 4674, 20, 4902, 0, 13849, 14800, 3700, 5994, 1499]
+      "initial_issuance": [2834344, 3666, 7, 3881, 0, 13122, 14949, 3738, 6143, 1536],
+      "subsequent_issuance": [4538615, 5726, 8, 6046, 0, 15331, 17281, 4321, 8475, 2119],
+      "partial_cancellation": [4556693, 5603, 8, 5923, 0, 15154, 16930, 4233, 8124, 2031],
+      "full_cancellation": [4275746, 5559, 8, 5879, 0, 15030, 16572, 4143, 7766, 1942],
+      "active_resolution_yes": [4126135, 5835, 73, 6220, 0, 15291, 16599, 4150, 7793, 1949],
+      "active_resolution_no": [4126135, 5835, 73, 6220, 0, 15291, 16599, 4150, 7793, 1949],
+      "dormant_resolution_yes": [2133723, 3606, 72, 3886, 0, 12833, 13784, 3446, 4978, 1245],
+      "dormant_resolution_no": [2133723, 3605, 72, 3885, 0, 12832, 13783, 3446, 4977, 1245],
+      "active_expiry": [3964968, 5450, 8, 5770, 0, 14841, 16149, 4038, 7343, 1836],
+      "dormant_expiry": [1986296, 3280, 7, 3495, 0, 12442, 13393, 3349, 4587, 1147]
     },
     "ab_side_independent_redemptions": {
-      "resolved_yes_partial_redemption": [727595, 2188, 18, 2310, 0, 2584, 3367, 842, 3367, 842],
-      "resolved_yes_full_redemption": [452323, 2109, 18, 2231, 0, 2425, 2974, 744, 2974, 744],
-      "resolved_no_partial_redemption": [727595, 2188, 18, 2310, 0, 2584, 3367, 842, 3367, 842],
-      "resolved_no_full_redemption": [452323, 2108, 18, 2230, 0, 2424, 2973, 744, 2973, 744],
-      "expiry_yes_partial_redemption": [721059, 2184, 19, 2307, 0, 2581, 3364, 841, 3364, 841],
-      "expiry_yes_full_redemption": [446687, 2110, 19, 2233, 0, 2427, 2976, 744, 2976, 744],
-      "expiry_no_partial_redemption": [721059, 2184, 19, 2307, 0, 2581, 3364, 841, 3364, 841],
-      "expiry_no_full_redemption": [446687, 2110, 19, 2233, 0, 2427, 2976, 744, 2976, 744]
+      "resolved_yes_partial_redemption": [719998, 2054, 14, 2172, 0, 2446, 3229, 808, 3229, 808],
+      "resolved_yes_full_redemption": [444726, 1975, 14, 2093, 0, 2287, 2836, 709, 2836, 709],
+      "resolved_no_partial_redemption": [719998, 2054, 14, 2172, 0, 2446, 3229, 808, 3229, 808],
+      "resolved_no_full_redemption": [444726, 1975, 14, 2093, 0, 2287, 2836, 709, 2836, 709],
+      "expiry_yes_partial_redemption": [712156, 2042, 15, 2161, 0, 2435, 3218, 805, 3218, 805],
+      "expiry_yes_full_redemption": [437784, 1968, 15, 2087, 0, 2281, 2830, 708, 2830, 708],
+      "expiry_no_partial_redemption": [712156, 2042, 15, 2161, 0, 2435, 3218, 805, 3218, 805],
+      "expiry_no_full_redemption": [437784, 1968, 15, 2087, 0, 2281, 2830, 708, 2830, 708]
     },
     "aggregate_rt_consuming_reduction_percent": {
       "method": "sum each metric across the ten RT-consuming lifecycle shapes, then compare A/B with rolling",
       "side_a": {
-        "cost_milliweight": 30.8,
-        "program_bytes": 2.5,
-        "witness_bytes": 85.5,
-        "stack_bytes": 8.2,
+        "cost_milliweight": 37.6,
+        "program_bytes": 23.3,
+        "witness_bytes": 90.6,
+        "stack_bytes": 27.1,
         "padding_bytes": 100.0,
-        "tx_bytes": 3.6,
-        "tx_weight": 3.3,
-        "tx_vsize": 3.3,
-        "tx_discount_weight": 6.6,
-        "tx_discount_vsize": 6.6
+        "tx_bytes": 11.8,
+        "tx_weight": 10.9,
+        "tx_vsize": 10.9,
+        "tx_discount_weight": 21.9,
+        "tx_discount_vsize": 21.9
       },
       "side_b": {
-        "cost_milliweight": 30.8,
-        "program_bytes": 2.5,
-        "witness_bytes": 85.5,
-        "stack_bytes": 8.3,
+        "cost_milliweight": 37.6,
+        "program_bytes": 23.4,
+        "witness_bytes": 90.6,
+        "stack_bytes": 27.2,
         "padding_bytes": 100.0,
-        "tx_bytes": 3.6,
-        "tx_weight": 3.3,
-        "tx_vsize": 3.3,
-        "tx_discount_weight": 6.7,
-        "tx_discount_vsize": 6.7
+        "tx_bytes": 11.9,
+        "tx_weight": 10.9,
+        "tx_vsize": 10.9,
+        "tx_discount_weight": 22.0,
+        "tx_discount_vsize": 22.0
       }
     }
   },
@@ -152,6 +154,15 @@
       "active expiry uses exact locktime and nonfinal sequences and burns B to A",
       "partial and full resolved-market redemption are accepted and drain collateral to zero"
     ],
-    "scope": "Three production-shaped full-contract chains cover every lifecycle class and both terminal flip directions. The deterministic BitMachine/interpreter corpus additionally enumerates both dormant terminal paths, both outcomes, both RT input sides, and every partial/full redemption shape."
+    "scope": "Three production-shaped full-contract chains cover every lifecycle class and both terminal flip directions. The deterministic BitMachine/interpreter corpus additionally enumerates both dormant terminal paths, both outcomes, both RT input sides, and every partial/full redemption shape.",
+    "strict_canonical_rerun": {
+      "status": "passed",
+      "run_date": "2026-07-22",
+      "duration_seconds": 46.93,
+      "confirmed_transactions": 16,
+      "negative_tests_passed": 3,
+      "validation": "nix develop .#default --command just ci-checks and nix develop .#default --command just regtest-market-ab on 2026-07-22; branch PR CI rerun required after this record changes",
+      "note": "The same live gate passed after the undeployed candidate was replaced by the strict coordinator/follower covenant. The strict rerun added divergent follower-source witnesses and a coordinator-stack transplant rejection. The linked per-transaction raw record remains the preserved pre-hardening run."
+    }
   }
 }

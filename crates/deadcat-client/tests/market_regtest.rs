@@ -26,7 +26,7 @@ use deadcat_client::validation::replay_contract_history;
 use deadcat_contracts::SimplicityNetwork;
 use deadcat_contracts::binary_market::{
     BinaryMarketAction, BinaryMarketEconomics, BinaryMarketSlot, BinaryMarketTransition,
-    BinaryOutcome,
+    BinaryOutcome, CompiledBinaryMarket, derived_binary_market,
 };
 use deadcat_contracts::maker_order::CompiledMakerOrder;
 use deadcat_contracts::market_crypto::{
@@ -76,6 +76,7 @@ use elements::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
+use simplex::program::{ProgramTrait as _, WitnessTrait as _};
 use simplex::provider::ElementsRpc;
 use simplex::signer::{Signer, SignerTrait as _};
 use simplex::transaction::{FinalTransaction, PartialOutput};
@@ -1567,6 +1568,70 @@ fn wallet_utxo(transaction: &Transaction, index: usize) -> WalletUtxo {
     }
 }
 
+fn rebuild_pruned_market_followers_from_divergent_witnesses(
+    pset: &mut PartiallySignedTransaction,
+    plan: &BinaryMarketTransitionPlan,
+    params: BinaryMarketParams,
+    network: &SimplicityNetwork,
+) {
+    let compiled = CompiledBinaryMarket::new(params).expect("compile canonical market");
+    for (input_index, slot, path, output_base, signature, tokens_burned, redeem_yes) in [
+        (
+            1,
+            BinaryMarketSlot::UnresolvedNoRt,
+            u8::MAX,
+            u32::MAX,
+            [0xa5; 64],
+            u64::MAX,
+            true,
+        ),
+        (
+            2,
+            BinaryMarketSlot::UnresolvedCollateral,
+            9,
+            u32::MAX - 1,
+            [0x5a; 64],
+            u64::MAX - 1,
+            false,
+        ),
+    ] {
+        let canonical = pset.inputs()[input_index]
+            .final_script_witness
+            .as_ref()
+            .expect("canonical follower witness")
+            .clone();
+        let witness = derived_binary_market::BinaryMarketWitness {
+            path,
+            slot: slot as u8,
+            output_base,
+            oracle_outcome_yes: input_index == 1,
+            oracle_signature: signature,
+            tokens_burned,
+            redeem_yes,
+        };
+        compiled
+            .program(slot)
+            .as_ref()
+            .execute(pset, &witness.build_witness(), input_index, network)
+            .unwrap_or_else(|error| panic!("divergent {slot:?} follower: {error}"));
+        let mut rebuilt = compiled
+            .program(slot)
+            .as_ref()
+            .finalize(pset, &witness.build_witness(), input_index, network)
+            .expect("finalize divergent follower witness");
+        match canonical.len() {
+            4 => {}
+            5 => rebuilt.push(canonical[4].clone()),
+            length => panic!("unexpected canonical follower stack length {length}"),
+        }
+        pset.inputs_mut()[input_index].final_script_witness = Some(rebuilt);
+    }
+    assert_eq!(
+        plan.path(),
+        deadcat_contracts::interpret::BinaryMarketPath::PartialCancellation
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_partial_cancellation(
     signer: &Signer,
@@ -1637,6 +1702,7 @@ fn build_partial_cancellation(
     )));
     plan.finalize(&mut pset, 0, 0, network)
         .expect("finalize partial cancellation");
+    rebuild_pruned_market_followers_from_divergent_witnesses(&mut pset, &plan, params, network);
     sign_input(signer, &mut pset, 3);
     sign_input(signer, &mut pset, 4);
     sign_input(signer, &mut pset, 5);
@@ -2533,6 +2599,17 @@ fn binary_market_ab_lifecycle_is_accepted_by_elementsd() {
         1,
         RtSide::B,
     );
+    let mut transplanted_follower_stack = partial_cancel.clone();
+    transplanted_follower_stack.input[0].witness.script_witness = transplanted_follower_stack.input
+        [1]
+    .witness
+    .script_witness
+    .clone();
+    let transplanted_follower = assert_mempool_rejects(
+        &rpc,
+        &transplanted_follower_stack,
+        "market_follower_stack_as_coordinator",
+    );
     let partial_cancel_accepted = accept_broadcast_mine(&rpc, &miner, &partial_cancel);
     transactions.push(metrics(
         "cancel_reissue_no",
@@ -2694,7 +2771,7 @@ fn binary_market_ab_lifecycle_is_accepted_by_elementsd() {
             },
         ],
         "transactions": transactions,
-        "negative_tests": [missing, malformed],
+        "negative_tests": [missing, malformed, transplanted_follower],
     });
     eprintln!(
         "DEADCAT_MARKET_AB_METRICS={}",

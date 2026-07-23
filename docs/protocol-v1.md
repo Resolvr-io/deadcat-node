@@ -287,16 +287,16 @@ network policy asset.
 
 The same parameters produce eight unique static slot scripts:
 
-| Slot | Phase | Role |
-|---:|---|---|
-| 0 | Dormant | YES reissuance token |
-| 1 | Dormant | NO reissuance token |
-| 2 | Unresolved | YES reissuance token |
-| 3 | Unresolved | NO reissuance token |
-| 4 | Unresolved | collateral |
-| 5 | ResolvedYes | collateral |
-| 6 | ResolvedNo | collateral |
-| 7 | Expired | collateral |
+| Slot | Phase | Asset role | Authorization role |
+|---:|---|---|---|
+| 0 | Dormant | YES reissuance token | coordinator |
+| 1 | Dormant | NO reissuance token | follower |
+| 2 | Unresolved | YES reissuance token | coordinator |
+| 3 | Unresolved | NO reissuance token | follower |
+| 4 | Unresolved | collateral | follower |
+| 5 | ResolvedYes | collateral | self-validating terminal |
+| 6 | ResolvedNo | collateral | self-validating terminal |
+| 7 | Expired | collateral | self-validating terminal |
 
 All slots share one parameterized Simplicity CMR. Their Taproot outputs differ
 through one hidden 32-byte TapData storage word:
@@ -310,6 +310,20 @@ byte 31     slot tag 0x00-0x07 from the table above
 The nonzero version prevents slot zero from collapsing to smplx's default
 all-zero storage value. Golden vectors pin every storage word, TapData hash,
 Merkle root, script pubkey, and control block.
+
+Multi-input states use one fixed coordinator. Dormant and unresolved YES derive
+the contract input base from their own `current_index` and validate the complete
+transition. They check every sibling input, both RT legs, every constrained
+output, the full collateral equation, and issuance fields on every market input.
+
+Dormant NO, unresolved NO, and unresolved collateral dispatch by their committed
+slot before consulting any transition witness. They ignore `PATH`, `OUTPUT_BASE`,
+oracle, and redemption fields and authorize only a co-spend with the exact
+coordinator group at the required adjacent transaction-input positions. The
+unresolved group must also spend consecutive prior outputs YES, NO, collateral.
+Consensus executes all inputs atomically, so a follower succeeds only when its
+coordinator independently authorizes the complete transition. Terminal
+collateral inputs validate their own redemption paths.
 
 The canonical node state is:
 
@@ -332,23 +346,29 @@ Every market path enforces:
 
 - every inspected input and output has the expected asset, value class, and
   script role;
-- non-issuance paths reject attached asset issuance;
-- each witness-selected input and output window is in bounds, every slot index
-  inside its own window is distinct, and every constrained output is checked at
-  its selected index;
+- non-issuance paths reject attached asset issuance on every consumed market
+  input, while deliberately allowing issuance on unrelated composable inputs;
+- coordinators derive the contiguous market input window from their own
+  `current_index`; only the output window is witness-selected, and every
+  constrained output is checked at its selected index;
 - every sibling group consumes UTXOs created by one previous transaction: both
   dormant RTs together, or all three unresolved RT/collateral slots together;
 - unresolved siblings are the consecutive previous outputs YES RT, NO RT, then
   collateral; dormant RTs need not be consecutive so custom composed creation
-  can place them at other uniquely identified positions;
+  can place them at other uniquely identified positions. This relies on
+  canonical creation exhausting each unique one-atom RT authority at the exact
+  dormant script;
 - token or RT destruction goes only to the required bare OP_RETURN burn outputs;
+- follower inputs cannot select a transition-specific branch and require the
+  exact coordinator sibling group;
 - no transition creates unmatched YES/NO supply; and
 - checked arithmetic cannot wrap.
 
-The interpreter uses decoded witness path and exact witness-selected windows. It
-does not find a continuation by taking the first output with a matching script.
-Decoy same-script outputs in an otherwise valid custom transaction must not
-change the interpreted state.
+The interpreter derives the input base from the tracked coordinator outpoint and
+uses only the coordinator's decoded path and output base. Follower transition
+witness values are non-authoritative. It does not find a continuation by taking
+the first output with a matching script. Decoy same-script outputs in an
+otherwise valid custom transaction must not change the interpreted state.
 
 ### Spend paths
 
