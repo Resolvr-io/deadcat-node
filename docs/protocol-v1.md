@@ -355,7 +355,9 @@ Every market path enforces:
   dormant RTs together, or all three unresolved RT/collateral slots together;
 - unresolved siblings are the consecutive previous outputs YES RT, NO RT, then
   collateral; dormant RTs need not be consecutive so custom composed creation
-  can place them at other uniquely identified positions;
+  can place them at other uniquely identified positions. This relies on
+  canonical creation exhausting each unique one-atom RT authority at the exact
+  dormant script;
 - token or RT destruction goes only to the required bare OP_RETURN burn outputs;
 - follower inputs cannot select a transition-specific branch and require the
   exact coordinator sibling group;

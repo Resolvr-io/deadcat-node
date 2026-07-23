@@ -4,7 +4,7 @@
   "rolling_baseline_commit": "ed6de4c4c8a177b4a4ba92c2bac17f55b324781f",
   "candidate_base_commit": "25ad4092293e86d71108cf6d10f490ed4d65dc4b",
   "pre_strict_candidate_commit": "7ed20b8b81306eaf81ee49b80b4ea65b49804871",
-  "strict_canonical_implementation": "repository revision containing this record",
+  "strict_canonical_implementation": "044fdf07d92217df7ad794ff2a9dff0fc9ae62b2",
   "strict_canonical_cmr": "ebbd8f3001141120edb0880c8e14f40d2054018116627624fc31c1bcf73af473",
   "toolchain": {
     "flake_lock_sha256": "39cb5ac107c5930e0184e9d01a43f7ee7ae3229a230e0f6e37b3cf6cebe3d0d7",
@@ -158,10 +158,11 @@
     "strict_canonical_rerun": {
       "status": "passed",
       "run_date": "2026-07-22",
-      "duration_seconds": 40.88,
+      "duration_seconds": 46.93,
       "confirmed_transactions": 16,
-      "negative_tests_passed": 2,
-      "note": "The same live gate passed after the undeployed candidate was replaced by the strict coordinator/follower covenant; the linked per-transaction raw record remains the preserved pre-hardening run."
+      "negative_tests_passed": 3,
+      "validation": "nix develop .#default --command just ci-checks and nix develop .#default --command just regtest-market-ab on 2026-07-22; branch PR CI rerun required after this record changes",
+      "note": "The same live gate passed after the undeployed candidate was replaced by the strict coordinator/follower covenant. The strict rerun added divergent follower-source witnesses and a coordinator-stack transplant rejection. The linked per-transaction raw record remains the preserved pre-hardening run."
     }
   }
 }

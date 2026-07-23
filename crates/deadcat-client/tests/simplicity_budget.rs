@@ -999,15 +999,34 @@ fn market_coordinator_rejects_adversarial_solvency_and_authorization_mutations()
         "confidential issuance amount",
     );
 
-    let mut token_issuance = initial.clone();
-    token_issuance.inputs_mut()[input_base].issuance_inflation_keys = Some(1);
-    assert_rejected(
-        dormant,
-        issue_two,
-        initial_attestation,
-        &initial_plan,
-        &token_issuance,
-        "nonzero reissuance-token amount",
+    let mut token_issuance_builder = initial.clone();
+    token_issuance_builder.inputs_mut()[input_base].issuance_inflation_keys = Some(1);
+    assert!(
+        initial_plan
+            .finalize(
+                &mut token_issuance_builder,
+                input_base,
+                output_base,
+                &network
+            )
+            .is_err(),
+        "builder accepted raw non-null reissuance-token field",
+    );
+    let mut token_issuance_interpreter = initial.clone();
+    token_issuance_interpreter.inputs_mut()[input_base].issuance_inflation_keys = Some(1);
+    let token_issuance_tx = token_issuance_interpreter
+        .extract_tx()
+        .expect("extract raw token-issuance transaction");
+    let live = live_inputs(params, dormant, RtSide::A);
+    assert!(
+        interpret_binary_market_spend(
+            params,
+            dormant,
+            &interpreter_live_outputs(params, dormant, &live),
+            &token_issuance_tx,
+        )
+        .is_err(),
+        "interpreter accepted raw non-null reissuance-token field",
     );
 
     let mut wrong_issuance_identity = initial.clone();
