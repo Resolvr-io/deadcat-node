@@ -134,18 +134,11 @@ pub fn interpret_binary_market_spend(
     if paths.is_empty() {
         return Err(InterpretError::MissingWitness("PATH"));
     }
-    let u32_values = decoded.u32_values();
-    let output_bases: Vec<u32> = u32_values
-        .iter()
-        .copied()
-        .filter(|candidate| {
-            u32_values
-                .iter()
-                .all(|value| *value == input_base || *value == *candidate)
-        })
-        .collect();
-    if output_bases.is_empty() {
-        return Err(InterpretError::MissingWitness("OUTPUT_BASE"));
+    let output_bases = decoded.u32_values();
+    match output_bases.len() {
+        0 => return Err(InterpretError::MissingWitness("OUTPUT_BASE")),
+        1 => {}
+        _ => return Err(InterpretError::AmbiguousInterpretation),
     }
 
     let economics = BinaryMarketEconomics::new(params.base_payout)?;
