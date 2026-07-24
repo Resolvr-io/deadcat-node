@@ -1,7 +1,6 @@
 use deadcat_types::{MakerOrderParams, MakerOrderState, OrderDirection};
 use elements::confidential::{Asset, Value};
 use elements::{OutPoint, Transaction};
-use sha2::{Digest as _, Sha256};
 
 use super::{
     InterpretError, TrackedContractOutput, decode_simplicity_witness, locate_input, output_at,
@@ -22,6 +21,7 @@ pub struct MakerOrderInterpretation {
     pub after: MakerOrderState,
     pub spent_outpoint: OutPoint,
     pub input_index: u32,
+    pub payment_index: Option<u32>,
     pub remainder_index: Option<u32>,
     pub continuation: Option<TrackedContractOutput>,
     pub annex_present: bool,
@@ -85,6 +85,7 @@ pub fn interpret_maker_order_spend(
             after,
             spent_outpoint: live_output.outpoint,
             input_index: input_index_u32,
+            payment_index: None,
             remainder_index: None,
             continuation: None,
             annex_present: annex.is_some(),
@@ -103,7 +104,31 @@ pub fn interpret_maker_order_spend(
             "maker script spend carries issuance",
         ));
     }
-    let payment_output = output_at(transaction, input_index_u32)?;
+    let partial_flags = decoded.bool_values();
+    if partial_flags.len() != 1 {
+        return Err(if partial_flags.is_empty() {
+            InterpretError::MissingWitness("IS_PARTIAL")
+        } else {
+            InterpretError::AmbiguousInterpretation
+        });
+    }
+    let is_partial = partial_flags[0];
+    let indices = decoded.u32_values();
+    if indices.len() != 2 {
+        return Err(if indices.is_empty() {
+            InterpretError::MissingWitness("PAYMENT_INDEX and REMAINDER_INDEX")
+        } else {
+            InterpretError::AmbiguousInterpretation
+        });
+    }
+    let payment_index = indices[0];
+    let remainder_index_witness = indices[1];
+    if payment_index == remainder_index_witness {
+        return Err(InterpretError::Inconsistent(
+            "maker output witness indices alias",
+        ));
+    }
+    let payment_output = output_at(transaction, payment_index)?;
     let (payment_asset, maker_payment) = explicit_asset_value(payment_output).ok_or(
         InterpretError::Inconsistent("maker payment is not explicit"),
     )?;
@@ -112,46 +137,17 @@ pub fn interpret_maker_order_spend(
         OrderDirection::SellQuote => params.base_asset_id,
     };
     if payment_asset != expected_payment_asset
-        || script_hash(&payment_output.script_pubkey) != params.maker_receive_spk_hash
+        || payment_output.script_pubkey != *compiled.maker_receive_spk()
     {
         return Err(InterpretError::Inconsistent(
             "maker payment asset or destination is wrong",
         ));
     }
 
-    let price = u64::from(params.price);
-    let full = match params.direction {
-        OrderDirection::SellBase => {
-            input_locked
-                .checked_mul(price)
-                .ok_or(crate::maker_order::MakerOrderError::ArithmeticOverflow)?
-                == maker_payment
-        }
-        OrderDirection::SellQuote => {
-            maker_payment
-                .checked_mul(price)
-                .ok_or(crate::maker_order::MakerOrderError::ArithmeticOverflow)?
-                == input_locked
-        }
-    };
-    let remainder_locked = if full {
+    let remainder_locked = if !is_partial {
         None
     } else {
-        let remainder_indices = decoded.u32_values();
-        if remainder_indices.len() != 1 {
-            return Err(if remainder_indices.is_empty() {
-                InterpretError::MissingWitness("REMAINDER_INDEX")
-            } else {
-                InterpretError::AmbiguousInterpretation
-            });
-        }
-        let remainder_index = remainder_indices[0];
-        if remainder_index == input_index_u32 {
-            return Err(InterpretError::Inconsistent(
-                "remainder aliases mandatory payment",
-            ));
-        }
-        let remainder_output = output_at(transaction, remainder_index)?;
+        let remainder_output = output_at(transaction, remainder_index_witness)?;
         if remainder_output.script_pubkey != *compiled.script_pubkey() {
             return Err(InterpretError::Inconsistent(
                 "witness-designated remainder script is wrong",
@@ -168,7 +164,7 @@ pub fn interpret_maker_order_spend(
         Some(amount)
     };
     let remainder_index = if remainder_locked.is_some() {
-        Some(decoded.u32_values()[0])
+        Some(remainder_index_witness)
     } else {
         None
     };
@@ -190,6 +186,7 @@ pub fn interpret_maker_order_spend(
         after: interpreted.next_state,
         spent_outpoint: live_output.outpoint,
         input_index: input_index_u32,
+        payment_index: Some(payment_index),
         remainder_index,
         continuation,
         annex_present: annex.is_some(),
@@ -204,8 +201,4 @@ fn explicit_asset_value(output: &elements::TxOut) -> Option<(elements::AssetId, 
         return None;
     };
     Some((asset, value))
-}
-
-fn script_hash(script: &elements::Script) -> [u8; 32] {
-    Sha256::digest(script.as_bytes()).into()
 }

@@ -2,6 +2,8 @@
 
 pub use deadcat_types::MakerOrderState;
 use deadcat_types::{MakerOrderParams, OrderDirection};
+use elements::OutPoint;
+use elements::hashes::Hash as _;
 use thiserror::Error;
 
 mod compiled;
@@ -9,6 +11,58 @@ mod compiled;
 pub use crate::artifacts::maker_order::MakerOrderProgram;
 pub use crate::artifacts::maker_order::derived_maker_order;
 pub use compiled::{CompiledMakerOrder, CompiledMakerOrderError};
+
+use crate::rt::tagged_hash;
+
+pub const ORDER_INPUTS_DOMAIN: &str = "deadcat/order-inputs/v1";
+pub const ORDER_INSTANCE_DOMAIN: &str = "deadcat/order-instance/v1";
+pub const ORDER_CANCEL_TWEAK_DOMAIN: &str = "deadcat/order-cancel/v1";
+pub const ORDER_RECEIVE_TWEAK_DOMAIN: &str = "deadcat/order-receive/v1";
+
+/// Derive the stable public identity of one canonical order creation.
+///
+/// Input ordering is deliberately ignored. Any change to the input set or the
+/// reserved order output position changes the result.
+pub fn derive_instance_id(
+    input_prevouts: &[OutPoint],
+    order_output_index: u32,
+) -> Result<[u8; 32], MakerOrderIdentityError> {
+    if input_prevouts.is_empty() {
+        return Err(MakerOrderIdentityError::NoCreationInputs);
+    }
+    let input_count = u32::try_from(input_prevouts.len())
+        .map_err(|_| MakerOrderIdentityError::TooManyCreationInputs)?;
+    let mut serialized = input_prevouts
+        .iter()
+        .map(|outpoint| {
+            let mut bytes = [0_u8; 36];
+            bytes[..32].copy_from_slice(&outpoint.txid.to_byte_array());
+            bytes[32..].copy_from_slice(&outpoint.vout.to_be_bytes());
+            bytes
+        })
+        .collect::<Vec<_>>();
+    serialized.sort_unstable();
+
+    let mut inputs_message = Vec::with_capacity(4 + serialized.len() * 36);
+    inputs_message.extend_from_slice(&input_count.to_be_bytes());
+    for outpoint in serialized {
+        inputs_message.extend_from_slice(&outpoint);
+    }
+    let inputs_commitment = tagged_hash(ORDER_INPUTS_DOMAIN, &inputs_message);
+
+    let mut instance_message = [0_u8; 36];
+    instance_message[..32].copy_from_slice(&inputs_commitment);
+    instance_message[32..].copy_from_slice(&order_output_index.to_be_bytes());
+    Ok(tagged_hash(ORDER_INSTANCE_DOMAIN, &instance_message))
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum MakerOrderIdentityError {
+    #[error("canonical maker-order creation requires at least one transaction input")]
+    NoCreationInputs,
+    #[error("maker-order creation input count exceeds u32")]
+    TooManyCreationInputs,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MakerOrderFill {
@@ -245,9 +299,33 @@ mod tests {
             price: 7,
             min_active_base: 3,
             direction,
-            maker_receive_spk_hash: [3; 32],
+            instance_id: [3; 32],
             maker_pubkey: [4; 32],
         }
+    }
+
+    #[test]
+    fn instance_identity_is_order_independent_but_creation_specific() {
+        let first = OutPoint::new(elements::Txid::from_byte_array([0x11; 32]), 2);
+        let second = OutPoint::new(elements::Txid::from_byte_array([0x22; 32]), 7);
+
+        let canonical = derive_instance_id(&[first, second], 4).expect("identity");
+        assert_eq!(
+            canonical,
+            derive_instance_id(&[second, first], 4).expect("identity")
+        );
+        assert_ne!(
+            canonical,
+            derive_instance_id(&[first, second], 5).expect("identity")
+        );
+        assert_ne!(
+            canonical,
+            derive_instance_id(&[first], 4).expect("identity")
+        );
+        assert_eq!(
+            derive_instance_id(&[], 4),
+            Err(MakerOrderIdentityError::NoCreationInputs)
+        );
     }
 
     #[test]

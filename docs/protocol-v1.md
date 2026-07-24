@@ -68,15 +68,17 @@ The family-specific creation anchor is:
 
 For the official standalone market layout the market anchor is vout 0. A
 validated custom composition may place it elsewhere. The maker anchor is the
-exact declared output index, so one transaction can create multiple distinct
-orders, including byte-identical outputs.
+exact canonical order output index. One transaction can create multiple orders,
+but each canonical order has an instance-specific script; byte-identical
+noncanonical clones are deliberately outside the supported security envelope.
 
 The ID remains stable as later transactions move or terminate the contract. It
 does not commit to the descriptor and does not certify that the output exists
 or is a valid Deadcat contract. That proof belongs to declaration ingestion and
 chain evidence. Simplicity CMRs are deterministically derived from the stored
-parameters; scripts and creation evidence remain independently verifiable
-contract data, not instance identity.
+parameters. The maker CMR varies with its instance-derived receive-script hash,
+but the stable protocol identity is still the verified creation anchor rather
+than the CMR.
 
 Ordinary transaction inputs, outputs, and live contract state use
 `elements::OutPoint` directly. The protocol does not define a duplicate generic
@@ -618,7 +620,7 @@ pub struct MakerOrderParams {
     pub price: u32,
     pub min_active_base: u32,
     pub direction: OrderDirection,
-    pub maker_receive_spk_hash: [u8; 32],
+    pub instance_id: [u8; 32],
     pub maker_pubkey: XOnlyPublicKey,
 }
 ```
@@ -634,9 +636,11 @@ asset. Canonical validity is:
 The order input and every covenant-constrained output use explicit asset and
 value. Taker wallet outputs may be confidential.
 
-The Taproot internal key is `maker_pubkey`. Key-spend is the sole cancellation
-mechanism. The Simplicity leaf contains only the permissionless fill path; it has
-no cosigner and no script-cancel branch.
+`maker_pubkey` is a per-wallet-index base key. `instance_id` derives independent
+cancellation and receive keys. The derived cancellation key is the Taproot
+internal key, and key-spend is the sole cancellation mechanism. The Simplicity
+leaf contains only the permissionless fill path; it has no cosigner and no
+script-cancel branch.
 
 ### Creation
 
@@ -651,15 +655,56 @@ SellQuote locks offered_base_capacity * price QUOTE atoms
 The SellQuote rule makes every canonical live remainder an exact multiple of
 price. A non-multiple foreign creation is not a canonical v1 order.
 
+Canonical creation additionally requires:
+
+```text
+sorted_prevouts =
+    lexicographically sort each (txid_internal_bytes || vout_be_u32)
+
+inputs_commitment = tagged_hash(
+    "deadcat/order-inputs/v1",
+    input_count_be_u32 || concat(sorted_prevouts)
+)
+
+instance_id = tagged_hash(
+    "deadcat/order-instance/v1",
+    inputs_commitment || order_creation_vout_be_u32
+)
+```
+
+Every creation input prevout and the reserved order vout are known before the
+outputs are constructed, so this has no txid circularity. Input ordering does
+not affect identity. `instance_id` remains unchanged through partial fills even
+when the continuation moves to another vout.
+
+The covenant compiler accepts any 32-byte `instance_id`; that property keeps
+the contract primitive composable. Official builders, registration, and public
+discovery require the derivation above. A noncanonical creator can deliberately
+reuse an instance ID and produce byte-identical order scripts, reintroducing
+output aliasing for software that elects to treat those outputs as orders.
+Noncanonical orders are therefore unsupported and must be handled as unsafe
+foreign contracts.
+
+The canonical order output is immediately followed by its recovery/discovery
+hint. That adjacency lets a scanner determine the creation vout without placing
+`instance_id` in the hint.
+
 ### Fill layout
 
-For an order input at index `i`:
+The script witness selects a maker-payment output `p`, an explicit
+`is_partial` branch, and a remainder output `r`. For an order input at any index:
 
-- the maker payment is output `i` and must match
-  `maker_receive_spk_hash`;
-- a partial-fill remainder index is supplied by the Simplicity witness;
+- the maker payment at `p` must use the instance-derived receive script;
+- `p != r` always, keeping the two witness fields unambiguous; a full fill does
+  not otherwise inspect `r`;
 - the remainder output must reproduce the exact covenant script; and
 - output indices and products are bounds/overflow checked.
+
+Neither output index is coupled to the order input index. Canonical instance
+uniqueness makes both the receive script and continuation script order-specific,
+so independently selected outputs cannot satisfy another canonical order.
+Client fill plans additionally bind the exact live input outpoint, preventing a
+composer from silently substituting a same-script foreign output.
 
 Let `I` be order input amount, `M` maker output amount, `R` nonzero remainder,
 `P` price, `A` minimum, and `F` filled BASE atoms.
@@ -726,7 +771,6 @@ Canonical state is:
 ```rust
 pub enum MakerOrderState {
     Active {
-        active_outpoint: OutPoint,
         remaining_base: u64,
         total_filled_base: u64,
     },
@@ -763,30 +807,23 @@ m/86'/1145258324'/2'/i'    reserved future pool admin key
 ```
 
 ```text
-order_nonce = HMAC-SHA256(
-    deadcat_secret_key,
-    "deadcat/order_nonce" || order_index_be_u16
-)
+cancel_tweak = hash_to_scalar("deadcat/order-cancel/v1", instance_id)
+receive_tweak = hash_to_scalar("deadcat/order-receive/v1", instance_id)
 
-order_uid = SHA256(
-    "deadcat/order_uid" ||
-    maker_pubkey || order_nonce ||
-    base_asset_id || quote_asset_id ||
-    price_be_u32 || min_active_base_be_u32 || direction_byte
-)
+P_cancel = xonly_add_tweak(maker_pubkey, cancel_tweak)
+P_receive = xonly_add_tweak(maker_pubkey, receive_tweak)
 
-order_tweak = hash_to_scalar("deadcat/order_tweak", order_uid)
-P_order = xonly_add_tweak(maker_pubkey, order_tweak)
-maker_receive_spk = OP_1 PUSH32 P_order
+maker_receive_spk = OP_1 PUSH32 P_receive
 maker_receive_spk_hash = SHA256(maker_receive_spk)
 ```
 
 `maker_pubkey` is the BIP-340 x-only serialization of the even-Y lift of the
 derived maker key. `xonly_add_tweak` uses the standard secp256k1 x-only tweak
 operation, records the resulting parity needed to derive the corresponding
-private spend key, and returns the result's 32-byte x-only serialization. An
-infinity result makes that order index unusable rather than selecting a
-different unstated derivation.
+private spend key, and returns the result's 32-byte x-only serialization.
+`P_cancel` is the Taproot internal key for the covenant tree; `P_receive` is the
+internal key of the maker's key-path receive output. An infinity result makes
+that instance unusable rather than selecting a different unstated derivation.
 
 `direction_byte` is zero for SellBase and one for SellQuote, matching the order
 type-tag direction bit and mask context.
@@ -794,11 +831,12 @@ type-tag direction bit and mask context.
 Order-mask context is:
 
 ```text
-market_creation_txid       32 bytes
+parent_market_reference    36 bytes
 price                       4 bytes, BE
 side                        1 byte, YES=0, NO=1
 direction                   1 byte, SellBase=0, SellQuote=1
 min_active_base             4 bytes, BE
+maker_pubkey               32 bytes
 ```
 
 ```text
@@ -811,28 +849,25 @@ mask_u16 = big_endian_u16(mask_bytes)
 masked_order_index = order_index XOR mask_u16
 ```
 
-The order hint is an owner mnemonic-recovery aid. A public node cannot unmask
-the index or derive maker-specific params. Nostr or manual registration supplies
-the full declaration in a package; the node verifies it by recompiling and
-matching the nominated creation output.
+The masked index remains an owner mnemonic-recovery aid, but the rest of the
+hint is intentionally public. A node does not need to unmask the index:
+adjacency supplies the order vout, the creation inputs derive `instance_id`, and
+the hint plus verified parent supplies every remaining compile parameter.
 
-For chain-only owner recovery, the client may either start with creation
-transactions found by its normal wallet rescan or ask a node for all
-length-valid order-hint candidates. For each candidate it locally derives the
-Deadcat secret, unmasks a candidate index, derives the maker/cancellation and
-receive keys, compiles the order, and accepts ownership only if the compiled
-script matches the unique creation output. XOR unmasking produces some `u16`
-for every foreign hint; the script match is therefore the ownership test. The
-mnemonic or derived xprv is never sent to the node.
+For chain-only owner recovery, the client scans order hints, unmasks a candidate
+index, derives the base/cancellation/receive keys using the chain-derived
+`instance_id`, and accepts ownership only if the base maker key and compiled
+script match the hint and adjacent creation output. XOR unmasking produces some
+`u16` for every foreign hint; the public-key and script matches are therefore
+the ownership test. The mnemonic or derived xprv is never sent to the node.
 
 Public registration supplies a `ContractPackage`. A maker-order descriptor
 contains the full parent `ContractId`, side, direction, price, minimum, maker
-public key, and maker receive script hash; its declaration nominates the exact
-creation output. That output must be the canonical explicit order state matching
-the compiled script, asset, amount, and economics. The node derives its current
-outpoint only by replaying that anchor's complete spend lineage; an announced
-live outpoint is at most an acceleration hint and is never trusted because
-anyone can create a decoy output at a public script.
+base public key, and canonical instance ID; its declaration nominates the exact
+creation output. The node re-derives the instance ID, requires the adjacent
+matching hint, and verifies the explicit state, script, asset, amount, and
+economics. The node derives its current outpoint only by replaying that anchor's
+complete spend lineage.
 
 ### Recovery hint
 
@@ -845,24 +880,28 @@ V1 order tags are:
 0x4c  NO  / SellQuote
 ```
 
-Payload, 43 bytes:
+Payload, 79 bytes:
 
 ```text
 Byte 0       complete order type tag
 Bytes 1-2    masked_order_index, u16 big-endian
-Bytes 3-34   parent market creation txid
-Bytes 35-38  price, u32 big-endian
-Bytes 39-42  min_active_base, u32 big-endian
+Bytes 3-34   parent market txid, internal byte order
+Bytes 35-38  parent market vout, u32 big-endian
+Bytes 39-42  price, u32 big-endian
+Bytes 43-46  min_active_base, u32 big-endian
+Bytes 47-78  maker base x-only public key
 ```
 
-The complete direct-push script is 45 bytes. No trailing bytes are accepted.
-The parent txid in this compact mnemonic-recovery hint is a locator, not a
-`ContractId`; validation derives and verifies the market's dormant-YES anchor
-from its creation transaction. Canonical package references always use the full
-parent `ContractId`. A node never globally associates a maker hint with a
-public contract record: the hint omits the maker key, receive script, exact
-output, and parent vout, so ownership is established only by client-side key
-derivation followed by an exact compiled-script match.
+The complete canonical script is `OP_RETURN OP_PUSHDATA1 0x4f <payload>` (82
+bytes). No trailing bytes are accepted. For an already-created parent, bytes
+3-38 are its complete `ContractId`. For a parent market created in the same
+transaction, an all-zero parent txid is the reserved “this transaction”
+sentinel and the vout remains explicit. This avoids a txid self-reference while
+retaining atomic market-plus-order creation.
+
+The node globally associates the hint only after it resolves the parent,
+derives the adjacent order's instance ID, compiles the covenant, and verifies
+the exact output. A copied or malformed hint is only a rejected candidate.
 
 ## 4. Confidentiality matrix
 
@@ -893,8 +932,9 @@ Machine-readable fixtures are committed before a contract is considered stable:
 7. expiry lock-height boundary fixtures (`nLockTime = H - 1` rejected by the
    covenant, block `H` not final, block `H + 1` accepted) plus valid late oracle
    resolution races and the `500_000_000` type boundary;
-8. mnemonic to numeric paths, secret, order key, nonce, mask, UID, tweak,
-   x-only tweak parity, receive private key, and receive script/hash;
+8. mnemonic to numeric paths, secret, base order key, canonical instance ID,
+   mask, cancellation/receive tweaks and parity, receive private key, and
+   receive script/hash;
 9. all four order hint tags;
 10. both directions' full/partial fills at minimum and overflow boundaries;
 11. decoy-output and shifted-window transactions proving witness-grounded

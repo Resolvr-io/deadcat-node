@@ -232,15 +232,18 @@ after that anchor to the pinned tip. During the same ordered pass the node:
 - stores every length-valid recognized recovery-hint envelope with its chain
   position and output index;
 - fully reconstructs and registers canonical standalone market creations; and
-- retains order hints as client-side mnemonic-recovery candidates even when the
-  public fields are insufficient for the node to compile the order.
+- fully reconstructs canonical maker orders whose adjacent public hint resolves
+  to a verified parent market.
 
 Automatic market discovery accepts only the fixed standalone creation shape.
 Composed creations use complete contract-package registration, avoiding
-combinatorial scans over attacker-supplied issuance sets. A standard Esplora
-service has no global OP_RETURN-prefix index, so activation-to-tip scanning
-requires downloading all raw blocks and may be unavailable or operationally
-expensive. Nostr and manual registration remain fast-start paths.
+combinatorial scans over attacker-supplied issuance sets. Canonical maker
+discovery is linear: the hint output identifies the immediately preceding order
+vout, and the creation input set derives its instance ID. A same-transaction
+parent uses the all-zero-txid sentinel plus its explicit vout. A standard
+Esplora service has no global OP_RETURN-prefix index, so activation-to-tip
+scanning requires downloading all raw blocks and may be unavailable or
+operationally expensive. Nostr and manual registration remain fast-start paths.
 
 `GetInfo` reports discovery coverage separately from contract synchronization:
 

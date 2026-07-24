@@ -39,9 +39,12 @@ overflow, and output-window aliasing.
 ## Phase 2: Maker limit-order covenant
 
 - Implement exact `u32` price and one `u32 min_active_base`.
-- Implement positional maker payment and witness-selected remainder.
+- Implement witness-selected maker payment and remainder indices with an
+  explicit full/partial branch.
+- Derive collision-resistant order instances from creation inputs and order
+  vout; derive distinct cancellation and receive keys from that instance.
 - Implement permissionless script-spend fill and maker-only key-spend cancel.
-- Implement owner recovery derivation and public announcement verification.
+- Implement owner recovery derivation and chain-only public discovery.
 
 Gate: SellBase and SellQuote full, partial, batched, minimum-boundary, overflow,
 cancel, recovery, and post-resolution ingestion tests pass. Differential tests

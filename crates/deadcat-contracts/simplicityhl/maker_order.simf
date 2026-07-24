@@ -1,7 +1,8 @@
 // Deadcat persistent maker limit order v1.
 //
-// The Taproot internal key is the maker key and provides the only cancellation
-// path. This Simplicity leaf is a permissionless exact-price fill path.
+// The Taproot internal key is the instance-derived maker cancellation key and
+// provides the only cancellation path. This Simplicity leaf is a
+// permissionless exact-price fill path.
 
 fn not(bit: bool) -> bool {
     <u1>::into(jet::complement_1(<bool>::into(bit)))
@@ -74,7 +75,6 @@ fn ensure_maker_payment(index: u32, asset: u256) -> u64 {
 }
 
 fn ensure_remainder(index: u32, input_index: u32, asset: u256) -> u64 {
-    assert!(not(jet::eq_32(index, input_index)));
     let (actual_asset, amount): (u256, u64) = get_output_explicit(index);
     assert!(jet::eq_256(actual_asset, asset));
     assert!(jet::eq_256(
@@ -84,20 +84,25 @@ fn ensure_remainder(index: u32, input_index: u32, asset: u256) -> u64 {
     amount
 }
 
-fn fill_sell_base(input_index: u32, remainder_index: u32) {
+fn fill_sell_base(
+    input_index: u32,
+    payment_index: u32,
+    is_partial: bool,
+    remainder_index: u32,
+) {
     let (input_asset, input_amount): (u256, u64) = get_input_explicit(input_index);
     assert!(jet::eq_256(input_asset, param::BASE_ASSET_ID));
 
-    let maker_payment: u64 = ensure_maker_payment(input_index, param::QUOTE_ASSET_ID);
+    let maker_payment: u64 = ensure_maker_payment(payment_index, param::QUOTE_ASSET_ID);
     let price: u64 = widen_u32(param::PRICE);
     let minimum: u64 = widen_u32(param::MIN_ACTIVE_BASE);
-    let complete_payment: u64 = safe_multiply(input_amount, price);
 
-    match jet::eq_64(maker_payment, complete_payment) {
-        true => {
+    match is_partial {
+        false => {
+            assert!(jet::eq_64(maker_payment, safe_multiply(input_amount, price)));
             assert!(jet::le_64(minimum, input_amount));
         },
-        false => {
+        true => {
             let remainder: u64 = ensure_remainder(
                 remainder_index,
                 input_index,
@@ -113,20 +118,27 @@ fn fill_sell_base(input_index: u32, remainder_index: u32) {
     };
 }
 
-fn fill_sell_quote(input_index: u32, remainder_index: u32) {
+fn fill_sell_quote(
+    input_index: u32,
+    payment_index: u32,
+    is_partial: bool,
+    remainder_index: u32,
+) {
     let (input_asset, input_amount): (u256, u64) = get_input_explicit(input_index);
     assert!(jet::eq_256(input_asset, param::QUOTE_ASSET_ID));
 
-    let filled: u64 = ensure_maker_payment(input_index, param::BASE_ASSET_ID);
+    let filled: u64 = ensure_maker_payment(payment_index, param::BASE_ASSET_ID);
     let price: u64 = widen_u32(param::PRICE);
     let minimum: u64 = widen_u32(param::MIN_ACTIVE_BASE);
     ensure_nonzero(filled);
     assert!(jet::le_64(minimum, filled));
     let quote_filled: u64 = safe_multiply(filled, price);
 
-    match jet::eq_64(quote_filled, input_amount) {
-        true => {},
+    match is_partial {
         false => {
+            assert!(jet::eq_64(quote_filled, input_amount));
+        },
+        true => {
             let remainder: u64 = ensure_remainder(
                 remainder_index,
                 input_index,
@@ -144,12 +156,26 @@ fn main() {
     let input_index: u32 = jet::current_index();
     ensure_no_issuance(input_index);
 
-    // The maker payment is position-anchored to this input. The remainder is
-    // witness-selected so batched fills can place it anywhere without aliasing
-    // another order's mandatory payment output.
+    // Canonical order instances have distinct covenant and payment scripts, so
+    // both exact outputs may be placed freely by the spending transaction.
+    let payment_index: u32 = witness::PAYMENT_INDEX;
+    let is_partial: bool = witness::IS_PARTIAL;
     let remainder_index: u32 = witness::REMAINDER_INDEX;
+    // Keep the two witness words structurally distinguishable even when the
+    // full-fill branch does not inspect a remainder output.
+    assert!(not(jet::eq_32(payment_index, remainder_index)));
     match param::DIRECTION_SELL_QUOTE {
-        false => fill_sell_base(input_index, remainder_index),
-        true => fill_sell_quote(input_index, remainder_index),
+        false => fill_sell_base(
+            input_index,
+            payment_index,
+            is_partial,
+            remainder_index,
+        ),
+        true => fill_sell_quote(
+            input_index,
+            payment_index,
+            is_partial,
+            remainder_index,
+        ),
     };
 }

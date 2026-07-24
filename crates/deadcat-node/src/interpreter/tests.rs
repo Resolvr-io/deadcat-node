@@ -1,7 +1,9 @@
 use deadcat_contracts::binary_market::{BinaryMarketSlot, CompiledBinaryMarket};
-use deadcat_contracts::maker_order::CompiledMakerOrder;
+use deadcat_contracts::maker_order::{CompiledMakerOrder, derive_instance_id};
 use deadcat_contracts::market_crypto::derive_issuance_assets;
-use deadcat_contracts::recovery::{MarketCollateral, MarketRecoveryHint, recovery_txout};
+use deadcat_contracts::recovery::{
+    MarketCollateral, MarketRecoveryHint, OrderRecoveryHint, ParentMarketRef, recovery_txout,
+};
 use deadcat_contracts::rt::{RtLeg, RtSide, commitments, factors};
 use deadcat_types::{
     BinaryMarketParams, ChainAnchor, ChainPosition, ContractSyncState, MakerOrderParams,
@@ -14,7 +16,6 @@ use elements::{
     AssetIssuance, BlockHash, LockTime, OutPoint, Script, Transaction, TxIn, TxOut, TxOutWitness,
     Txid,
 };
-use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 
 use super::*;
@@ -73,7 +74,7 @@ fn maker_params(seed: u8) -> MakerOrderParams {
         price: 7,
         min_active_base: 3,
         direction: OrderDirection::SellBase,
-        maker_receive_spk_hash: Sha256::digest([seed]).into(),
+        instance_id: [seed; 32],
         maker_pubkey: key(seed),
     }
 }
@@ -534,7 +535,83 @@ fn canonical_hint_creates_ready_market_but_composed_shape_is_registration_only()
 }
 
 #[test]
-fn destructive_replay_revalidates_retained_market_and_identical_same_tx_makers() {
+fn canonical_order_hint_publicly_discovers_same_transaction_order() {
+    let (_directory, store) = empty_store();
+    let policy = asset(0xa2);
+    let (mut transaction, market_params) = standalone_market_with_params(policy);
+    let creation_prevouts = transaction
+        .input
+        .iter()
+        .map(|input| input.previous_output)
+        .collect::<Vec<_>>();
+    let params = MakerOrderParams {
+        base_asset_id: market_params.yes_token_asset_id,
+        quote_asset_id: market_params.collateral_asset_id,
+        price: 100,
+        min_active_base: 10,
+        direction: OrderDirection::SellQuote,
+        instance_id: derive_instance_id(&creation_prevouts, 3).expect("instance"),
+        maker_pubkey: VALID_XONLY,
+    };
+    let compiled = CompiledMakerOrder::new(params).expect("compile order");
+    transaction.output.push(explicit_txout(
+        params.quote_asset_id,
+        2_000,
+        compiled.script_pubkey().clone(),
+    ));
+    let hint = OrderRecoveryHint {
+        side: OrderSide::Yes,
+        direction: params.direction,
+        masked_order_index: 0x1234,
+        parent_market: ParentMarketRef::SameTransaction { vout: 0 },
+        price: params.price,
+        min_active_base: params.min_active_base,
+        maker_pubkey: params.maker_pubkey,
+    };
+    transaction
+        .output
+        .push(recovery_txout(policy, &hint.encode()).expect("order hint"));
+
+    let current = anchor(12, 0xc2);
+    let interpreted = DeadcatInterpreter::new(LiquidNetwork::ElementsRegtest, policy)
+        .interpret_transaction(
+            &InterpretationContext {
+                store: &store,
+                anchor: current,
+                position: ChainPosition {
+                    block_height: 12,
+                    tx_index: 5,
+                },
+                prior_transactions: &[],
+                retained_declarations: &[],
+                mode: InterpretationMode::Canonical,
+            },
+            &transaction,
+        )
+        .expect("publicly discover market and maker order");
+
+    let market_id = ContractId::new(OutPoint::new(transaction.txid(), 0));
+    let order_id = ContractId::new(OutPoint::new(transaction.txid(), 3));
+    assert_eq!(
+        interpreted
+            .created_contracts
+            .iter()
+            .map(|record| record.contract_id)
+            .collect::<Vec<_>>(),
+        vec![market_id, order_id]
+    );
+    assert_eq!(
+        interpreted
+            .recovery_hints
+            .iter()
+            .filter_map(|hint| hint.associated_contract)
+            .collect::<Vec<_>>(),
+        vec![market_id, order_id]
+    );
+}
+
+#[test]
+fn destructive_replay_revalidates_retained_market_and_canonical_same_tx_makers() {
     let directory = tempfile::tempdir().expect("tempdir");
     let store = Store::open(directory.path().join("deadcat.redb")).expect("store");
     let genesis = anchor(0, 0x01);
@@ -551,27 +628,46 @@ fn destructive_replay_revalidates_retained_market_and_identical_same_tx_makers()
         .expect("initialize chain");
 
     let (mut creation, market_params) = standalone_market_with_params(policy);
-    let order_params = MakerOrderParams {
+    // Move the canonical YES RT away from vout 0. The complete declaration
+    // remains verifiable, but fixed-shape market-hint discovery alone must not
+    // recover this composed market during rebuild.
+    creation.output.swap(0, 1);
+    let creation_prevouts = creation
+        .input
+        .iter()
+        .map(|input| input.previous_output)
+        .collect::<Vec<_>>();
+    let order_params = |order_vout| MakerOrderParams {
         base_asset_id: market_params.yes_token_asset_id,
         quote_asset_id: market_params.collateral_asset_id,
         price: 100,
         min_active_base: 10,
         direction: OrderDirection::SellQuote,
-        maker_receive_spk_hash: [0x43; 32],
+        instance_id: derive_instance_id(&creation_prevouts, order_vout).expect("instance"),
         maker_pubkey: VALID_XONLY,
     };
-    let compiled_order = CompiledMakerOrder::new(order_params).expect("compile order");
-    let order_output = explicit_txout(
-        order_params.quote_asset_id,
-        2_000,
-        compiled_order.script_pubkey().clone(),
-    );
-    // Move the canonical YES RT away from vout 0. The complete declaration
-    // remains verifiable, but fixed-shape hint discovery alone must not recover
-    // this composed market during rebuild.
-    creation.output.swap(0, 1);
-    creation.output.push(order_output.clone());
-    creation.output.push(order_output);
+    let first_params = order_params(3);
+    let second_params = order_params(5);
+    for params in [first_params, second_params] {
+        let compiled_order = CompiledMakerOrder::new(params).expect("compile order");
+        creation.output.push(explicit_txout(
+            params.quote_asset_id,
+            2_000,
+            compiled_order.script_pubkey().clone(),
+        ));
+        let hint = OrderRecoveryHint {
+            side: OrderSide::Yes,
+            direction: params.direction,
+            masked_order_index: 0x1234,
+            parent_market: ParentMarketRef::SameTransaction { vout: 1 },
+            price: params.price,
+            min_active_base: params.min_active_base,
+            maker_pubkey: params.maker_pubkey,
+        };
+        creation
+            .output
+            .push(recovery_txout(policy, &hint.encode()).expect("order hint"));
+    }
 
     let old_anchor = anchor(1, 0x02);
     let old_position = ChainPosition {
@@ -589,7 +685,7 @@ fn destructive_replay_revalidates_retained_market_and_identical_same_tx_makers()
         .expect("index original creation block");
     let market_id = ContractId::new(OutPoint::new(creation.txid(), 1));
     let first_order_id = ContractId::new(OutPoint::new(creation.txid(), 3));
-    let second_order_id = ContractId::new(OutPoint::new(creation.txid(), 4));
+    let second_order_id = ContractId::new(OutPoint::new(creation.txid(), 5));
     let market = verify_binary_market_creation(
         &creation,
         old_position,
@@ -604,20 +700,22 @@ fn destructive_replay_revalidates_retained_market_and_identical_same_tx_makers()
         &creation,
         old_position,
         old_anchor,
+        policy,
         first_order_id,
         &market.record,
         OrderSide::Yes,
-        order_params,
+        first_params,
     )
     .expect("verify first order");
     let second_order = verify_maker_order_creation(
         &creation,
         old_position,
         old_anchor,
+        policy,
         second_order_id,
         &market.record,
         OrderSide::Yes,
-        order_params,
+        second_params,
     )
     .expect("verify second order");
     let shared_creation = Arc::new(creation.clone());
@@ -766,7 +864,7 @@ fn destructive_replay_revalidates_retained_market_and_identical_same_tx_makers()
         ));
     }
 
-    let assert_identical_orders_are_indexed = |store: &Store| {
+    let assert_canonical_orders_are_indexed = |store: &Store| {
         let mut actual = store
             .ready_orders(market_id, None, None, None, 10)
             .expect("ready orders")
@@ -779,10 +877,10 @@ fn destructive_replay_revalidates_retained_market_and_identical_same_tx_makers()
         expected.sort_unstable();
         assert_eq!(actual, expected);
     };
-    assert_identical_orders_are_indexed(&store);
+    assert_canonical_orders_are_indexed(&store);
     drop(store);
     let reopened = Store::open(directory.path().join("deadcat.redb")).expect("reopen store");
-    assert_identical_orders_are_indexed(&reopened);
+    assert_canonical_orders_are_indexed(&reopened);
 }
 
 #[test]

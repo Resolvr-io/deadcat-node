@@ -31,9 +31,9 @@ pub enum ClientError {
 #[cfg(test)]
 mod tests {
     use deadcat_contracts::recovery::{OrderRecoveryHint, order_mask};
-    use deadcat_types::{OrderDirection, OrderSide};
-    use elements::Txid;
+    use deadcat_types::{ContractId, OrderDirection, OrderSide};
     use elements::hashes::Hash as _;
+    use elements::{OutPoint, Txid};
 
     use super::*;
 
@@ -45,9 +45,15 @@ mod tests {
             side: OrderSide::Yes,
             direction: OrderDirection::SellBase,
             masked_order_index: 0,
-            market_creation_txid: Txid::from_byte_array([0x24; 32]),
+            parent_market: ContractId::new(OutPoint::new(Txid::from_byte_array([0x24; 32]), 3))
+                .into(),
             price: 5_000,
             min_active_base: 100,
+            maker_pubkey: [
+                0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9,
+                0x7a, 0x5e, 0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a,
+                0xce, 0x80, 0x3a, 0xc0,
+            ],
         };
         hint.masked_order_index = order_index ^ order_mask(hint, &secret);
 

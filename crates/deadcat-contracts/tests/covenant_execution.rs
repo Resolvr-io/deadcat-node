@@ -13,7 +13,7 @@ use deadcat_contracts::market_crypto::derive_issuance_assets;
 use deadcat_contracts::rt::{RtFactors, RtLeg, RtSide, factors};
 use deadcat_types::{BinaryMarketParams, MakerOrderParams, OrderDirection};
 use elements::confidential::{Asset, Nonce, Value};
-use elements::hashes::{Hash as _, HashEngine as _, sha256};
+use elements::hashes::Hash as _;
 use elements::pset::PartiallySignedTransaction;
 use elements::secp256k1_zkp::{Generator, Keypair, PedersenCommitment, Secp256k1, Tweak};
 use elements::{
@@ -22,16 +22,6 @@ use elements::{
 use simplex::program::{ProgramTrait as _, WitnessTrait as _};
 
 use support::{asset, bare_op_return, explicit_txout, network, pset_input, pset_output, script};
-
-fn maker_receive_script() -> Script {
-    script(0x42)
-}
-
-fn script_hash(script: &Script) -> [u8; 32] {
-    let mut engine = sha256::Hash::engine();
-    engine.input(script.as_bytes());
-    sha256::Hash::from_engine(engine).to_byte_array()
-}
 
 fn maker_key() -> [u8; 32] {
     Keypair::from_seckey_slice(&Secp256k1::new(), &[0x31; 32])
@@ -48,7 +38,7 @@ fn maker_params(direction: OrderDirection) -> MakerOrderParams {
         price: 7,
         min_active_base: 3,
         direction,
-        maker_receive_spk_hash: script_hash(&maker_receive_script()),
+        instance_id: [0x42; 32],
         maker_pubkey: maker_key(),
     }
 }
@@ -119,6 +109,7 @@ impl MakerFillCase {
 fn execute_maker_fill(case: MakerFillCase) -> Result<(), Box<dyn std::error::Error>> {
     let params = maker_params(case.direction);
     let compiled = CompiledMakerOrder::new(params)?;
+    let is_partial = case.remainder.is_some();
     let order_script = compiled.script_pubkey().clone();
     let input_asset = match case.direction {
         OrderDirection::SellBase => params.base_asset_id,
@@ -160,8 +151,11 @@ fn execute_maker_fill(case: MakerFillCase) -> Result<(), Box<dyn std::error::Err
         .max(remainder_output_index)
         .max(case.input_index);
     let mut outputs = vec![explicit_txout(params.quote_asset_id, 1, script(0x99)); last_output + 1];
-    outputs[case.payment_index] =
-        explicit_txout(payment_asset, case.payment_amount, maker_receive_script());
+    outputs[case.payment_index] = explicit_txout(
+        payment_asset,
+        case.payment_amount,
+        compiled.maker_receive_spk().clone(),
+    );
     if let Some(mut remainder) = case.remainder {
         if remainder.script_pubkey.is_empty() {
             remainder.script_pubkey = order_script;
@@ -174,6 +168,8 @@ fn execute_maker_fill(case: MakerFillCase) -> Result<(), Box<dyn std::error::Err
     }
 
     let witness = derived_maker_order::MakerOrderWitness {
+        payment_index: u32::try_from(case.payment_index)?,
+        is_partial,
         remainder_index: case.remainder_witness_index,
     };
     let net = network(params.quote_asset_id);
@@ -217,6 +213,17 @@ fn maker_rejects_inexact_payments_and_dust_remainders() {
 }
 
 #[test]
+fn maker_partial_branch_does_not_evaluate_overflowing_full_fill_product() {
+    execute_maker_fill(MakerFillCase::partial(
+        OrderDirection::SellBase,
+        u64::MAX,
+        21,
+        u64::MAX - 3,
+    ))
+    .expect("partial branch only multiplies the three-atom fill");
+}
+
+#[test]
 fn maker_rejects_wrong_remainder_script_and_alias() {
     let mut wrong_script = MakerFillCase::partial(OrderDirection::SellBase, 10, 28, 6);
     wrong_script
@@ -239,16 +246,98 @@ fn maker_rejects_attached_issuance() {
 }
 
 #[test]
-fn maker_payment_is_anchored_to_current_input_position() {
+fn maker_payment_and_remainder_indices_are_flexible() {
     let mut valid = MakerFillCase::full(OrderDirection::SellBase, 10, 70);
     valid.input_index = 1;
     valid.payment_index = 1;
+    valid.remainder_witness_index = 0;
     execute_maker_fill(valid).expect("payment at current input index");
 
-    let mut misplaced = MakerFillCase::full(OrderDirection::SellBase, 10, 70);
-    misplaced.input_index = 1;
-    misplaced.payment_index = 0;
-    assert!(execute_maker_fill(misplaced).is_err());
+    let mut independently_placed = MakerFillCase::partial(OrderDirection::SellBase, 10, 28, 6);
+    independently_placed.input_index = 2;
+    independently_placed.payment_index = 1;
+    independently_placed
+        .remainder
+        .as_mut()
+        .expect("remainder")
+        .output_index = 0;
+    independently_placed.remainder_witness_index = 0;
+    execute_maker_fill(independently_placed).expect("independent output positions");
+}
+
+#[test]
+fn canonical_instances_prevent_cross_order_output_aliasing() {
+    let first_params = maker_params(OrderDirection::SellBase);
+    let mut second_params = first_params;
+    second_params.instance_id = [0x43; 32];
+    let first = CompiledMakerOrder::new(first_params).expect("first order");
+    let second = CompiledMakerOrder::new(second_params).expect("second order");
+    assert_ne!(first.script_pubkey(), second.script_pubkey());
+    assert_ne!(first.maker_receive_spk(), second.maker_receive_spk());
+
+    let mut pset = PartiallySignedTransaction::new_v2();
+    pset.add_input(pset_input(
+        0xa1,
+        0,
+        explicit_txout(
+            first_params.base_asset_id,
+            10,
+            first.script_pubkey().clone(),
+        ),
+    ));
+    pset.add_input(pset_input(
+        0xa2,
+        0,
+        explicit_txout(
+            second_params.base_asset_id,
+            10,
+            second.script_pubkey().clone(),
+        ),
+    ));
+    pset.add_output(pset_output(explicit_txout(
+        first_params.quote_asset_id,
+        28,
+        first.maker_receive_spk().clone(),
+    )));
+    pset.add_output(pset_output(explicit_txout(
+        first_params.base_asset_id,
+        6,
+        first.script_pubkey().clone(),
+    )));
+    let witness = derived_maker_order::MakerOrderWitness {
+        payment_index: 0,
+        is_partial: true,
+        remainder_index: 1,
+    };
+    let net = network(first_params.quote_asset_id);
+    first
+        .program()
+        .as_ref()
+        .execute(&pset, &witness.build_witness(), 0, &net)
+        .expect("first order owns the selected outputs");
+    assert!(
+        second
+            .program()
+            .as_ref()
+            .execute(&pset, &witness.build_witness(), 1, &net)
+            .is_err(),
+        "a distinct canonical instance accepted another order's outputs"
+    );
+
+    // At the covenant level, a creator can deliberately clone the same
+    // instance and script. Both inputs then accept the aliased outputs. Node
+    // creation verification rejects this noncanonical construction.
+    let mut duplicate_pset = pset;
+    duplicate_pset.inputs_mut()[1].witness_utxo = Some(explicit_txout(
+        first_params.base_asset_id,
+        10,
+        first.script_pubkey().clone(),
+    ));
+    first
+        .program()
+        .as_ref()
+        .execute(&duplicate_pset, &witness.build_witness(), 1, &net)
+        .expect("noncanonical duplicate demonstrates the documented boundary");
 }
 
 fn confidential_rt_txout(asset_id: AssetId, factors: RtFactors, script_pubkey: Script) -> TxOut {

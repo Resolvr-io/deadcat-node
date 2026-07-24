@@ -6,10 +6,12 @@ use std::str::FromStr as _;
 use std::sync::Arc;
 
 use deadcat_contracts::binary_market::{BinaryMarketSlot, CompiledBinaryMarket};
-use deadcat_contracts::maker_order::{CompiledMakerOrder, create, validate_against_market};
+use deadcat_contracts::maker_order::{
+    CompiledMakerOrder, create, derive_instance_id, validate_against_market,
+};
 use deadcat_contracts::market_crypto::derive_issuance_assets;
 use deadcat_contracts::recovery::{
-    MARKET_V1_TAG, MarketCollateral, MarketRecoveryHint, validate_recovery_txout,
+    MARKET_V1_TAG, MarketCollateral, MarketRecoveryHint, OrderRecoveryHint, validate_recovery_txout,
 };
 use deadcat_contracts::rt::{RtLeg, RtSide, commitments, factors};
 use deadcat_types::{
@@ -158,6 +160,7 @@ where
                 Arc::clone(&creation.transaction),
                 creation.position,
                 creation.anchor,
+                self.policy_asset,
                 declaration.contract_id,
                 parent,
                 side,
@@ -621,6 +624,7 @@ pub fn verify_maker_order_creation(
     transaction: &Transaction,
     position: ChainPosition,
     anchor: ChainAnchor,
+    policy_asset: AssetId,
     contract_id: ContractId,
     parent: &ContractRecord,
     side: deadcat_types::OrderSide,
@@ -630,6 +634,7 @@ pub fn verify_maker_order_creation(
         Arc::new(transaction.clone()),
         position,
         anchor,
+        policy_asset,
         contract_id,
         parent,
         side,
@@ -642,6 +647,7 @@ pub(crate) fn verify_maker_order_creation_shared(
     creation_transaction: Arc<Transaction>,
     position: ChainPosition,
     anchor: ChainAnchor,
+    policy_asset: AssetId,
     contract_id: ContractId,
     parent: &ContractRecord,
     side: deadcat_types::OrderSide,
@@ -651,6 +657,18 @@ pub(crate) fn verify_maker_order_creation_shared(
     if contract_id.txid() != transaction.txid() {
         return Err(RegistrationError::InvalidCreation(
             "maker ContractId transaction does not match its creation transaction".to_owned(),
+        ));
+    }
+    let creation_prevouts = transaction
+        .input
+        .iter()
+        .map(|input| input.previous_output)
+        .collect::<Vec<_>>();
+    let expected_instance_id = derive_instance_id(&creation_prevouts, contract_id.vout())
+        .map_err(|error| RegistrationError::InvalidCreation(error.to_string()))?;
+    if params.instance_id != expected_instance_id {
+        return Err(RegistrationError::InvalidCreation(
+            "maker instance ID is not canonical for its creation inputs and vout".to_owned(),
         ));
     }
     let ContractParameters::BinaryMarket(parent_params) = &parent.params else {
@@ -729,6 +747,36 @@ pub(crate) fn verify_maker_order_creation_shared(
         ));
     }
 
+    let hint_output_index = contract_id.vout().checked_add(1).ok_or_else(|| {
+        RegistrationError::InvalidCreation("maker hint output index overflowed u32".to_owned())
+    })?;
+    let hint_output = transaction
+        .output
+        .get(usize::try_from(hint_output_index).map_err(|_| {
+            RegistrationError::InvalidCreation("maker hint output index exceeds usize".to_owned())
+        })?)
+        .ok_or_else(|| {
+            RegistrationError::InvalidCreation(
+                "canonical maker order must be followed by its recovery hint".to_owned(),
+            )
+        })?;
+    let hint = OrderRecoveryHint::decode(
+        validate_recovery_txout(hint_output, policy_asset)
+            .map_err(|error| RegistrationError::InvalidCreation(error.to_string()))?,
+    )
+    .map_err(|error| RegistrationError::InvalidCreation(error.to_string()))?;
+    if hint.parent_market.resolve(transaction.txid()) != parent.contract_id
+        || hint.side != side
+        || hint.direction != params.direction
+        || hint.price != params.price
+        || hint.min_active_base != params.min_active_base
+        || hint.maker_pubkey != params.maker_pubkey
+    {
+        return Err(RegistrationError::InvalidCreation(
+            "canonical maker hint does not match its order or parent market".to_owned(),
+        ));
+    }
+
     let record = ContractRecord {
         contract_id,
         kind: ContractKind::MakerOrderV1,
@@ -776,11 +824,80 @@ pub(crate) fn verify_maker_order_creation_shared(
         record,
         creation_block_anchor: anchor,
         creation_transaction,
-        // V1 maker hints intentionally omit the maker key, receive script,
-        // exact output, and parent vout. They are owner-recovery locators, not
-        // a globally unique public contract association.
-        associated_hint: None,
+        associated_hint: Some(RecoveryHintLocation {
+            position,
+            output_index: hint_output_index,
+        }),
     })
+}
+
+pub(crate) fn verify_maker_order_hint_creation_shared(
+    creation_transaction: Arc<Transaction>,
+    position: ChainPosition,
+    anchor: ChainAnchor,
+    policy_asset: AssetId,
+    hint_output_index: u32,
+    parent: &ContractRecord,
+) -> Result<VerifiedRegistration, RegistrationError> {
+    let transaction = creation_transaction.as_ref();
+    let hint_output = transaction
+        .output
+        .get(usize::try_from(hint_output_index).map_err(|_| {
+            RegistrationError::InvalidCreation("maker hint output index exceeds usize".to_owned())
+        })?)
+        .ok_or_else(|| {
+            RegistrationError::InvalidCreation(
+                "maker hint output does not exist in the creation transaction".to_owned(),
+            )
+        })?;
+    let hint = OrderRecoveryHint::decode(
+        validate_recovery_txout(hint_output, policy_asset)
+            .map_err(|error| RegistrationError::InvalidCreation(error.to_string()))?,
+    )
+    .map_err(|error| RegistrationError::InvalidCreation(error.to_string()))?;
+    if hint.parent_market.resolve(transaction.txid()) != parent.contract_id {
+        return Err(RegistrationError::InvalidCreation(
+            "maker hint names a different parent market".to_owned(),
+        ));
+    }
+    let order_output_index = hint_output_index.checked_sub(1).ok_or_else(|| {
+        RegistrationError::InvalidCreation(
+            "canonical maker hint must immediately follow its order output".to_owned(),
+        )
+    })?;
+    let ContractParameters::BinaryMarket(parent_params) = &parent.params else {
+        return Err(RegistrationError::ParentIsNotMarket);
+    };
+    let base_asset_id = match hint.side {
+        deadcat_types::OrderSide::Yes => parent_params.yes_token_asset_id,
+        deadcat_types::OrderSide::No => parent_params.no_token_asset_id,
+    };
+    let creation_prevouts = transaction
+        .input
+        .iter()
+        .map(|input| input.previous_output)
+        .collect::<Vec<_>>();
+    let params = deadcat_types::MakerOrderParams {
+        base_asset_id,
+        quote_asset_id: parent_params.collateral_asset_id,
+        price: hint.price,
+        min_active_base: hint.min_active_base,
+        direction: hint.direction,
+        instance_id: derive_instance_id(&creation_prevouts, order_output_index)
+            .map_err(|error| RegistrationError::InvalidCreation(error.to_string()))?,
+        maker_pubkey: hint.maker_pubkey,
+    };
+    let contract_id = ContractId::new(OutPoint::new(transaction.txid(), order_output_index));
+    verify_maker_order_creation_shared(
+        creation_transaction,
+        position,
+        anchor,
+        policy_asset,
+        contract_id,
+        parent,
+        hint.side,
+        params,
+    )
 }
 
 fn unique_defining_input(
@@ -1269,28 +1386,49 @@ mod tests {
         let policy_asset = asset(0x94);
         let (mut transaction, market_params, position, creation_anchor) =
             standalone_market(policy_asset);
-        let order_params = deadcat_types::MakerOrderParams {
+        let creation_prevouts = transaction
+            .input
+            .iter()
+            .map(|input| input.previous_output)
+            .collect::<Vec<_>>();
+        let order_params = |order_vout| deadcat_types::MakerOrderParams {
             base_asset_id: market_params.yes_token_asset_id,
             quote_asset_id: market_params.collateral_asset_id,
             price: 100,
             min_active_base: 10,
             direction: OrderDirection::SellQuote,
-            maker_receive_spk_hash: [0x43; 32],
+            instance_id: derive_instance_id(&creation_prevouts, order_vout).expect("instance"),
             maker_pubkey: VALID_XONLY,
         };
-        let compiled_order = CompiledMakerOrder::new(order_params).expect("compile order");
-        let order_output = TxOut {
-            asset: Asset::Explicit(order_params.quote_asset_id),
-            value: Value::Explicit(2_000),
-            nonce: Nonce::Null,
-            script_pubkey: compiled_order.script_pubkey().clone(),
-            witness: TxOutWitness::default(),
-        };
-        transaction.output.push(order_output.clone());
-        transaction.output.push(order_output);
+        let first_params = order_params(3);
+        let second_params = order_params(5);
+        for params in [first_params, second_params] {
+            let compiled_order = CompiledMakerOrder::new(params).expect("compile order");
+            transaction.output.push(TxOut {
+                asset: Asset::Explicit(params.quote_asset_id),
+                value: Value::Explicit(2_000),
+                nonce: Nonce::Null,
+                script_pubkey: compiled_order.script_pubkey().clone(),
+                witness: TxOutWitness::default(),
+            });
+            let hint = OrderRecoveryHint {
+                side: OrderSide::Yes,
+                direction: params.direction,
+                masked_order_index: 0x1234,
+                parent_market: deadcat_contracts::recovery::ParentMarketRef::SameTransaction {
+                    vout: 0,
+                },
+                price: params.price,
+                min_active_base: params.min_active_base,
+                maker_pubkey: params.maker_pubkey,
+            };
+            transaction
+                .output
+                .push(recovery_txout(policy_asset, &hint.encode()).expect("canonical order hint"));
+        }
         let market_id = ContractId::new(OutPoint::new(transaction.txid(), 0));
         let first_order_id = ContractId::new(OutPoint::new(transaction.txid(), 3));
-        let second_order_id = ContractId::new(OutPoint::new(transaction.txid(), 4));
+        let second_order_id = ContractId::new(OutPoint::new(transaction.txid(), 5));
         let package = ContractPackage {
             format_version: CONTRACT_PACKAGE_FORMAT_VERSION,
             chain: deadcat_types::ChainIdentity {
@@ -1305,7 +1443,7 @@ mod tests {
                     descriptor: ContractDescriptor::MakerOrderV1 {
                         parent_market: market_id,
                         side: OrderSide::Yes,
-                        params: order_params,
+                        params: first_params,
                     },
                 },
                 ContractDeclaration {
@@ -1313,7 +1451,7 @@ mod tests {
                     descriptor: ContractDescriptor::MakerOrderV1 {
                         parent_market: market_id,
                         side: OrderSide::Yes,
-                        params: order_params,
+                        params: second_params,
                     },
                 },
                 ContractDeclaration {
@@ -1631,13 +1769,14 @@ mod tests {
         let ContractParameters::BinaryMarket(parent_params) = parent.params else {
             panic!("market params")
         };
+        let input = TxIn::default();
         let params = deadcat_types::MakerOrderParams {
             base_asset_id: parent_params.yes_token_asset_id,
             quote_asset_id: parent_params.collateral_asset_id,
             price: 100,
             min_active_base: 10,
             direction: OrderDirection::SellQuote,
-            maker_receive_spk_hash: [0x42; 32],
+            instance_id: derive_instance_id(&[input.previous_output], 0).expect("instance"),
             maker_pubkey: VALID_XONLY,
         };
         let compiled = CompiledMakerOrder::new(params).expect("order compile");
@@ -1645,15 +1784,16 @@ mod tests {
             side: OrderSide::Yes,
             direction: params.direction,
             masked_order_index: 0x1234,
-            market_creation_txid: parent.contract_id.txid(),
+            parent_market: parent.contract_id.into(),
             price: params.price,
             min_active_base: params.min_active_base,
+            maker_pubkey: params.maker_pubkey,
         }
         .encode();
         let transaction = Transaction {
             version: 2,
             lock_time: LockTime::ZERO,
-            input: vec![TxIn::default()],
+            input: vec![input],
             output: vec![
                 TxOut {
                     asset: Asset::Explicit(params.quote_asset_id),
@@ -1673,6 +1813,7 @@ mod tests {
             &transaction,
             position,
             anchor(101, 0x56),
+            policy_asset,
             ContractId::new(OutPoint::new(transaction.txid(), 0)),
             &parent,
             OrderSide::Yes,
@@ -1686,45 +1827,44 @@ mod tests {
                 total_filled_base: 0,
             })
         );
-        assert_eq!(verified.associated_hint, None);
+        assert_eq!(
+            verified.associated_hint,
+            Some(RecoveryHintLocation {
+                position,
+                output_index: 1,
+            })
+        );
 
-        // Identity nominates an output, so byte-identical orders in the same
-        // transaction remain independently addressable.
+        // Copying an otherwise valid order output and hint to another vout is
+        // noncanonical: the second vout requires a different instance ID and
+        // therefore a different covenant/payment script pair.
         let mut duplicated = transaction;
-        duplicated.output.insert(1, duplicated.output[0].clone());
+        duplicated.output.extend_from_within(..2);
         let first = verify_maker_order_creation(
             &duplicated,
             position,
             anchor(101, 0x56),
+            policy_asset,
             ContractId::new(OutPoint::new(duplicated.txid(), 0)),
             &parent,
             OrderSide::Yes,
             params,
         )
-        .expect("first identical order");
-        let second = verify_maker_order_creation(
-            &duplicated,
-            position,
-            anchor(101, 0x56),
-            ContractId::new(OutPoint::new(duplicated.txid(), 1)),
-            &parent,
-            OrderSide::Yes,
-            params,
-        )
-        .expect("second identical order");
-        assert_ne!(first.record.contract_id, second.record.contract_id);
-        assert_eq!(first.record.params, second.record.params);
-        assert!(
+        .expect("first canonical order");
+        assert_eq!(first.record.params, ContractParameters::MakerOrder(params));
+        assert!(matches!(
             verify_maker_order_creation(
                 &duplicated,
                 position,
                 anchor(101, 0x56),
+                policy_asset,
                 ContractId::new(OutPoint::new(duplicated.txid(), 2)),
                 &parent,
                 OrderSide::Yes,
                 params,
-            )
-            .is_err()
-        );
+            ),
+            Err(RegistrationError::InvalidCreation(message))
+                if message.contains("instance ID")
+        ));
     }
 }

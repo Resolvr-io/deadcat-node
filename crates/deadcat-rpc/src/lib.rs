@@ -634,7 +634,7 @@ mod tests {
                             price: 2_500,
                             min_active_base: 10,
                             direction: OrderDirection::SellQuote,
-                            maker_receive_spk_hash: [0x66; 32],
+                            instance_id: [0x66; 32],
                             maker_pubkey: [0x77; 32],
                         },
                     },
@@ -802,9 +802,15 @@ mod tests {
         };
         let mut payload = vec![0x40, 0x00, 0x01];
         payload.extend_from_slice(&contract_id.txid().to_byte_array());
+        payload.extend_from_slice(&contract_id.vout().to_be_bytes());
         payload.extend_from_slice(&2_500_u32.to_be_bytes());
         payload.extend_from_slice(&10_u32.to_be_bytes());
-        assert_eq!(payload.len(), 43);
+        payload.extend_from_slice(&[
+            0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9,
+            0x7a, 0x5e, 0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a,
+            0xce, 0x80, 0x3a, 0xc0,
+        ]);
+        assert_eq!(payload.len(), 79);
         let envelope = ServerEnvelope {
             schema_version: SCHEMA_VERSION,
             request_id: RequestId(8),

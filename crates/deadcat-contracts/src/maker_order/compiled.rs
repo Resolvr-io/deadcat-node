@@ -1,15 +1,19 @@
 //! Validation-first compilation of the canonical maker-order covenant.
 
 use elements::Script;
-use elements::secp256k1_zkp::{Secp256k1, XOnlyPublicKey};
+use elements::secp256k1_zkp::{Scalar, Secp256k1, XOnlyPublicKey};
 use elements::taproot::{ControlBlock, TaprootBuilder, TaprootBuilderError};
+use sha2::{Digest as _, Sha256};
 use simplex::program::ArgumentsTrait as _;
 use simplex::simplicityhl::CompiledProgram;
 use simplex::simplicityhl::simplicity::{HasCmr as _, leaf_version};
 use thiserror::Error;
 
-use super::{MakerOrderParams, validate_params};
+use super::{
+    MakerOrderParams, ORDER_CANCEL_TWEAK_DOMAIN, ORDER_RECEIVE_TWEAK_DOMAIN, validate_params,
+};
 use crate::artifacts::maker_order::{MakerOrderProgram, derived_maker_order};
+use crate::rt::hash_to_scalar;
 
 /// A validated order covenant and its maker-cancellable Taproot output.
 #[derive(Clone, Debug)]
@@ -17,6 +21,8 @@ pub struct CompiledMakerOrder {
     params: MakerOrderParams,
     arguments: derived_maker_order::MakerOrderArguments,
     cmr: [u8; 32],
+    internal_key: XOnlyPublicKey,
+    maker_receive_spk: Script,
     script_pubkey: Script,
     control_block: ControlBlock,
 }
@@ -24,9 +30,24 @@ pub struct CompiledMakerOrder {
 impl CompiledMakerOrder {
     pub fn new(params: MakerOrderParams) -> Result<Self, CompiledMakerOrderError> {
         validate_params(params).map_err(CompiledMakerOrderError::InvalidEconomics)?;
-        let internal_key = XOnlyPublicKey::from_slice(&params.maker_pubkey)
+        let maker_key = XOnlyPublicKey::from_slice(&params.maker_pubkey)
             .map_err(|_| CompiledMakerOrderError::InvalidMakerPublicKey)?;
-        let arguments = contract_arguments(params);
+        let secp = Secp256k1::verification_only();
+        let internal_key = tweak_key(
+            &secp,
+            maker_key,
+            ORDER_CANCEL_TWEAK_DOMAIN,
+            params.instance_id,
+        )?;
+        let receive_key = tweak_key(
+            &secp,
+            maker_key,
+            ORDER_RECEIVE_TWEAK_DOMAIN,
+            params.instance_id,
+        )?;
+        let maker_receive_spk = p2tr_key_script(receive_key);
+        let maker_receive_spk_hash = Sha256::digest(maker_receive_spk.as_bytes()).into();
+        let arguments = contract_arguments(params, maker_receive_spk_hash);
         let compiled = CompiledProgram::new(
             MakerOrderProgram::SOURCE,
             arguments.build_arguments(),
@@ -39,7 +60,6 @@ impl CompiledMakerOrder {
 
         let version = leaf_version();
         let program_leaf_script = Script::from(cmr.to_vec());
-        let secp = Secp256k1::verification_only();
         let spend_info = TaprootBuilder::new()
             .add_leaf_with_ver(0, program_leaf_script.clone(), version)?
             .finalize(&secp, internal_key)?;
@@ -52,6 +72,8 @@ impl CompiledMakerOrder {
             params,
             arguments,
             cmr,
+            internal_key,
+            maker_receive_spk,
             script_pubkey,
             control_block,
         })
@@ -68,6 +90,16 @@ impl CompiledMakerOrder {
     }
 
     #[must_use]
+    pub const fn internal_key(&self) -> XOnlyPublicKey {
+        self.internal_key
+    }
+
+    #[must_use]
+    pub fn maker_receive_spk(&self) -> &Script {
+        &self.maker_receive_spk
+    }
+
+    #[must_use]
     pub fn script_pubkey(&self) -> &Script {
         &self.script_pubkey
     }
@@ -80,9 +112,7 @@ impl CompiledMakerOrder {
     /// Recreate the validated generated program for witness satisfaction.
     #[must_use]
     pub fn program(&self) -> MakerOrderProgram {
-        let internal_key = XOnlyPublicKey::from_slice(&self.params.maker_pubkey)
-            .expect("maker key was validated during construction");
-        MakerOrderProgram::new(self.arguments.clone()).with_taproot_pubkey(internal_key)
+        MakerOrderProgram::new(self.arguments.clone()).with_taproot_pubkey(self.internal_key)
     }
 }
 
@@ -92,6 +122,10 @@ pub enum CompiledMakerOrderError {
     InvalidEconomics(super::MakerOrderError),
     #[error("maker public key is not a valid x-only secp256k1 key")]
     InvalidMakerPublicKey,
+    #[error("derived maker-order tweak is not a valid scalar")]
+    InvalidTweakScalar,
+    #[error("derived maker-order key is the point at infinity")]
+    TweakedKeyAtInfinity,
     #[error("failed to compile maker-order SimplicityHL: {0}")]
     Compilation(String),
     #[error("failed to build maker-order Taproot tree: {0}")]
@@ -100,15 +134,38 @@ pub enum CompiledMakerOrderError {
     MissingControlBlock,
 }
 
-fn contract_arguments(params: MakerOrderParams) -> derived_maker_order::MakerOrderArguments {
+fn contract_arguments(
+    params: MakerOrderParams,
+    maker_receive_spk_hash: [u8; 32],
+) -> derived_maker_order::MakerOrderArguments {
     derived_maker_order::MakerOrderArguments {
         base_asset_id: params.base_asset_id.into_inner().to_byte_array(),
         quote_asset_id: params.quote_asset_id.into_inner().to_byte_array(),
         price: params.price,
         min_active_base: params.min_active_base,
-        maker_receive_spk_hash: params.maker_receive_spk_hash,
+        maker_receive_spk_hash,
         direction_sell_quote: params.direction == deadcat_types::OrderDirection::SellQuote,
     }
+}
+
+fn tweak_key(
+    secp: &Secp256k1<elements::secp256k1_zkp::VerifyOnly>,
+    key: XOnlyPublicKey,
+    domain: &str,
+    instance_id: [u8; 32],
+) -> Result<XOnlyPublicKey, CompiledMakerOrderError> {
+    let tweak = Scalar::from_be_bytes(hash_to_scalar(domain, &instance_id))
+        .map_err(|_| CompiledMakerOrderError::InvalidTweakScalar)?;
+    key.add_tweak(secp, &tweak)
+        .map(|(key, _)| key)
+        .map_err(|_| CompiledMakerOrderError::TweakedKeyAtInfinity)
+}
+
+fn p2tr_key_script(key: XOnlyPublicKey) -> Script {
+    let mut bytes = Vec::with_capacity(34);
+    bytes.extend_from_slice(&[0x51, 0x20]);
+    bytes.extend_from_slice(&key.serialize());
+    Script::from(bytes)
 }
 
 #[cfg(test)]
@@ -136,7 +193,7 @@ mod tests {
             price: 12_345,
             min_active_base: 67,
             direction: deadcat_types::OrderDirection::SellQuote,
-            maker_receive_spk_hash: [0x33; 32],
+            instance_id: [0x33; 32],
             maker_pubkey: VALID_XONLY,
         }
     }
@@ -173,9 +230,9 @@ mod tests {
         assert_eq!(
             first.cmr(),
             [
-                0x28, 0xcc, 0xd9, 0x19, 0xe6, 0xc6, 0xa3, 0x6f, 0x08, 0x5e, 0x56, 0xca, 0xb0, 0xfb,
-                0x76, 0x31, 0x37, 0x0b, 0x41, 0xcd, 0x67, 0x81, 0x98, 0xba, 0x86, 0x31, 0x35, 0x83,
-                0xaf, 0x45, 0x44, 0x68,
+                0xd1, 0xde, 0x83, 0x2f, 0x42, 0x54, 0x7f, 0xd6, 0xb2, 0xe9, 0xd3, 0xdb, 0x51, 0x7f,
+                0x9e, 0x3f, 0x8f, 0x8f, 0x87, 0xe0, 0xf4, 0xf3, 0xac, 0x3e, 0x4e, 0x7c, 0x99, 0xe1,
+                0x17, 0xf9, 0xcb, 0x63,
             ]
         );
         assert_eq!(
@@ -187,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn direction_changes_cmr_and_maker_key_changes_output_key() {
+    fn economics_instance_and_maker_key_change_commitments() {
         let params = params();
         let original = CompiledMakerOrder::new(params).expect("compile");
         let mut changed_direction = params;
@@ -199,11 +256,25 @@ mod tests {
                 .cmr()
         );
 
+        let mut changed_instance = params;
+        changed_instance.instance_id = [0x44; 32];
+        let changed_instance = CompiledMakerOrder::new(changed_instance).expect("compile");
+        assert_ne!(original.cmr(), changed_instance.cmr());
+        assert_ne!(original.script_pubkey(), changed_instance.script_pubkey());
+        assert_ne!(
+            original.maker_receive_spk(),
+            changed_instance.maker_receive_spk()
+        );
+
         let mut changed_maker = params;
         changed_maker.maker_pubkey = [2; 32];
         let changed_maker = CompiledMakerOrder::new(changed_maker).expect("compile");
-        assert_eq!(original.cmr(), changed_maker.cmr());
+        assert_ne!(original.cmr(), changed_maker.cmr());
         assert_ne!(original.script_pubkey(), changed_maker.script_pubkey());
+        assert_ne!(
+            original.maker_receive_spk(),
+            changed_maker.maker_receive_spk()
+        );
     }
 
     #[test]
