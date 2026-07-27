@@ -23,6 +23,7 @@ use thiserror::Error;
 use crate::discovery::scan_transaction_hints;
 use crate::registration::{
     verify_binary_market_creation_shared, verify_maker_order_creation_shared,
+    verify_maker_order_hint_creation_shared,
 };
 use crate::store::{
     ContractParameters, ContractRecord, ContractState, OutpointOwner, StateUpdate, StoreError,
@@ -103,8 +104,12 @@ impl ChainInterpreter for DeadcatInterpreter {
                 .recovery_hints
                 .iter()
                 .any(|hint| hint.family == RecoveryFamily::BinaryMarketV1);
-            let shared_transaction =
-                (!retained.is_empty() || has_market_hint).then(|| Arc::new(transaction.clone()));
+            let has_order_hint = result
+                .recovery_hints
+                .iter()
+                .any(|hint| hint.family == RecoveryFamily::MakerOrderV1);
+            let shared_transaction = (!retained.is_empty() || has_market_hint || has_order_hint)
+                .then(|| Arc::new(transaction.clone()));
 
             // Explicit declarations are durable watch intent, not authority.
             // Recompile every retained market against this exact canonical
@@ -175,10 +180,9 @@ impl ChainInterpreter for DeadcatInterpreter {
                 }
             }
 
-            // A maker hint is deliberately insufficient for public discovery.
-            // Retained declarations provide the missing semantics, but remain
-            // dormant if their parent or exact canonical output no longer
-            // validates on this branch.
+            // Retained declarations remain useful for durable watch intent,
+            // but canonical maker hints now contain enough public information
+            // to derive and validate an order independently.
             for declaration in retained.iter().filter(|declaration| {
                 matches!(
                     declaration.descriptor,
@@ -215,6 +219,7 @@ impl ChainInterpreter for DeadcatInterpreter {
                     ),
                     context.position,
                     context.anchor,
+                    self.policy_asset,
                     declaration.contract_id,
                     parent,
                     side,
@@ -228,6 +233,68 @@ impl ChainInterpreter for DeadcatInterpreter {
                         &mut result.created_contracts,
                         verified.record,
                     )?;
+                }
+            }
+
+            for hint_index in result
+                .recovery_hints
+                .iter()
+                .filter(|hint| hint.family == RecoveryFamily::MakerOrderV1)
+                .map(|hint| hint.output_index)
+                .collect::<Vec<_>>()
+            {
+                let Some(hint) = result
+                    .recovery_hints
+                    .iter()
+                    .find(|hint| hint.output_index == hint_index)
+                    .and_then(|hint| {
+                        deadcat_contracts::recovery::OrderRecoveryHint::decode(&hint.payload).ok()
+                    })
+                else {
+                    continue;
+                };
+                let parent_market = hint.parent_market.resolve(transaction.txid());
+                let same_transaction_parent = result
+                    .created_contracts
+                    .iter()
+                    .find(|record| record.contract_id == parent_market);
+                let stored_parent;
+                let parent = if let Some(parent) = same_transaction_parent {
+                    parent
+                } else {
+                    let Some(parent) = contract_in_context(context, parent_market)? else {
+                        continue;
+                    };
+                    stored_parent = parent;
+                    &stored_parent
+                };
+                if let Ok(mut verified) = verify_maker_order_hint_creation_shared(
+                    Arc::clone(
+                        shared_transaction
+                            .as_ref()
+                            .expect("maker hints allocate shared transaction evidence"),
+                    ),
+                    context.position,
+                    context.anchor,
+                    self.policy_asset,
+                    hint_index,
+                    parent,
+                ) {
+                    verified.record.sync_state = ContractSyncState::Ready {
+                        synced_through: context.anchor,
+                    };
+                    let contract_id = verified.record.contract_id;
+                    retain_canonical_creation(
+                        context,
+                        &mut result.created_contracts,
+                        verified.record,
+                    )?;
+                    let associated = result
+                        .recovery_hints
+                        .iter_mut()
+                        .find(|candidate| candidate.output_index == hint_index)
+                        .ok_or(NodeInterpretError::MissingAssociatedHint)?;
+                    associated.associated_contract = Some(contract_id);
                 }
             }
         }

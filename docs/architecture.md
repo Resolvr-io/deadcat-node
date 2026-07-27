@@ -114,13 +114,13 @@ ContractPackage     chain-bound roots plus declarations/dependencies
 
 `ContractId` is a nominal newtype around `elements::OutPoint`, not a semantic
 hash. A market uses its initial dormant YES RT output as its anchor; a maker
-order uses its initial order output. The nominated output index distinguishes
-multiple or identical contracts created in one transaction. A CMR identifies a
-Simplicity program commitment, not an instance: it omits off-leaf Taproot data
-such as the maker cancellation key and cannot distinguish identical outputs.
-Conversely, an anchor alone says nothing about the alleged contract semantics.
-The declaration supplies those semantics, and canonical chain verification
-proves whether the claim is true.
+order uses its initial order output. Canonical maker creation derives a stable
+instance ID from the creation input-prevout set and that output index, so
+multiple orders in one transaction compile to distinct covenant and receive
+scripts. A CMR identifies a Simplicity program commitment, not a stable live
+outpoint. Conversely, an anchor alone says nothing about the alleged contract
+semantics. The declaration supplies those semantics, and canonical chain
+verification proves whether the claim is true.
 
 Ordinary UTXO references use `elements::OutPoint` throughout the internal chain
 and transaction APIs. `ContractId` exists only to prevent confusing an
@@ -228,12 +228,12 @@ in [ADR 0001](adr/0001-authority-and-shared-node.md). Contract-semantic replay
 does not by itself prove that one remote source supplied the current canonical
 Liquid chain.
 
-Market recovery hints are publicly reconstructible. Order recovery hints are
-mnemonic recovery aids for the maker; a public node needs the full announced or
-manually registered order parameters before it can compile and verify an order.
-The node nevertheless indexes raw, length-valid order hints so a client can
-download candidates and test ownership locally without revealing its mnemonic
-or derived keys.
+Market and canonical order recovery hints are publicly reconstructible. An
+order hint supplies its parent reference, economics, side/direction, and maker
+base key; adjacency plus the creation inputs supplies its instance ID. A node
+therefore compiles and globally discovers an order from chain data alone. The
+masked derivation index remains mnemonic-private, so a client can test ownership
+locally without revealing its mnemonic or derived keys.
 
 ## Transport and operations
 
@@ -280,3 +280,9 @@ Post-resolution order risk is especially important: an independent order
 remains covenant-fillable after its market terminates. Every trade snapshot
 therefore includes the parent market even when the transaction will not spend
 it. This is a client safety preflight, not a consensus guarantee.
+
+Canonical creation is the output-aliasing security boundary. Official builders
+and nodes require the input-set-plus-vout instance derivation and adjacent
+public hint. The covenant primitive accepts an arbitrary instance ID, so a
+custom creator can intentionally make colliding, byte-identical scripts; such
+orders are unsupported foreign contracts and must not enter official routing.

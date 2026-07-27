@@ -15,7 +15,7 @@ use deadcat_types::{
     BinaryMarketParams, BinaryMarketState, MakerOrderParams, MakerOrderState, OrderDirection,
 };
 use elements::confidential::{Asset, Nonce, Value};
-use elements::hashes::{Hash as _, HashEngine as _, sha256};
+use elements::hashes::Hash as _;
 use elements::pset::PartiallySignedTransaction;
 use elements::secp256k1_zkp::{Generator, Keypair, PedersenCommitment, Secp256k1, Tweak};
 use elements::{LockTime, OutPoint, Script, Sequence, Transaction, TxOut, TxOutWitness};
@@ -31,12 +31,6 @@ fn key(seed: u8) -> [u8; 32] {
         .serialize()
 }
 
-fn script_hash(script: &Script) -> [u8; 32] {
-    let mut engine = sha256::Hash::engine();
-    engine.input(script.as_bytes());
-    sha256::Hash::from_engine(engine).to_byte_array()
-}
-
 fn maker_params(direction: OrderDirection) -> MakerOrderParams {
     MakerOrderParams {
         base_asset_id: asset(0x11),
@@ -44,7 +38,7 @@ fn maker_params(direction: OrderDirection) -> MakerOrderParams {
         price: 7,
         min_active_base: 3,
         direction,
-        maker_receive_spk_hash: script_hash(&script(0x42)),
+        instance_id: [0x42; 32],
         maker_pubkey: key(0x31),
     }
 }
@@ -91,7 +85,7 @@ fn maker_fill_scenario(
     pset.add_output(pset_output(explicit_txout(
         payment_asset,
         payment,
-        script(0x42),
+        compiled.maker_receive_spk().clone(),
     )));
 
     let remainder_index = if partial {
@@ -126,7 +120,11 @@ fn maker_fill_scenario(
         )));
     }
 
-    let witness = derived_maker_order::MakerOrderWitness { remainder_index };
+    let witness = derived_maker_order::MakerOrderWitness {
+        payment_index: 0,
+        is_partial: partial,
+        remainder_index,
+    };
     let net = network(params.quote_asset_id);
     let mut stack = compiled
         .program()

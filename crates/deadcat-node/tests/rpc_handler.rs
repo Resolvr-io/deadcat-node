@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use deadcat_contracts::maker_order::CompiledMakerOrder;
+use deadcat_contracts::maker_order::{CompiledMakerOrder, derive_instance_id};
+use deadcat_contracts::recovery::{OrderRecoveryHint, recovery_txout};
 use deadcat_iroh::{RequestHandler as _, SubscriptionItem};
 use deadcat_node::chain::{ChainSource, ChainSourceError, Outspend, TransactionStatus};
 use deadcat_node::rpc_handler::{NodeRpcHandler, RpcHandlerConfig};
@@ -264,7 +265,7 @@ fn order_record(
         price: spec.price,
         min_active_base: spec.minimum,
         direction: spec.direction,
-        maker_receive_spk_hash: [spec.marker.wrapping_add(1); 32],
+        instance_id: [spec.marker.wrapping_add(1); 32],
         maker_pubkey: [spec.marker.wrapping_add(2); 32],
     };
     let creation_position = ChainPosition {
@@ -1154,27 +1155,40 @@ async fn registration_package_rpc_returns_ordered_idempotent_receipts() {
         panic!("parent market params")
     };
 
+    let creation_input = TxIn::default();
     let params = MakerOrderParams {
         base_asset_id: parent_params.yes_token_asset_id,
         quote_asset_id: parent_params.collateral_asset_id,
         price: 5,
         min_active_base: 3,
         direction: OrderDirection::SellBase,
-        maker_receive_spk_hash: [0x42; 32],
+        instance_id: derive_instance_id(&[creation_input.previous_output], 0).expect("instance"),
         maker_pubkey: VALID_XONLY,
     };
     let compiled = CompiledMakerOrder::new(params).expect("compile maker order");
+    let hint = OrderRecoveryHint {
+        side: OrderSide::Yes,
+        direction: params.direction,
+        masked_order_index: 0x1234,
+        parent_market: parent.contract_id.into(),
+        price: params.price,
+        min_active_base: params.min_active_base,
+        maker_pubkey: params.maker_pubkey,
+    };
     let creation = Transaction {
         version: 2,
         lock_time: LockTime::ZERO,
-        input: vec![TxIn::default()],
-        output: vec![TxOut {
-            asset: Asset::Explicit(params.base_asset_id),
-            value: Value::Explicit(10),
-            nonce: Nonce::Null,
-            script_pubkey: compiled.script_pubkey().clone(),
-            witness: TxOutWitness::default(),
-        }],
+        input: vec![creation_input],
+        output: vec![
+            TxOut {
+                asset: Asset::Explicit(params.base_asset_id),
+                value: Value::Explicit(10),
+                nonce: Nonce::Null,
+                script_pubkey: compiled.script_pubkey().clone(),
+                witness: TxOutWitness::default(),
+            },
+            recovery_txout(asset(0x20), &hint.encode()).expect("order hint"),
+        ],
     };
     store
         .apply_block(&BlockDelta {

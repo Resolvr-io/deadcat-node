@@ -1,6 +1,7 @@
 # Maker-order v1 live acceptance packet
 
-Status: Complete for the local Elements protocol gate.
+Status: Complete for the canonical instance/public-discovery local Elements
+protocol gate.
 
 This packet records the production-shaped boundary for the v1 maker-order
 covenant. It complements the pure Rust, generated Simplicity, interpreter,
@@ -40,22 +41,20 @@ The following balance-preserving invalid transactions are rejected by
 
 ## Recovery and ingestion
 
-The live creation transaction contains all four canonical 43-byte mnemonic
-recovery hints. Recovery verifies the policy-asset zero-value envelope, unmasks
-the candidate `u16` index locally, rederives the order, recompiles the exact
-script, locates the unique explicit held-asset output, infers base capacity from
-its chain value (including exact SellQuote divisibility), and rebuilds the
-complete creation output. A foreign mnemonic still produces a candidate index
-but matches no compiled output.
+The redesigned creation transaction contains one canonical 79-byte public hint
+immediately after each order. A node derives the instance ID from the creation
+input set and adjacent order vout, resolves the parent reference, and
+independently compiles and discovers the order. Owner recovery additionally
+unmasks the candidate `u16` index locally and verifies the derived base key. A
+foreign mnemonic still produces a candidate index but matches neither the
+public maker key nor compiled output.
 
 The same confirmed chain is processed through the production
 `ElementsRpcChainSource`, `DeadcatInterpreter`, `SyncCoordinator`, and redb
-`Store`. The parent market is discovered from its public market hint. A
-market-plus-four-orders `ContractPackage` is then verified against live chain
-evidence; the parent registration is idempotent and all maker declarations are
-late-registered and historically backfilled. Maker hints deliberately retain
-`associated_contract = None`: ownership association remains a client-local
-mnemonic and exact-script test.
+`Store`. The parent market is discovered from its public market hint, and maker
+hints are associated with verified order records without a package.
+`ContractPackage` registration remains an idempotent fast-start/watch-intent
+path.
 
 RPC contract views, complete histories, and raw transaction evidence are
 replayed independently by `deadcat-client` against full transactions fetched

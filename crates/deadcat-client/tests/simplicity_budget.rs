@@ -24,7 +24,6 @@ use elements::pset::{Input as PsetInput, Output as PsetOutput, PartiallySignedTr
 use elements::secp256k1_zkp::{Keypair, Message, Secp256k1, Tweak};
 use elements::{AssetId, LockTime, OutPoint, Script, Sequence, TxOut, TxOutWitness, Txid};
 use serde::Serialize;
-use sha2::{Digest as _, Sha256};
 use simplex::program::{ProgramTrait as _, WitnessTrait as _};
 use simplex::simplicityhl::simplicity::jet::Elements;
 use simplex::simplicityhl::simplicity::{BitIter, RedeemNode};
@@ -1814,24 +1813,14 @@ fn every_terminal_market_slot_rejects_a_false_slot_witness() {
     }
 }
 
-fn maker_receive_script() -> Script {
-    Script::from(
-        vec![0x51, 0x20]
-            .into_iter()
-            .chain([0x44; 32])
-            .collect::<Vec<_>>(),
-    )
-}
-
 fn maker_params(direction: OrderDirection) -> MakerOrderParams {
-    let receive = maker_receive_script();
     MakerOrderParams {
         base_asset_id: asset(0x91),
         quote_asset_id: asset(0x92),
         price: 7,
         min_active_base: 3,
         direction,
-        maker_receive_spk_hash: Sha256::digest(receive.as_bytes()).into(),
+        instance_id: [0x44; 32],
         maker_pubkey: Keypair::from_seckey_slice(&Secp256k1::new(), &[0x41; 32])
             .expect("maker key")
             .x_only_public_key()
@@ -1848,7 +1837,8 @@ fn finalized_maker_stack(direction: OrderDirection, partial: bool) -> Vec<Vec<u8
     };
     let fill_base = if partial { 4 } else { 10 };
     let remainder_index = partial.then_some(1);
-    let plan = MakerFillPlan::new(params, maker_receive_script(), input_locked, fill_base, 0)
+    let live_outpoint = OutPoint::new(Txid::from_byte_array([0xa1; 32]), 0);
+    let plan = MakerFillPlan::new(live_outpoint, params, input_locked, fill_base, 0)
         .expect("maker fill plan");
     let compiled = CompiledMakerOrder::new(params).expect("compile maker order");
     let held_asset = match direction {
@@ -1857,7 +1847,7 @@ fn finalized_maker_stack(direction: OrderDirection, partial: bool) -> Vec<Vec<u8
     };
     let mut pset = PartiallySignedTransaction::new_v2();
     pset.add_input(pset_input(
-        OutPoint::new(Txid::from_byte_array([0xa1; 32]), 0),
+        live_outpoint,
         explicit_txout(held_asset, input_locked, compiled.script_pubkey().clone()),
     ));
     for (_, output) in plan
@@ -1869,7 +1859,7 @@ fn finalized_maker_stack(direction: OrderDirection, partial: bool) -> Vec<Vec<u8
     let network = SimplicityNetwork::ElementsRegtest {
         policy_asset: params.quote_asset_id,
     };
-    plan.finalize(&mut pset, 0, remainder_index, &network)
+    plan.finalize(&mut pset, 0, 0, remainder_index, &network)
         .expect("finalize maker order");
     pset.inputs()[0]
         .final_script_witness

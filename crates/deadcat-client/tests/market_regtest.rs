@@ -28,7 +28,7 @@ use deadcat_contracts::binary_market::{
     BinaryMarketAction, BinaryMarketEconomics, BinaryMarketSlot, BinaryMarketTransition,
     BinaryOutcome, CompiledBinaryMarket, derived_binary_market,
 };
-use deadcat_contracts::maker_order::CompiledMakerOrder;
+use deadcat_contracts::maker_order::{CompiledMakerOrder, derive_instance_id};
 use deadcat_contracts::market_crypto::{
     BinaryOutcome as OracleOutcome, derive_issuance_assets, oracle_message,
 };
@@ -771,20 +771,26 @@ fn create_maker_orders(
     WalletUtxo,
     WalletUtxo,
 ) {
+    let parent_market = ContractId::new(OutPoint::new(market.transaction.txid(), 0)).into();
     let definitions = [
         (0_u16, OrderSide::Yes, OrderDirection::SellBase),
         (1, OrderSide::No, OrderDirection::SellQuote),
         (2, OrderSide::No, OrderDirection::SellBase),
         (3, OrderSide::Yes, OrderDirection::SellBase),
     ];
+    let creation_prevouts = [yes_tokens.outpoint, no_tokens.outpoint, funding.outpoint];
     let owned = definitions
         .into_iter()
-        .map(|(index, side, direction)| {
+        .enumerate()
+        .map(|(position, (index, side, direction))| {
             let terms = maker_terms(market.params, side, direction);
+            let order_vout = u32::try_from(position * 2).expect("order vout");
+            let instance_id =
+                derive_instance_id(&creation_prevouts, order_vout).expect("order identity");
             let owned = keychain
-                .derive_owned_order(index, market.transaction.txid(), side, terms)
+                .derive_owned_order(index, parent_market, side, terms, instance_id)
                 .expect("derive mnemonic-owned maker order");
-            (index, side, owned)
+            (index, side, owned, order_vout)
         })
         .collect::<Vec<_>>();
 
@@ -794,16 +800,18 @@ fn create_maker_orders(
     pset.add_input(pset_input(funding.outpoint, funding.txout.clone()));
 
     let mut positions = Vec::with_capacity(owned.len());
-    for (index, side, owned) in owned {
+    for (index, side, owned, expected_order_vout) in owned {
+        let order_vout = u32::try_from(pset.outputs().len()).expect("order vout");
+        assert_eq!(order_vout, expected_order_vout);
         let creation = maker_order_creation_outputs(
             market.params.collateral_asset_id,
+            &creation_prevouts,
+            order_vout,
             owned.params,
             MAKER_CAPACITY,
-            &owned.keys.maker_receive_spk,
             owned.recovery_hint,
         )
         .expect("canonical maker-order outputs");
-        let order_vout = u32::try_from(pset.outputs().len()).expect("order vout");
         pset.add_output(PsetOutput::from_txout(creation.order));
         let hint_vout = u32::try_from(pset.outputs().len()).expect("hint vout");
         pset.add_output(PsetOutput::from_txout(creation.recovery_hint));
@@ -838,9 +846,10 @@ fn create_maker_orders(
         let capacity = MAKER_CAPACITY;
         let expected = maker_order_creation_outputs(
             market.params.collateral_asset_id,
+            &creation_prevouts,
+            *order_vout,
             owned.params,
             capacity,
-            &owned.keys.maker_receive_spk,
             owned.recovery_hint,
         )
         .expect("rebuild canonical maker outputs");
@@ -902,16 +911,16 @@ fn build_composed_issuance_and_maker_fills(
     )
     .expect("composed market issuance plan");
     let sell_base_plan = MakerFillPlan::new(
+        sell_base.output.outpoint,
         sell_base.owned.params,
-        sell_base.owned.keys.maker_receive_spk.clone(),
         explicit_value(&sell_base.output.txout),
         COMPOSED_SELL_BASE_FILL,
         0,
     )
     .expect("composed SellBase fill plan");
     let sell_quote_plan = MakerFillPlan::new(
+        sell_quote.output.outpoint,
         sell_quote.owned.params,
-        sell_quote.owned.keys.maker_receive_spk.clone(),
         explicit_value(&sell_quote.output.txout),
         MAKER_CAPACITY,
         0,
@@ -945,9 +954,10 @@ fn build_composed_issuance_and_maker_fills(
     ));
     pset.add_input(pset_input(funding.outpoint, funding.txout.clone()));
 
-    // The market owns output indices 0..=2. Maker payments are anchored to
-    // their order-input indices (3 and 4), while the partial SellBase
-    // continuation occupies index 5. Install the union in absolute order so
+    // The market owns output indices 0..=2. This composition chooses maker
+    // payment indices 3 and 4 and continuation index 5, but the maker covenant
+    // does not couple any of those positions to its input index. Install the
+    // union in absolute order so
     // no individual plan gets to assume ownership of the whole transaction.
     let mut mandatory = market_plan
         .mandatory_outputs(0)
@@ -1028,10 +1038,10 @@ fn build_composed_issuance_and_maker_fills(
         .finalize(&mut pset, 0, 0, network)
         .expect("finalize composed market covenants");
     sell_base_plan
-        .finalize(&mut pset, 3, Some(5), network)
+        .finalize(&mut pset, 3, 3, Some(5), network)
         .expect("finalize composed SellBase covenant");
     sell_quote_plan
-        .finalize(&mut pset, 4, None, network)
+        .finalize(&mut pset, 4, 4, None, network)
         .expect("finalize composed SellQuote covenant");
 
     (
@@ -1049,7 +1059,6 @@ fn build_sell_base_fill(
     signer: &Signer,
     network: &SimplicityNetwork,
     params: MakerOrderParams,
-    maker_receive_spk: &Script,
     order: &WalletUtxo,
     funding: &Funding,
     fill_base: u64,
@@ -1057,8 +1066,8 @@ fn build_sell_base_fill(
 ) -> (PartiallySignedTransaction, MakerFillPlan) {
     let input_locked = explicit_value(&order.txout);
     let plan = MakerFillPlan::new(
+        order.outpoint,
         params,
-        maker_receive_spk.clone(),
         input_locked,
         fill_base,
         prior_total_filled_base,
@@ -1088,7 +1097,7 @@ fn build_sell_base_fill(
         FEE,
         params.quote_asset_id,
     )));
-    plan.finalize(&mut pset, 0, remainder_index, network)
+    plan.finalize(&mut pset, 0, 0, remainder_index, network)
         .expect("finalize SellBase covenant");
     (pset, plan)
 }
@@ -1098,7 +1107,6 @@ fn build_sell_quote_fill(
     signer: &Signer,
     network: &SimplicityNetwork,
     params: MakerOrderParams,
-    maker_receive_spk: &Script,
     order: &WalletUtxo,
     taker_base: &WalletUtxo,
     funding: &Funding,
@@ -1109,8 +1117,8 @@ fn build_sell_quote_fill(
     let taker_base_value = explicit_value(&taker_base.txout);
     assert!(taker_base_value >= fill_base);
     let plan = MakerFillPlan::new(
+        order.outpoint,
         params,
-        maker_receive_spk.clone(),
         input_locked,
         fill_base,
         prior_total_filled_base,
@@ -1148,7 +1156,7 @@ fn build_sell_quote_fill(
         FEE,
         params.quote_asset_id,
     )));
-    plan.finalize(&mut pset, 0, remainder_index, network)
+    plan.finalize(&mut pset, 0, 0, remainder_index, network)
         .expect("finalize SellQuote covenant");
     (pset, plan)
 }
@@ -1198,7 +1206,7 @@ fn sign_maker_cancellation(
         .expect("mnemonic-derived maker keypair");
     assert_eq!(
         maker_keypair.x_only_public_key().0.serialize(),
-        owned.params.maker_pubkey
+        compiled.internal_key().serialize()
     );
 
     let signing_keypair = if apply_tap_tweak {
@@ -1248,63 +1256,45 @@ fn assert_mnemonic_order_recovery(
     .expect("canonical order recovery envelope");
     let hint = OrderRecoveryHint::decode(payload).expect("decode order recovery hint");
     assert_eq!(hint, order.owned.recovery_hint);
-    assert_eq!(hint.market_creation_txid, market.transaction.txid());
+    assert_eq!(
+        hint.parent_market,
+        ContractId::new(OutPoint::new(market.transaction.txid(), 0)).into()
+    );
     let deadcat_secret = keychain.deadcat_secret_key().expect("Deadcat secret");
     let candidate = recover_order_candidate_index(payload, &deadcat_secret)
         .expect("recover candidate order index");
     assert_eq!(candidate, order.order_index);
     let terms = maker_terms(market.params, hint.side, hint.direction);
+    let creation_prevouts = creation
+        .input
+        .iter()
+        .map(|input| input.previous_output)
+        .collect::<Vec<_>>();
+    let instance_id = derive_instance_id(&creation_prevouts, order.contract_id.vout())
+        .expect("recover canonical order identity");
     let recovered = keychain
-        .derive_owned_order(candidate, hint.market_creation_txid, hint.side, terms)
+        .derive_owned_order(candidate, hint.parent_market, hint.side, terms, instance_id)
         .expect("rederive recovered order");
     let compiled = CompiledMakerOrder::new(recovered.params).expect("compile recovered order");
     let held_asset = match recovered.params.direction {
         OrderDirection::SellBase => recovered.params.base_asset_id,
         OrderDirection::SellQuote => recovered.params.quote_asset_id,
     };
-    let matches = creation
-        .output
-        .iter()
-        .enumerate()
-        .filter_map(|(index, output)| {
-            if output.script_pubkey != *compiled.script_pubkey()
-                || output.asset != Asset::Explicit(held_asset)
-                || output.nonce != Nonce::Null
-                || output.witness != TxOutWitness::default()
-            {
-                return None;
-            }
-            let Value::Explicit(locked) = output.value else {
-                return None;
-            };
-            let capacity = match recovered.params.direction {
-                OrderDirection::SellBase => locked,
-                OrderDirection::SellQuote => {
-                    let price = u64::from(recovered.params.price);
-                    if !locked.is_multiple_of(price) {
-                        return None;
-                    }
-                    locked / price
-                }
-            };
-            if capacity < u64::from(recovered.params.min_active_base) {
-                return None;
-            }
-            let expected = maker_order_creation_outputs(
-                market.params.collateral_asset_id,
-                recovered.params,
-                capacity,
-                &recovered.keys.maker_receive_spk,
-                hint,
-            )
-            .ok()?;
-            (output == &expected.order).then_some((index, capacity, expected))
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(matches.len(), 1);
-    let (matched_vout, recovered_capacity, expected) = &matches[0];
-    assert_eq!(*matched_vout, order.contract_id.vout() as usize);
-    assert_eq!(*recovered_capacity, MAKER_CAPACITY);
+    let order_output = &creation.output[order.contract_id.vout() as usize];
+    assert_eq!(order_output.script_pubkey, *compiled.script_pubkey());
+    assert_eq!(order_output.asset, Asset::Explicit(held_asset));
+    assert_eq!(order_output.nonce, Nonce::Null);
+    assert_eq!(order_output.witness, TxOutWitness::default());
+    let expected = maker_order_creation_outputs(
+        market.params.collateral_asset_id,
+        &creation_prevouts,
+        order.contract_id.vout(),
+        recovered.params,
+        MAKER_CAPACITY,
+        hint,
+    )
+    .expect("rebuild recovered order");
+    assert_eq!(order_output, &expected.order);
     assert_eq!(
         creation.output[order.hint_vout as usize],
         expected.recovery_hint
@@ -1321,9 +1311,10 @@ fn assert_mnemonic_order_recovery(
     let foreign_order = foreign
         .derive_owned_order(
             foreign_candidate,
-            hint.market_creation_txid,
+            hint.parent_market,
             hint.side,
             terms,
+            instance_id,
         )
         .expect("derive foreign candidate");
     let foreign_compiled =
@@ -3239,7 +3230,6 @@ async fn maker_order_lifecycle_is_accepted_by_elementsd() {
         &signer,
         &network,
         sell_base.owned.params,
-        &sell_base.owned.keys.maker_receive_spk,
         &sell_base.output,
         &funding[4],
         3,
@@ -3293,7 +3283,6 @@ async fn maker_order_lifecycle_is_accepted_by_elementsd() {
         &signer,
         &network,
         sell_base.owned.params,
-        &sell_base.owned.keys.maker_receive_spk,
         &wallet_utxo(&sell_base_partial, 1),
         &funding[5],
         7,
@@ -3311,7 +3300,6 @@ async fn maker_order_lifecycle_is_accepted_by_elementsd() {
         &signer,
         &network,
         sell_quote.owned.params,
-        &sell_quote.owned.keys.maker_receive_spk,
         &sell_quote.output,
         &no_change,
         &funding[6],
@@ -3360,7 +3348,6 @@ async fn maker_order_lifecycle_is_accepted_by_elementsd() {
         &signer,
         &network,
         sell_quote.owned.params,
-        &sell_quote.owned.keys.maker_receive_spk,
         &wallet_utxo(&sell_quote_partial, 1),
         &wallet_utxo(&sell_quote_partial, 3),
         &funding[7],
@@ -3476,7 +3463,7 @@ async fn maker_order_lifecycle_is_accepted_by_elementsd() {
         store
             .contract(order.contract_id)
             .expect("order lookup")
-            .is_none()
+            .is_some()
     }));
 
     let package = ContractPackage {
@@ -3525,22 +3512,21 @@ async fn maker_order_lifecycle_is_accepted_by_elementsd() {
     assert_eq!(registration.roots, package.roots);
     assert_eq!(registration.contracts.len(), 5);
     for receipt in &registration.contracts {
-        assert_eq!(
+        assert!(
             receipt.already_registered,
-            receipt.contract_id == market_id,
-            "only the hint-discovered market should predate package registration"
+            "chain-discovered markets and orders should make package registration idempotent"
         );
     }
-    eprintln!("DEADCAT_MAKER_REGTEST_PHASE=late_backfill");
+    eprintln!("DEADCAT_MAKER_REGTEST_PHASE=idempotent_resync");
     let SyncOutcome::Ready(backfill) =
         SyncCoordinator::new(source.as_ref(), store.as_ref(), &interpreter)
             .sync_to_tip()
             .await
-            .expect("maker late-registration backfill")
+            .expect("maker idempotent resync")
     else {
-        panic!("maker backfill unexpectedly required a rescan")
+        panic!("maker idempotent resync unexpectedly required a rescan")
     };
-    assert!(backfill.backfill_blocks_applied > 0);
+    assert_eq!(backfill.backfill_blocks_applied, 0);
     assert_eq!(
         stored_maker_state(&store, orders[0].contract_id),
         MakerOrderState::Consumed
@@ -3606,11 +3592,6 @@ async fn maker_order_lifecycle_is_accepted_by_elementsd() {
         .filter(|hint| hint.creation_txid == order_creation.txid())
         .collect::<Vec<_>>();
     assert_eq!(creation_hints.len(), 4);
-    assert!(
-        creation_hints
-            .iter()
-            .all(|hint| hint.associated_contract.is_none())
-    );
     assert_eq!(
         creation_hints
             .iter()
@@ -3623,6 +3604,7 @@ async fn maker_order_lifecycle_is_accepted_by_elementsd() {
             .iter()
             .find(|record| record.location.output_index == order.hint_vout)
             .expect("RPC recovery record for every created order");
+        assert_eq!(record.associated_contract, Some(order.contract_id));
         let on_chain_payload = validate_recovery_txout(
             &order_creation.output[order.hint_vout as usize],
             policy_asset,
@@ -3652,7 +3634,6 @@ async fn maker_order_lifecycle_is_accepted_by_elementsd() {
         &signer,
         &network,
         post_resolution.owned.params,
-        &post_resolution.owned.keys.maker_receive_spk,
         &post_resolution.output,
         &funding[10],
         MAKER_CAPACITY,
@@ -4034,10 +4015,9 @@ async fn multi_contract_transaction_is_accepted_and_indexed_by_elementsd() {
     assert_eq!(sell_base.owned.params.direction, OrderDirection::SellBase);
     assert_eq!(sell_quote.owned.params.direction, OrderDirection::SellQuote);
 
-    // Scan the public market first, then late-register only the two orders
-    // participating in this transaction. The other two creation outputs prove
-    // that registration scope, rather than script resemblance, controls what
-    // the node indexes.
+    // Chain scanning discovers the public market and all four canonical maker
+    // hints. The package below is therefore an idempotent declaration of the
+    // two orders participating in the composed transaction.
     let source = Arc::new(
         ElementsRpcChainSource::new(ElementsRpcConfig::new(
             client.rpc_url(),
@@ -4076,7 +4056,7 @@ async fn multi_contract_transaction_is_accepted_and_indexed_by_elementsd() {
         store
             .contract(order.contract_id)
             .expect("order lookup")
-            .is_none()
+            .is_some()
     }));
 
     let package = ContractPackage {
@@ -4132,22 +4112,21 @@ async fn multi_contract_transaction_is_accepted_and_indexed_by_elementsd() {
     assert_eq!(registration.roots, package.roots);
     assert_eq!(registration.contracts.len(), 3);
     for receipt in &registration.contracts {
-        assert_eq!(
+        assert!(
             receipt.already_registered,
-            receipt.contract_id == market_id,
-            "only the hint-discovered parent should predate registration"
+            "all canonical declarations should already be chain-discovered"
         );
     }
-    eprintln!("DEADCAT_MULTI_CONTRACT_REGTEST_PHASE=late_backfill");
+    eprintln!("DEADCAT_MULTI_CONTRACT_REGTEST_PHASE=idempotent_resync");
     let SyncOutcome::Ready(backfill) =
         SyncCoordinator::new(source.as_ref(), store.as_ref(), &interpreter)
             .sync_to_tip()
             .await
-            .expect("multi-contract late-registration backfill")
+            .expect("multi-contract idempotent resync")
     else {
-        panic!("multi-contract backfill unexpectedly required a rescan")
+        panic!("multi-contract idempotent resync unexpectedly required a rescan")
     };
-    assert!(backfill.backfill_blocks_applied > 0);
+    assert_eq!(backfill.backfill_blocks_applied, 0);
 
     let pre_order_state = MakerOrderState::Active {
         remaining_base: MAKER_CAPACITY,
@@ -4191,14 +4170,12 @@ async fn multi_contract_transaction_is_accepted_and_indexed_by_elementsd() {
         vec![(0, sell_quote.output.outpoint)],
     );
     let expected_pre_order_book = ready_order_rows(&store, market_id);
-    assert_eq!(expected_pre_order_book.len(), 2);
+    assert_eq!(expected_pre_order_book.len(), orders.len());
     for (contract_id, entry) in &expected_pre_order_book {
-        let order = if *contract_id == sell_base.contract_id {
-            sell_base
-        } else {
-            assert_eq!(*contract_id, sell_quote.contract_id);
-            sell_quote
-        };
+        let order = orders
+            .iter()
+            .find(|order| order.contract_id == *contract_id)
+            .expect("publicly discovered maker order");
         assert_eq!(entry.market_id, market_id);
         assert_eq!(entry.side, order.side);
         assert_eq!(entry.direction, order.owned.params.direction);
@@ -4213,13 +4190,14 @@ async fn multi_contract_transaction_is_accepted_and_indexed_by_elementsd() {
                 .creation_position
         );
     }
-    let mut post_sell_base_book_entry = expected_pre_order_book
-        .iter()
+    let mut expected_post_order_book = expected_pre_order_book.clone();
+    expected_post_order_book
+        .iter_mut()
         .find(|(contract_id, _)| *contract_id == sell_base.contract_id)
         .expect("pre-composition SellBase book row")
-        .1;
-    post_sell_base_book_entry.remaining_base = 7;
-    let expected_post_order_book = vec![(sell_base.contract_id, post_sell_base_book_entry)];
+        .1
+        .remaining_base = 7;
+    expected_post_order_book.retain(|(contract_id, _)| *contract_id != sell_quote.contract_id);
     let pre_market_history = store
         .contract_history(market_id)
         .expect("pre-composition market history");

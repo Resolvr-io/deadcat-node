@@ -249,8 +249,13 @@ pub struct MakerOrderParams {
     pub price: u32,
     pub min_active_base: u32,
     pub direction: OrderDirection,
+    /// Stable order instance commitment. The covenant accepts any value;
+    /// canonical creation derives it from all creation input prevouts and the
+    /// initial order output index.
     #[serde(with = "hex::serde")]
-    pub maker_receive_spk_hash: [u8; 32],
+    pub instance_id: [u8; 32],
+    /// Per-order base key. The canonical covenant derives independent
+    /// cancellation and payment keys from this key and `instance_id`.
     #[serde(with = "hex::serde")]
     pub maker_pubkey: [u8; 32],
 }

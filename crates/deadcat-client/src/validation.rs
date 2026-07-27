@@ -485,11 +485,18 @@ pub fn validate_maker_fill_pset_intent(
     plan: &MakerFillPlan,
     pset: &PartiallySignedTransaction,
     input_index: usize,
+    payment_index: usize,
     remainder_index: Option<usize>,
     network: &SimplicityNetwork,
 ) -> Result<(), ValidationError> {
     let mut staged = pset.clone();
-    plan.finalize(&mut staged, input_index, remainder_index, network)?;
+    plan.finalize(
+        &mut staged,
+        input_index,
+        payment_index,
+        remainder_index,
+        network,
+    )?;
     Ok(())
 }
 
@@ -1356,7 +1363,6 @@ mod tests {
         AssetId, AssetIssuance, LockTime, OutPoint, Script, Sequence, Transaction, TxIn, TxOut,
         Txid,
     };
-    use sha2::{Digest as _, Sha256};
 
     use super::*;
     use crate::market_builder::{
@@ -1451,15 +1457,6 @@ mod tests {
         }
     }
 
-    fn receive_script() -> Script {
-        Script::from(
-            vec![0x51, 0x20]
-                .into_iter()
-                .chain([0x44; 32])
-                .collect::<Vec<_>>(),
-        )
-    }
-
     fn order_view(
         market: &ContractView,
         at: ChainAnchor,
@@ -1479,7 +1476,7 @@ mod tests {
             price,
             min_active_base: 3,
             direction,
-            maker_receive_spk_hash: Sha256::digest(receive_script().as_bytes()).into(),
+            instance_id: [creation_byte; 32],
             maker_pubkey: key(0x41),
         };
         let creation_txid = txid(creation_byte);
@@ -2386,10 +2383,11 @@ mod tests {
         let ContractParametersView::MakerOrder { params } = order.parameters else {
             unreachable!()
         };
-        let plan = MakerFillPlan::new(params, receive_script(), 10, 4, 0).expect("plan");
+        let live_outpoint = OutPoint::new(txid(0x31), 0);
+        let plan = MakerFillPlan::new(live_outpoint, params, 10, 4, 0).expect("plan");
         let compiled = CompiledMakerOrder::new(params).expect("compile");
         let mut pset = PartiallySignedTransaction::new_v2();
-        let mut input = PsetInput::from_prevout(OutPoint::new(txid(0x31), 0));
+        let mut input = PsetInput::from_prevout(live_outpoint);
         input.witness_utxo = Some(explicit_output(
             params.base_asset_id,
             10,
@@ -2403,11 +2401,12 @@ mod tests {
             policy_asset: params.quote_asset_id,
         };
         let original = pset.clone();
-        validate_maker_fill_pset_intent(&plan, &pset, 0, Some(1), &network).expect("maker intent");
+        validate_maker_fill_pset_intent(&plan, &pset, 0, 0, Some(1), &network)
+            .expect("maker intent");
         assert_eq!(pset, original);
         pset.outputs_mut()[0].amount = Some(19);
         assert!(matches!(
-            validate_maker_fill_pset_intent(&plan, &pset, 0, Some(1), &network),
+            validate_maker_fill_pset_intent(&plan, &pset, 0, 0, Some(1), &network),
             Err(ValidationError::MakerIntent(
                 MakerBuilderError::MandatoryOutputMismatch { .. }
             ))
