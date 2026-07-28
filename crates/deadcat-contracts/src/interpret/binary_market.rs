@@ -271,7 +271,7 @@ fn interpret_candidate(
             }
         }
         BinaryMarketPath::ActiveExpiry | BinaryMarketPath::DormantExpiry => {
-            check_expiry_lock(transaction, input_base, params.expiry_height)?;
+            check_expiry_lock(transaction, params.expiry_height)?;
             BinaryMarketAction::Expire
         }
         BinaryMarketPath::ResolvedRedemption => BinaryMarketAction::Redeem {
@@ -981,16 +981,17 @@ fn issuance_amount(
     Ok(amount)
 }
 
-fn check_expiry_lock(
-    transaction: &Transaction,
-    input_index: u32,
-    expiry: u32,
-) -> Result<(), InterpretError> {
-    let input = transaction
+fn check_expiry_lock(transaction: &Transaction, expiry: u32) -> Result<(), InterpretError> {
+    let locktime = transaction.lock_time;
+    // Elements' `check_lock_height` jet activates the transaction-wide
+    // nLockTime when any input is non-final. Do not narrow this to the market
+    // coordinator: a follower or unrelated wallet input may legally activate
+    // the shared lock.
+    let has_nonfinal_input = transaction
         .input
-        .get(input_index as usize)
-        .ok_or(InterpretError::Inconsistent("expiry input index"))?;
-    if transaction.lock_time.to_consensus_u32() < expiry || input.sequence.is_final() {
+        .iter()
+        .any(|input| !input.sequence.is_final());
+    if !locktime.is_block_height() || locktime.to_consensus_u32() < expiry || !has_nonfinal_input {
         return Err(InterpretError::Inconsistent("expiry locktime"));
     }
     Ok(())

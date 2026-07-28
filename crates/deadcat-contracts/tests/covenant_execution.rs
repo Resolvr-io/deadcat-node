@@ -372,6 +372,28 @@ fn binary_params() -> BinaryMarketParams {
 /// `previous_vouts` models the sibling outputs of their shared prior tx.
 fn execute_active_expiry(
     previous_vouts: [u32; 3],
+    sequences: [Sequence; 3],
+    yes_input: RtFactors,
+    no_input: RtFactors,
+    yes_burn: RtFactors,
+    no_burn: RtFactors,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let expiry_height = binary_params().expiry_height;
+    execute_active_expiry_with_locktime(
+        previous_vouts,
+        sequences,
+        LockTime::from_height(expiry_height)?,
+        yes_input,
+        no_input,
+        yes_burn,
+        no_burn,
+    )
+}
+
+fn execute_active_expiry_with_locktime(
+    previous_vouts: [u32; 3],
+    sequences: [Sequence; 3],
+    locktime: LockTime,
     yes_input: RtFactors,
     no_input: RtFactors,
     yes_burn: RtFactors,
@@ -382,7 +404,7 @@ fn execute_active_expiry(
     let collateral = 600;
 
     let mut pset = PartiallySignedTransaction::new_v2();
-    pset.global.tx_data.fallback_locktime = Some(LockTime::from_height(params.expiry_height)?);
+    pset.global.tx_data.fallback_locktime = Some(locktime);
     let input_utxos = [
         confidential_rt_txout(
             params.yes_reissuance_token_id,
@@ -409,9 +431,9 @@ fn execute_active_expiry(
                 .clone(),
         ),
     ];
-    for (vout, utxo) in previous_vouts.into_iter().zip(input_utxos) {
+    for ((vout, utxo), sequence) in previous_vouts.into_iter().zip(input_utxos).zip(sequences) {
         let mut input = pset_input(0xb0, vout, utxo);
-        input.sequence = Some(Sequence(0xffff_fffe));
+        input.sequence = Some(sequence);
         pset.add_input(input);
     }
 
@@ -463,6 +485,7 @@ fn execute_active_expiry(
 fn valid_active_expiry(side: RtSide) -> Result<(), Box<dyn std::error::Error>> {
     execute_active_expiry(
         [10, 11, 12],
+        [Sequence::ENABLE_LOCKTIME_NO_RBF; 3],
         factors(RtLeg::Yes, side),
         factors(RtLeg::No, side),
         factors(RtLeg::Yes, side.flip()),
@@ -586,6 +609,56 @@ fn binary_active_expiry_executes_with_consecutive_siblings() {
 }
 
 #[test]
+fn binary_active_expiry_accepts_nonfinal_follower_with_final_coordinator() {
+    execute_active_expiry(
+        [10, 11, 12],
+        [
+            Sequence::MAX,
+            Sequence::ENABLE_LOCKTIME_NO_RBF,
+            Sequence::MAX,
+        ],
+        factors(RtLeg::Yes, RtSide::A),
+        factors(RtLeg::No, RtSide::A),
+        factors(RtLeg::Yes, RtSide::B),
+        factors(RtLeg::No, RtSide::B),
+    )
+    .expect("a follower may activate the transaction-global expiry locktime");
+}
+
+#[test]
+fn binary_active_expiry_requires_an_active_height_typed_locktime() {
+    let rt_factors = (
+        factors(RtLeg::Yes, RtSide::A),
+        factors(RtLeg::No, RtSide::A),
+        factors(RtLeg::Yes, RtSide::B),
+        factors(RtLeg::No, RtSide::B),
+    );
+    assert!(
+        execute_active_expiry(
+            [10, 11, 12],
+            [Sequence::MAX; 3],
+            rt_factors.0,
+            rt_factors.1,
+            rt_factors.2,
+            rt_factors.3,
+        )
+        .is_err()
+    );
+    assert!(
+        execute_active_expiry_with_locktime(
+            [10, 11, 12],
+            [Sequence::ENABLE_LOCKTIME_NO_RBF; 3],
+            LockTime::from_time(500_000_000).expect("timestamp"),
+            rt_factors.0,
+            rt_factors.1,
+            rt_factors.2,
+            rt_factors.3,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn binary_issuance_binds_reissuance_nonce_to_the_input_side() {
     execute_initial_issuance(RtSide::A, RtSide::A, RtSide::A).expect("side-A issuance nonce");
     execute_initial_issuance(RtSide::B, RtSide::B, RtSide::B).expect("side-B issuance nonce");
@@ -599,6 +672,7 @@ fn binary_rejects_same_txid_collateral_decoy_at_nonconsecutive_vout() {
     assert!(
         execute_active_expiry(
             [10, 11, 13],
+            [Sequence::ENABLE_LOCKTIME_NO_RBF; 3],
             factors(RtLeg::Yes, RtSide::A),
             factors(RtLeg::No, RtSide::A),
             factors(RtLeg::Yes, RtSide::B),
@@ -618,6 +692,7 @@ fn binary_rejects_same_side_wrong_role_and_mixed_side_rt_shapes() {
     assert!(
         execute_active_expiry(
             [10, 11, 12],
+            [Sequence::ENABLE_LOCKTIME_NO_RBF; 3],
             valid_yes_in,
             valid_no_in,
             // The generator and value remain on the input side.
@@ -629,6 +704,7 @@ fn binary_rejects_same_side_wrong_role_and_mixed_side_rt_shapes() {
     assert!(
         execute_active_expiry(
             [10, 11, 12],
+            [Sequence::ENABLE_LOCKTIME_NO_RBF; 3],
             valid_yes_in,
             valid_no_in,
             // ABFs are global, so this specifically substitutes NO's CBF/value.
@@ -640,6 +716,7 @@ fn binary_rejects_same_side_wrong_role_and_mixed_side_rt_shapes() {
     assert!(
         execute_active_expiry(
             [10, 11, 12],
+            [Sequence::ENABLE_LOCKTIME_NO_RBF; 3],
             valid_yes_in,
             // Canonical markets can never have A/B or B/A live legs.
             factors(RtLeg::No, RtSide::B),
@@ -651,6 +728,7 @@ fn binary_rejects_same_side_wrong_role_and_mixed_side_rt_shapes() {
     assert!(
         execute_active_expiry(
             [10, 11, 12],
+            [Sequence::ENABLE_LOCKTIME_NO_RBF; 3],
             // The YES asset generator with NO's CBF is not a recognized YES side.
             factors(RtLeg::No, RtSide::A),
             valid_no_in,

@@ -475,7 +475,7 @@ fn confidential_rt_txout(
     }
 }
 
-fn finalized_active_expiry(side: RtSide) -> BinaryScenario {
+fn finalized_active_expiry(side: RtSide, sequences: [Sequence; 3]) -> BinaryScenario {
     let params = binary_params();
     let compiled = CompiledBinaryMarket::new(params).expect("compile market");
     let before = BinaryMarketState::Trading {
@@ -516,14 +516,17 @@ fn finalized_active_expiry(side: RtSide) -> BinaryScenario {
     let mut pset = PartiallySignedTransaction::new_v2();
     pset.global.tx_data.fallback_locktime =
         Some(LockTime::from_height(params.expiry_height).expect("height"));
-    for (outpoint, txout) in [
+    for ((outpoint, txout), sequence) in [
         (yes_outpoint, yes_txout.clone()),
         (no_outpoint, no_txout.clone()),
         (collateral_outpoint, collateral_txout.clone()),
-    ] {
+    ]
+    .into_iter()
+    .zip(sequences)
+    {
         let mut input = pset_input(0xd1, outpoint.vout, txout);
         input.previous_txid = common_txid;
-        input.sequence = Some(Sequence(0xffff_fffe));
+        input.sequence = Some(sequence);
         pset.add_input(input);
     }
     // Same-script decoy at vout 0; the decoded OUTPUT_BASE is 2.
@@ -600,7 +603,7 @@ fn finalized_active_expiry(side: RtSide) -> BinaryScenario {
 #[test]
 fn interprets_active_expiry_and_rejects_nonconsecutive_sibling_decoy() {
     for side in [RtSide::A, RtSide::B] {
-        let scenario = finalized_active_expiry(side);
+        let scenario = finalized_active_expiry(side, [Sequence::ENABLE_LOCKTIME_NO_RBF; 3]);
         let interpreted = interpret_binary_market_spend(
             scenario.params,
             scenario.before,
@@ -619,7 +622,7 @@ fn interprets_active_expiry_and_rejects_nonconsecutive_sibling_decoy() {
         assert_eq!(interpreted.continuations[0].output.outpoint.vout, 4);
     }
 
-    let scenario = finalized_active_expiry(RtSide::A);
+    let scenario = finalized_active_expiry(RtSide::A, [Sequence::ENABLE_LOCKTIME_NO_RBF; 3]);
 
     let mut decoy = scenario.transaction.clone();
     decoy.input[2].previous_output.vout = 13;
@@ -640,6 +643,64 @@ fn interprets_active_expiry_and_rejects_nonconsecutive_sibling_decoy() {
             scenario.before,
             &scenario.live,
             &wrong_burn,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn interprets_active_expiry_when_follower_activates_locktime() {
+    let scenario = finalized_active_expiry(
+        RtSide::A,
+        [
+            Sequence::MAX,
+            Sequence::ENABLE_LOCKTIME_NO_RBF,
+            Sequence::MAX,
+        ],
+    );
+
+    let interpreted = interpret_binary_market_spend(
+        scenario.params,
+        scenario.before,
+        &scenario.live,
+        &scenario.transaction,
+    )
+    .expect("a follower may activate the transaction-global expiry locktime");
+
+    assert_eq!(interpreted.path, BinaryMarketPath::ActiveExpiry);
+    assert_eq!(
+        interpreted.after,
+        BinaryMarketState::Expired {
+            collateral_unredeemed: 600,
+        }
+    );
+}
+
+#[test]
+fn rejects_inactive_or_time_typed_active_expiry_locktime() {
+    let mut all_final = finalized_active_expiry(RtSide::A, [Sequence::ENABLE_LOCKTIME_NO_RBF; 3]);
+    for input in &mut all_final.transaction.input {
+        input.sequence = Sequence::MAX;
+    }
+    assert!(
+        interpret_binary_market_spend(
+            all_final.params,
+            all_final.before,
+            &all_final.live,
+            &all_final.transaction,
+        )
+        .is_err()
+    );
+
+    let mut time_typed = finalized_active_expiry(RtSide::A, [Sequence::ENABLE_LOCKTIME_NO_RBF; 3]);
+    time_typed.transaction.lock_time = LockTime::from_time(500_000_000).expect("timestamp");
+
+    assert!(
+        interpret_binary_market_spend(
+            time_typed.params,
+            time_typed.before,
+            &time_typed.live,
+            &time_typed.transaction,
         )
         .is_err()
     );
