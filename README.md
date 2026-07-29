@@ -195,6 +195,7 @@ Start with:
 - [V1 protocol](docs/protocol-v1.md)
 - [Storage, synchronization, and RPC](docs/storage-sync-rpc.md)
 - [Implementation plan](docs/implementation-plan.md)
+- [Proposed liquidity roadmap](docs/liquidity-roadmap.md)
 - [Architecture decisions](docs/adr/README.md)
 - [Binary-market A/B acceptance packet](docs/acceptance/binary-market-ab-v1.md)
 - [Maker-order live acceptance packet](docs/acceptance/maker-orders-v1.md)
