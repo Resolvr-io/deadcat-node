@@ -1,9 +1,8 @@
 //! Recovery-hint scanning. Hints identify candidates; compilation confirms them.
 
 use deadcat_contracts::recovery::{
-    MARKET_V1_TAG, MarketCollateral, MarketRecoveryHint, ORDER_NO_SELL_BASE_V1_TAG,
-    ORDER_NO_SELL_QUOTE_V1_TAG, ORDER_YES_SELL_BASE_V1_TAG, ORDER_YES_SELL_QUOTE_V1_TAG,
-    OrderRecoveryHint, parse_recovery_script, validate_recovery_txout,
+    MARKET_V1_TAG, MarketCollateral, MarketRecoveryHint, parse_recovery_script,
+    validate_recovery_txout,
 };
 use deadcat_rpc::RecoveryFamily;
 use deadcat_types::{ChainPosition, LiquidNetwork, RecoveryHintLocation};
@@ -64,9 +63,6 @@ pub fn scan_transaction_hints(
                     }
                     Ok(())
                 }
-                RecoveryFamily::MakerOrderV1 => OrderRecoveryHint::decode(payload)
-                    .map(|_| ())
-                    .map_err(|error| error.to_string()),
             });
 
         match validation {
@@ -92,10 +88,6 @@ pub fn scan_transaction_hints(
 fn recognized_family(tag: Option<u8>) -> Option<RecoveryFamily> {
     match tag? {
         MARKET_V1_TAG => Some(RecoveryFamily::BinaryMarketV1),
-        ORDER_YES_SELL_BASE_V1_TAG
-        | ORDER_YES_SELL_QUOTE_V1_TAG
-        | ORDER_NO_SELL_BASE_V1_TAG
-        | ORDER_NO_SELL_QUOTE_V1_TAG => Some(RecoveryFamily::MakerOrderV1),
         _ => None,
     }
 }

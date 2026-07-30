@@ -6,29 +6,26 @@ use std::str::FromStr as _;
 use std::sync::Arc;
 
 use deadcat_contracts::binary_market::{BinaryMarketSlot, CompiledBinaryMarket};
-use deadcat_contracts::maker_order::{
-    CompiledMakerOrder, create, derive_instance_id, validate_against_market,
-};
 use deadcat_contracts::market_crypto::derive_issuance_assets;
 use deadcat_contracts::recovery::{
-    MARKET_V1_TAG, MarketCollateral, MarketRecoveryHint, OrderRecoveryHint, validate_recovery_txout,
+    MARKET_V1_TAG, MarketCollateral, MarketRecoveryHint, validate_recovery_txout,
 };
 use deadcat_contracts::rt::{RtLeg, RtSide, commitments, factors};
 use deadcat_types::{
     BinaryMarketParams, BinaryMarketState, CONTRACT_PACKAGE_FORMAT_VERSION, ChainAnchor,
     ChainPosition, ContractDeclaration, ContractDescriptor, ContractId, ContractKind,
     ContractPackage, ContractSyncState, LiquidNetwork, MAX_CONTRACT_PACKAGE_DECLARATIONS,
-    MAX_CONTRACT_PACKAGE_ROOTS, MakerOrderState, OrderDirection, RecoveryHintLocation,
+    MAX_CONTRACT_PACKAGE_ROOTS, RecoveryHintLocation,
 };
-use elements::confidential::{Asset, Nonce, Value};
+use elements::confidential::{Asset, Value};
 use elements::secp256k1_zkp::ZERO_TWEAK;
-use elements::{AssetId, BlockHash, OutPoint, Transaction, TxOutWitness, Txid};
+use elements::{AssetId, BlockHash, OutPoint, Transaction, Txid};
 use thiserror::Error;
 
 use crate::chain::{ChainSource, ChainSourceError, TransactionStatus};
 use crate::store::{
     AssetBinding, AssetRelationKind, ContractParameters, ContractRecord, ContractState,
-    OrderBookEntry, RegistrationEvidence, ScriptBinding, Store, StoreError, TrackedOutpoint,
+    RegistrationEvidence, ScriptBinding, Store, StoreError, TrackedOutpoint,
 };
 
 const LIQUID_MAINNET_USDT: &str =
@@ -79,8 +76,7 @@ where
     }
 
     /// Verify every declaration from canonical chain evidence. Package order is
-    /// not trusted: dependencies are resolved before their children and each
-    /// creation transaction is fetched at most once.
+    /// not trusted and each creation transaction is fetched at most once.
     pub async fn verify_package(
         &self,
         package: &ContractPackage,
@@ -90,14 +86,7 @@ where
         let mut evidence_bytes = 0_usize;
         let mut verified = BTreeMap::<ContractId, VerifiedRegistration>::new();
 
-        // Markets have no dependencies and are verified first regardless of
-        // declaration order.
-        for declaration in declarations.values().filter(|declaration| {
-            matches!(
-                declaration.descriptor,
-                ContractDescriptor::BinaryMarketV1 { .. }
-            )
-        }) {
+        for declaration in declarations.values() {
             let creation = self
                 .creation_evidence(
                     declaration.contract_id.txid(),
@@ -105,9 +94,7 @@ where
                     &mut evidence_bytes,
                 )
                 .await?;
-            let ContractDescriptor::BinaryMarketV1 { params } = declaration.descriptor else {
-                unreachable!("filtered to market declarations")
-            };
+            let ContractDescriptor::BinaryMarketV1 { params } = declaration.descriptor;
             let registration = verify_binary_market_creation_shared(
                 Arc::clone(&creation.transaction),
                 creation.position,
@@ -120,57 +107,7 @@ where
             verified.insert(declaration.contract_id, registration);
         }
 
-        for declaration in declarations.values().filter(|declaration| {
-            matches!(
-                declaration.descriptor,
-                ContractDescriptor::MakerOrderV1 { .. }
-            )
-        }) {
-            let ContractDescriptor::MakerOrderV1 {
-                parent_market,
-                side,
-                params,
-            } = declaration.descriptor
-            else {
-                unreachable!("filtered to maker-order declarations")
-            };
-            let stored_parent;
-            let parent = if let Some(parent) = verified.get(&parent_market) {
-                &parent.record
-            } else {
-                stored_parent = self
-                    .store
-                    .contract(parent_market)?
-                    .ok_or(RegistrationError::ParentMarketNotFound)?;
-                &stored_parent
-            };
-            let creation = self
-                .creation_evidence(
-                    declaration.contract_id.txid(),
-                    &mut evidence,
-                    &mut evidence_bytes,
-                )
-                .await?;
-            if parent.creation_position > creation.position {
-                return Err(RegistrationError::InvalidPackage(
-                    "maker order precedes its parent market".to_owned(),
-                ));
-            }
-            let registration = verify_maker_order_creation_shared(
-                Arc::clone(&creation.transaction),
-                creation.position,
-                creation.anchor,
-                self.policy_asset,
-                declaration.contract_id,
-                parent,
-                side,
-                params,
-            )?;
-            verified.insert(declaration.contract_id, registration);
-        }
-
-        // Receipts and persistence inputs retain the sender's declaration
-        // order even though verification itself is dependency ordered.
+        // Receipts and persistence inputs retain the sender's declaration order.
         package
             .declarations
             .iter()
@@ -267,11 +204,6 @@ where
 
         let mut declarations = BTreeMap::new();
         for declaration in &package.declarations {
-            if declaration.descriptor.parent() == Some(declaration.contract_id) {
-                return Err(RegistrationError::InvalidPackage(
-                    "contract declaration depends on itself".to_owned(),
-                ));
-            }
             if declarations
                 .insert(declaration.contract_id, *declaration)
                 .is_some()
@@ -294,43 +226,12 @@ where
             ));
         }
 
-        let mut reachable = BTreeSet::new();
-        let mut pending = package.roots.clone();
-        while let Some(contract_id) = pending.pop() {
-            if !reachable.insert(contract_id) {
-                continue;
-            }
-            if let Some(parent) = declarations
-                .get(&contract_id)
-                .and_then(|declaration| declaration.descriptor.parent())
-                && declarations.contains_key(&parent)
-            {
-                pending.push(parent);
-            }
-        }
-        if reachable.len() != declarations.len() {
+        if roots.len() != declarations.len() {
             return Err(RegistrationError::InvalidPackage(
-                "contract package contains declarations unreachable from its roots".to_owned(),
+                "every contract package declaration must be a root".to_owned(),
             ));
         }
 
-        for declaration in declarations.values() {
-            if let ContractDescriptor::MakerOrderV1 { parent_market, .. } = declaration.descriptor {
-                if let Some(parent) = declarations.get(&parent_market) {
-                    if !matches!(parent.descriptor, ContractDescriptor::BinaryMarketV1 { .. }) {
-                        return Err(RegistrationError::ParentIsNotMarket);
-                    }
-                } else {
-                    let parent = self
-                        .store
-                        .contract(parent_market)?
-                        .ok_or(RegistrationError::ParentMarketNotFound)?;
-                    if parent.kind != ContractKind::BinaryMarketV1 {
-                        return Err(RegistrationError::ParentIsNotMarket);
-                    }
-                }
-            }
-        }
         Ok(declarations)
     }
 
@@ -566,8 +467,6 @@ pub(crate) fn verify_binary_market_creation_shared(
         sync_state: ContractSyncState::CatchingUp {
             synced_through: anchor,
         },
-        parent_market: None,
-        outcome_side: None,
         scripts,
         assets: vec![
             AssetBinding {
@@ -606,7 +505,6 @@ pub(crate) fn verify_binary_market_creation_shared(
                 outpoint: OutPoint::new(txid, no_output),
             },
         ],
-        order_book: None,
     };
     Ok(VerifiedRegistration {
         record,
@@ -617,287 +515,6 @@ pub(crate) fn verify_binary_market_creation_shared(
             output_index: matching_hints[0],
         }),
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn verify_maker_order_creation(
-    transaction: &Transaction,
-    position: ChainPosition,
-    anchor: ChainAnchor,
-    policy_asset: AssetId,
-    contract_id: ContractId,
-    parent: &ContractRecord,
-    side: deadcat_types::OrderSide,
-    params: deadcat_types::MakerOrderParams,
-) -> Result<VerifiedRegistration, RegistrationError> {
-    verify_maker_order_creation_shared(
-        Arc::new(transaction.clone()),
-        position,
-        anchor,
-        policy_asset,
-        contract_id,
-        parent,
-        side,
-        params,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn verify_maker_order_creation_shared(
-    creation_transaction: Arc<Transaction>,
-    position: ChainPosition,
-    anchor: ChainAnchor,
-    policy_asset: AssetId,
-    contract_id: ContractId,
-    parent: &ContractRecord,
-    side: deadcat_types::OrderSide,
-    params: deadcat_types::MakerOrderParams,
-) -> Result<VerifiedRegistration, RegistrationError> {
-    let transaction = creation_transaction.as_ref();
-    if contract_id.txid() != transaction.txid() {
-        return Err(RegistrationError::InvalidCreation(
-            "maker ContractId transaction does not match its creation transaction".to_owned(),
-        ));
-    }
-    let creation_prevouts = transaction
-        .input
-        .iter()
-        .map(|input| input.previous_output)
-        .collect::<Vec<_>>();
-    let expected_instance_id = derive_instance_id(&creation_prevouts, contract_id.vout())
-        .map_err(|error| RegistrationError::InvalidCreation(error.to_string()))?;
-    if params.instance_id != expected_instance_id {
-        return Err(RegistrationError::InvalidCreation(
-            "maker instance ID is not canonical for its creation inputs and vout".to_owned(),
-        ));
-    }
-    let ContractParameters::BinaryMarket(parent_params) = &parent.params else {
-        return Err(RegistrationError::ParentIsNotMarket);
-    };
-    let expected_base = match side {
-        deadcat_types::OrderSide::Yes => parent_params.yes_token_asset_id,
-        deadcat_types::OrderSide::No => parent_params.no_token_asset_id,
-    };
-    validate_against_market(
-        params,
-        expected_base,
-        parent_params.collateral_asset_id,
-        parent_params.collateral_per_pair().ok_or_else(|| {
-            RegistrationError::InvalidCreation("invalid parent payout".to_owned())
-        })?,
-    )
-    .map_err(|error| RegistrationError::InvalidCreation(error.to_string()))?;
-    let compiled = CompiledMakerOrder::new(params)
-        .map_err(|error| RegistrationError::Compilation(error.to_string()))?;
-
-    let output = transaction
-        .output
-        .get(usize::try_from(contract_id.vout()).map_err(|_| {
-            RegistrationError::InvalidCreation("maker output index exceeds usize".to_owned())
-        })?)
-        .ok_or_else(|| {
-            RegistrationError::InvalidCreation(
-                "maker ContractId output does not exist in the creation transaction".to_owned(),
-            )
-        })?;
-    if output.script_pubkey != *compiled.script_pubkey() {
-        return Err(RegistrationError::InvalidCreation(
-            "maker ContractId output does not use the declared canonical order script".to_owned(),
-        ));
-    }
-    if output.nonce != Nonce::Null || output.witness != TxOutWitness::default() {
-        return Err(RegistrationError::InvalidCreation(
-            "canonical order output has a nonce or confidential proofs".to_owned(),
-        ));
-    }
-    let (asset, locked_amount) = match (output.asset, output.value) {
-        (Asset::Explicit(asset), Value::Explicit(amount)) => (asset, amount),
-        _ => {
-            return Err(RegistrationError::InvalidCreation(
-                "order output asset and value must be explicit".to_owned(),
-            ));
-        }
-    };
-    let expected_asset = match params.direction {
-        OrderDirection::SellBase => params.base_asset_id,
-        OrderDirection::SellQuote => params.quote_asset_id,
-    };
-    if asset != expected_asset {
-        return Err(RegistrationError::InvalidCreation(
-            "order output holds the wrong asset".to_owned(),
-        ));
-    }
-    let offered_base_capacity = match params.direction {
-        OrderDirection::SellBase => locked_amount,
-        OrderDirection::SellQuote => {
-            let price = u64::from(params.price);
-            if locked_amount % price != 0 {
-                return Err(RegistrationError::InvalidCreation(
-                    "SellQuote locked amount is not an exact multiple of price".to_owned(),
-                ));
-            }
-            locked_amount / price
-        }
-    };
-    let creation = create(params, offered_base_capacity)
-        .map_err(|error| RegistrationError::InvalidCreation(error.to_string()))?;
-    if creation.locked_amount != locked_amount {
-        return Err(RegistrationError::InvalidCreation(
-            "order locked amount is inconsistent with capacity".to_owned(),
-        ));
-    }
-
-    let hint_output_index = contract_id.vout().checked_add(1).ok_or_else(|| {
-        RegistrationError::InvalidCreation("maker hint output index overflowed u32".to_owned())
-    })?;
-    let hint_output = transaction
-        .output
-        .get(usize::try_from(hint_output_index).map_err(|_| {
-            RegistrationError::InvalidCreation("maker hint output index exceeds usize".to_owned())
-        })?)
-        .ok_or_else(|| {
-            RegistrationError::InvalidCreation(
-                "canonical maker order must be followed by its recovery hint".to_owned(),
-            )
-        })?;
-    let hint = OrderRecoveryHint::decode(
-        validate_recovery_txout(hint_output, policy_asset)
-            .map_err(|error| RegistrationError::InvalidCreation(error.to_string()))?,
-    )
-    .map_err(|error| RegistrationError::InvalidCreation(error.to_string()))?;
-    if hint.parent_market.resolve(transaction.txid()) != parent.contract_id
-        || hint.side != side
-        || hint.direction != params.direction
-        || hint.price != params.price
-        || hint.min_active_base != params.min_active_base
-        || hint.maker_pubkey != params.maker_pubkey
-    {
-        return Err(RegistrationError::InvalidCreation(
-            "canonical maker hint does not match its order or parent market".to_owned(),
-        ));
-    }
-
-    let record = ContractRecord {
-        contract_id,
-        kind: ContractKind::MakerOrderV1,
-        params: ContractParameters::MakerOrder(params),
-        creation_position: position,
-        state: ContractState::MakerOrder(MakerOrderState::Active {
-            remaining_base: offered_base_capacity,
-            total_filled_base: 0,
-        }),
-        sync_state: ContractSyncState::CatchingUp {
-            synced_through: anchor,
-        },
-        parent_market: Some(parent.contract_id),
-        outcome_side: Some(side),
-        scripts: vec![ScriptBinding {
-            role: 0,
-            script_pubkey: compiled.script_pubkey().as_bytes().to_vec(),
-        }],
-        assets: vec![
-            AssetBinding {
-                asset_id: params.base_asset_id,
-                relation: AssetRelationKind::OrderBase,
-                role: 0,
-            },
-            AssetBinding {
-                asset_id: params.quote_asset_id,
-                relation: AssetRelationKind::OrderQuote,
-                role: 1,
-            },
-        ],
-        outpoints: vec![TrackedOutpoint {
-            role: 0,
-            outpoint: contract_id.creation_anchor(),
-        }],
-        order_book: Some(OrderBookEntry {
-            market_id: parent.contract_id,
-            side,
-            direction: params.direction,
-            price: params.price,
-            creation_position: position,
-            remaining_base: offered_base_capacity,
-        }),
-    };
-    Ok(VerifiedRegistration {
-        record,
-        creation_block_anchor: anchor,
-        creation_transaction,
-        associated_hint: Some(RecoveryHintLocation {
-            position,
-            output_index: hint_output_index,
-        }),
-    })
-}
-
-pub(crate) fn verify_maker_order_hint_creation_shared(
-    creation_transaction: Arc<Transaction>,
-    position: ChainPosition,
-    anchor: ChainAnchor,
-    policy_asset: AssetId,
-    hint_output_index: u32,
-    parent: &ContractRecord,
-) -> Result<VerifiedRegistration, RegistrationError> {
-    let transaction = creation_transaction.as_ref();
-    let hint_output = transaction
-        .output
-        .get(usize::try_from(hint_output_index).map_err(|_| {
-            RegistrationError::InvalidCreation("maker hint output index exceeds usize".to_owned())
-        })?)
-        .ok_or_else(|| {
-            RegistrationError::InvalidCreation(
-                "maker hint output does not exist in the creation transaction".to_owned(),
-            )
-        })?;
-    let hint = OrderRecoveryHint::decode(
-        validate_recovery_txout(hint_output, policy_asset)
-            .map_err(|error| RegistrationError::InvalidCreation(error.to_string()))?,
-    )
-    .map_err(|error| RegistrationError::InvalidCreation(error.to_string()))?;
-    if hint.parent_market.resolve(transaction.txid()) != parent.contract_id {
-        return Err(RegistrationError::InvalidCreation(
-            "maker hint names a different parent market".to_owned(),
-        ));
-    }
-    let order_output_index = hint_output_index.checked_sub(1).ok_or_else(|| {
-        RegistrationError::InvalidCreation(
-            "canonical maker hint must immediately follow its order output".to_owned(),
-        )
-    })?;
-    let ContractParameters::BinaryMarket(parent_params) = &parent.params else {
-        return Err(RegistrationError::ParentIsNotMarket);
-    };
-    let base_asset_id = match hint.side {
-        deadcat_types::OrderSide::Yes => parent_params.yes_token_asset_id,
-        deadcat_types::OrderSide::No => parent_params.no_token_asset_id,
-    };
-    let creation_prevouts = transaction
-        .input
-        .iter()
-        .map(|input| input.previous_output)
-        .collect::<Vec<_>>();
-    let params = deadcat_types::MakerOrderParams {
-        base_asset_id,
-        quote_asset_id: parent_params.collateral_asset_id,
-        price: hint.price,
-        min_active_base: hint.min_active_base,
-        direction: hint.direction,
-        instance_id: derive_instance_id(&creation_prevouts, order_output_index)
-            .map_err(|error| RegistrationError::InvalidCreation(error.to_string()))?,
-        maker_pubkey: hint.maker_pubkey,
-    };
-    let contract_id = ContractId::new(OutPoint::new(transaction.txid(), order_output_index));
-    verify_maker_order_creation_shared(
-        creation_transaction,
-        position,
-        anchor,
-        policy_asset,
-        contract_id,
-        parent,
-        hint.side,
-        params,
-    )
 }
 
 fn unique_defining_input(
@@ -1026,10 +643,6 @@ pub enum RegistrationError {
     WrongChain,
     #[error("invalid contract package: {0}")]
     InvalidPackage(String),
-    #[error("parent market is not registered")]
-    ParentMarketNotFound,
-    #[error("parent contract is not a binary market")]
-    ParentIsNotMarket,
     #[error("contract compilation failed: {0}")]
     Compilation(String),
     #[error("invalid contract creation: {0}")]
@@ -1040,9 +653,7 @@ pub enum RegistrationError {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use deadcat_contracts::maker_order::CompiledMakerOrder;
-    use deadcat_contracts::recovery::{OrderRecoveryHint, recovery_txout};
-    use deadcat_types::{OrderDirection, OrderSide};
+    use deadcat_contracts::recovery::recovery_txout;
     use elements::confidential::{Asset, Nonce, Value};
     use elements::hashes::Hash as _;
     use elements::{
@@ -1426,142 +1037,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reversed_same_transaction_package_registers_market_and_order_atomically() {
-        let policy_asset = asset(0x94);
-        let (mut transaction, market_params, position, creation_anchor) =
-            standalone_market(policy_asset);
-        let creation_prevouts = transaction
-            .input
-            .iter()
-            .map(|input| input.previous_output)
-            .collect::<Vec<_>>();
-        let order_params = |order_vout| deadcat_types::MakerOrderParams {
-            base_asset_id: market_params.yes_token_asset_id,
-            quote_asset_id: market_params.collateral_asset_id,
-            price: 100,
-            min_active_base: 10,
-            direction: OrderDirection::SellQuote,
-            instance_id: derive_instance_id(&creation_prevouts, order_vout).expect("instance"),
-            maker_pubkey: VALID_XONLY,
-        };
-        let first_params = order_params(3);
-        let second_params = order_params(5);
-        for params in [first_params, second_params] {
-            let compiled_order = CompiledMakerOrder::new(params).expect("compile order");
-            transaction.output.push(TxOut {
-                asset: Asset::Explicit(params.quote_asset_id),
-                value: Value::Explicit(2_000),
-                nonce: Nonce::Null,
-                script_pubkey: compiled_order.script_pubkey().clone(),
-                witness: TxOutWitness::default(),
-            });
-            let hint = OrderRecoveryHint {
-                side: OrderSide::Yes,
-                direction: params.direction,
-                masked_order_index: 0x1234,
-                parent_market: deadcat_contracts::recovery::ParentMarketRef::SameTransaction {
-                    vout: 0,
-                },
-                price: params.price,
-                min_active_base: params.min_active_base,
-                maker_pubkey: params.maker_pubkey,
-            };
-            transaction
-                .output
-                .push(recovery_txout(policy_asset, &hint.encode()).expect("canonical order hint"));
-        }
-        let market_id = ContractId::new(OutPoint::new(transaction.txid(), 0));
-        let first_order_id = ContractId::new(OutPoint::new(transaction.txid(), 3));
-        let second_order_id = ContractId::new(OutPoint::new(transaction.txid(), 5));
-        let package = ContractPackage {
-            format_version: CONTRACT_PACKAGE_FORMAT_VERSION,
-            chain: deadcat_types::ChainIdentity {
-                network: LiquidNetwork::ElementsRegtest,
-                genesis_hash: BlockHash::all_zeros(),
-            },
-            roots: vec![first_order_id, second_order_id],
-            // Deliberately child-first: package order is not dependency order.
-            declarations: vec![
-                ContractDeclaration {
-                    contract_id: first_order_id,
-                    descriptor: ContractDescriptor::MakerOrderV1 {
-                        parent_market: market_id,
-                        side: OrderSide::Yes,
-                        params: first_params,
-                    },
-                },
-                ContractDeclaration {
-                    contract_id: second_order_id,
-                    descriptor: ContractDescriptor::MakerOrderV1 {
-                        parent_market: market_id,
-                        side: OrderSide::Yes,
-                        params: second_params,
-                    },
-                },
-                ContractDeclaration {
-                    contract_id: market_id,
-                    descriptor: ContractDescriptor::BinaryMarketV1 {
-                        params: market_params,
-                    },
-                },
-            ],
-        };
-        let source = RegistrationSource::new(
-            transaction,
-            TransactionStatus::Confirmed {
-                anchor: creation_anchor,
-                tx_index: position.tx_index,
-            },
-        );
-        let directory = tempfile::tempdir().expect("tempdir");
-        let store = Store::open(directory.path().join("package.redb")).expect("open store");
-        store
-            .initialize_tip(creation_anchor)
-            .expect("initialize tip");
-        let verifier = RegistrationVerifier::new(
-            &source,
-            &store,
-            LiquidNetwork::ElementsRegtest,
-            BlockHash::all_zeros(),
-            policy_asset,
-        );
-
-        let registrations = verifier
-            .verify_and_register_package(&package)
-            .await
-            .expect("register composed package");
-        assert_eq!(source.transaction_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(source.status_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(registrations.len(), 3);
-        assert_eq!(registrations[0].0.record.contract_id, first_order_id);
-        assert_eq!(registrations[1].0.record.contract_id, second_order_id);
-        assert_eq!(registrations[2].0.record.contract_id, market_id);
-        assert!(Arc::ptr_eq(
-            &registrations[0].0.creation_transaction,
-            &registrations[1].0.creation_transaction,
-        ));
-        assert!(Arc::ptr_eq(
-            &registrations[1].0.creation_transaction,
-            &registrations[2].0.creation_transaction,
-        ));
-        assert!(registrations.iter().all(|(_, inserted)| *inserted));
-        assert!(store.contract(market_id).expect("market lookup").is_some());
-        assert!(
-            store
-                .contract(first_order_id)
-                .expect("first order lookup")
-                .is_some()
-        );
-        assert!(
-            store
-                .contract(second_order_id)
-                .expect("second order lookup")
-                .is_some()
-        );
-        assert_eq!(store.pending_backfills().expect("backfills").len(), 3);
-    }
-
-    #[tokio::test]
     async fn reversed_same_transaction_package_registers_two_markets_atomically() {
         let policy_asset = asset(0x90);
         let first_yes_input = issuance_input(0x31, 1);
@@ -1813,14 +1288,14 @@ mod tests {
                 if message.contains("root must have a declaration")
         ));
 
-        let mut unreachable = package.clone();
-        unreachable.declarations.push(ContractDeclaration {
+        let mut unrooted = package.clone();
+        unrooted.declarations.push(ContractDeclaration {
             contract_id: ContractId::new(OutPoint::new(contract_id.txid(), 8)),
             descriptor: ContractDescriptor::BinaryMarketV1 { params },
         });
         assert!(matches!(
-            verifier.verify_package(&unreachable).await,
-            Err(RegistrationError::InvalidPackage(message)) if message.contains("unreachable")
+            verifier.verify_package(&unrooted).await,
+            Err(RegistrationError::InvalidPackage(message)) if message.contains("must be a root")
         ));
 
         let mut oversized = package;
@@ -1932,123 +1407,6 @@ mod tests {
                 None,
             ),
             Err(RegistrationError::InvalidCreation(message)) if message.contains("found 0")
-        ));
-    }
-
-    #[test]
-    fn maker_order_registration_derives_capacity_and_parent_relation() {
-        let policy_asset = asset(0x97);
-        let (market_tx, _, market_position, market_anchor) = standalone_market(policy_asset);
-        let parent = verify_binary_market_creation(
-            &market_tx,
-            market_position,
-            market_anchor,
-            LiquidNetwork::ElementsRegtest,
-            policy_asset,
-            None,
-            None,
-        )
-        .expect("parent")
-        .record;
-        let ContractParameters::BinaryMarket(parent_params) = parent.params else {
-            panic!("market params")
-        };
-        let input = TxIn::default();
-        let params = deadcat_types::MakerOrderParams {
-            base_asset_id: parent_params.yes_token_asset_id,
-            quote_asset_id: parent_params.collateral_asset_id,
-            price: 100,
-            min_active_base: 10,
-            direction: OrderDirection::SellQuote,
-            instance_id: derive_instance_id(&[input.previous_output], 0).expect("instance"),
-            maker_pubkey: VALID_XONLY,
-        };
-        let compiled = CompiledMakerOrder::new(params).expect("order compile");
-        let hint = OrderRecoveryHint {
-            side: OrderSide::Yes,
-            direction: params.direction,
-            masked_order_index: 0x1234,
-            parent_market: parent.contract_id.into(),
-            price: params.price,
-            min_active_base: params.min_active_base,
-            maker_pubkey: params.maker_pubkey,
-        }
-        .encode();
-        let transaction = Transaction {
-            version: 2,
-            lock_time: LockTime::ZERO,
-            input: vec![input],
-            output: vec![
-                TxOut {
-                    asset: Asset::Explicit(params.quote_asset_id),
-                    value: Value::Explicit(2_000),
-                    nonce: Nonce::Null,
-                    script_pubkey: compiled.script_pubkey().clone(),
-                    witness: TxOutWitness::default(),
-                },
-                recovery_txout(policy_asset, &hint).expect("hint output"),
-            ],
-        };
-        let position = ChainPosition {
-            block_height: 101,
-            tx_index: 3,
-        };
-        let verified = verify_maker_order_creation(
-            &transaction,
-            position,
-            anchor(101, 0x56),
-            policy_asset,
-            ContractId::new(OutPoint::new(transaction.txid(), 0)),
-            &parent,
-            OrderSide::Yes,
-            params,
-        )
-        .expect("verify order");
-        assert_eq!(
-            verified.record.state,
-            ContractState::MakerOrder(MakerOrderState::Active {
-                remaining_base: 20,
-                total_filled_base: 0,
-            })
-        );
-        assert_eq!(
-            verified.associated_hint,
-            Some(RecoveryHintLocation {
-                position,
-                output_index: 1,
-            })
-        );
-
-        // Copying an otherwise valid order output and hint to another vout is
-        // noncanonical: the second vout requires a different instance ID and
-        // therefore a different covenant/payment script pair.
-        let mut duplicated = transaction;
-        duplicated.output.extend_from_within(..2);
-        let first = verify_maker_order_creation(
-            &duplicated,
-            position,
-            anchor(101, 0x56),
-            policy_asset,
-            ContractId::new(OutPoint::new(duplicated.txid(), 0)),
-            &parent,
-            OrderSide::Yes,
-            params,
-        )
-        .expect("first canonical order");
-        assert_eq!(first.record.params, ContractParameters::MakerOrder(params));
-        assert!(matches!(
-            verify_maker_order_creation(
-                &duplicated,
-                position,
-                anchor(101, 0x56),
-                policy_asset,
-                ContractId::new(OutPoint::new(duplicated.txid(), 2)),
-                &parent,
-                OrderSide::Yes,
-                params,
-            ),
-            Err(RegistrationError::InvalidCreation(message))
-                if message.contains("instance ID")
         ));
     }
 }

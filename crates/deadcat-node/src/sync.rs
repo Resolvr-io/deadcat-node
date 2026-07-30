@@ -1484,8 +1484,6 @@ mod tests {
                 outstanding_pairs: 0,
             }),
             sync_state,
-            parent_market: None,
-            outcome_side: None,
             scripts: vec![ScriptBinding {
                 role: 0,
                 script_pubkey: vec![marker, 0x51],
@@ -1499,7 +1497,6 @@ mod tests {
                 role: 0,
                 outpoint: OutPoint::new(txid, 0),
             }],
-            order_book: None,
         }
     }
 
@@ -1523,7 +1520,6 @@ mod tests {
                 role: 0,
                 outpoint: OutPoint::new(spending_txid, 0),
             }],
-            order_remaining_base: None,
             transition: TransitionRecord {
                 kind: 1,
                 payload: outstanding_pairs.to_be_bytes().to_vec(),

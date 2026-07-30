@@ -1,4 +1,3 @@
-use deadcat_client::maker_builder::MakerFillPlan;
 use deadcat_client::market_builder::{
     BinaryMarketLiveInputs, BinaryMarketTransitionPlan, MarketIssuanceEntropies, MarketRtInput,
     OracleAttestation,
@@ -12,12 +11,11 @@ use deadcat_contracts::interpret::strip_taproot_annex;
 use deadcat_contracts::interpret::{
     BinaryMarketLiveOutputs, TrackedContractOutput, interpret_binary_market_spend_with_compiled,
 };
-use deadcat_contracts::maker_order::CompiledMakerOrder;
 use deadcat_contracts::market_crypto::{
     BinaryOutcome as OracleOutcome, derive_issuance_assets, oracle_message,
 };
 use deadcat_contracts::rt::{RtLeg, RtSide, commitments, factors};
-use deadcat_types::{BinaryMarketParams, BinaryMarketState, MakerOrderParams, OrderDirection};
+use deadcat_types::{BinaryMarketParams, BinaryMarketState};
 use elements::confidential::{Asset, Nonce, Value};
 use elements::hashes::Hash as _;
 use elements::pset::{Input as PsetInput, Output as PsetOutput, PartiallySignedTransaction};
@@ -1874,79 +1872,4 @@ fn every_terminal_market_slot_rejects_a_false_slot_witness() {
             "{slot:?} accepted a false SLOT witness"
         );
     }
-}
-
-fn maker_params(direction: OrderDirection) -> MakerOrderParams {
-    MakerOrderParams {
-        base_asset_id: asset(0x91),
-        quote_asset_id: asset(0x92),
-        price: 7,
-        min_active_base: 3,
-        direction,
-        instance_id: [0x44; 32],
-        maker_pubkey: Keypair::from_seckey_slice(&Secp256k1::new(), &[0x41; 32])
-            .expect("maker key")
-            .x_only_public_key()
-            .0
-            .serialize(),
-    }
-}
-
-fn finalized_maker_stack(direction: OrderDirection, partial: bool) -> Vec<Vec<u8>> {
-    let params = maker_params(direction);
-    let input_locked = match direction {
-        OrderDirection::SellBase => 10,
-        OrderDirection::SellQuote => 70,
-    };
-    let fill_base = if partial { 4 } else { 10 };
-    let remainder_index = partial.then_some(1);
-    let live_outpoint = OutPoint::new(Txid::from_byte_array([0xa1; 32]), 0);
-    let plan = MakerFillPlan::new(live_outpoint, params, input_locked, fill_base, 0)
-        .expect("maker fill plan");
-    let compiled = CompiledMakerOrder::new(params).expect("compile maker order");
-    let held_asset = match direction {
-        OrderDirection::SellBase => params.base_asset_id,
-        OrderDirection::SellQuote => params.quote_asset_id,
-    };
-    let mut pset = PartiallySignedTransaction::new_v2();
-    pset.add_input(pset_input(
-        live_outpoint,
-        explicit_txout(held_asset, input_locked, compiled.script_pubkey().clone()),
-    ));
-    for (_, output) in plan
-        .mandatory_outputs(0, remainder_index)
-        .expect("maker outputs")
-    {
-        pset.add_output(PsetOutput::from_txout(output));
-    }
-    let network = SimplicityNetwork::ElementsRegtest {
-        policy_asset: params.quote_asset_id,
-    };
-    plan.finalize(&mut pset, 0, 0, remainder_index, &network)
-        .expect("finalize maker order");
-    pset.inputs()[0]
-        .final_script_witness
-        .clone()
-        .expect("final maker witness")
-}
-
-#[test]
-fn every_finalized_maker_fill_stack_has_sufficient_simplicity_budget() {
-    let mut failures = Vec::new();
-    for direction in [OrderDirection::SellBase, OrderDirection::SellQuote] {
-        for partial in [false, true] {
-            let shape = if partial { "partial" } else { "full" };
-            let stack = finalized_maker_stack(direction, partial);
-            let _ = record_budget(
-                format!("maker-{direction:?}-{shape}"),
-                &stack,
-                &mut failures,
-            );
-        }
-    }
-    let report = failure_report(&failures);
-    assert!(
-        failures.is_empty(),
-        "underbudget finalized maker stacks:\n{report}"
-    );
 }

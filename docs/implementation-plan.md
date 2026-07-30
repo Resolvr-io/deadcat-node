@@ -1,7 +1,15 @@
-# V1 implementation plan
+# V1 alpha implementation record
 
-Every phase has a test gate. A later phase does not compensate for an ambiguous
-or untested covenant invariant in an earlier one.
+> **Completed historical record.** This plan describes the first alpha,
+> including the subsequently removed maker-order experiment. No maker contract
+> was deployed to testnet or mainnet. The final pre-removal implementation is
+> preserved at
+> [`d7be35b27a020a61333e471b2ded5f59e3a0a039`](https://github.com/Resolvr-io/deadcat-node/tree/d7be35b27a020a61333e471b2ded5f59e3a0a039).
+> Current work is market-only and RFQ-first; this file is not the active
+> roadmap.
+
+Every phase below had a test gate. A later phase did not compensate for an
+ambiguous or untested covenant invariant in an earlier one.
 
 ## Phase 0: Protocol lock and workspace scaffold
 

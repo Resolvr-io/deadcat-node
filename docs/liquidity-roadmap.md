@@ -17,9 +17,8 @@ market-only production scope, RFQ-first liquidity boundary, complete
 future interfaces and phases in this roadmap remain non-normative until their
 own specifications and acceptance work exist.
 
-In particular, this roadmap does not by itself:
+In particular, this roadmap is not an implementation mechanism and does not:
 
-- remove or disable `MakerOrderV1`;
 - change any deployed contract's semantics;
 - supersede an accepted architecture decision record;
 - define a stable RFQ, AMM, DLOB, or router API; or
@@ -30,7 +29,9 @@ updates. ADR 0006 records that no maker contract reached Liquid testnet,
 mainnet, or production and that incompatible local alpha data is disposable.
 `MakerOrderV1` therefore has no compatibility, migration, recovery, indexing,
 or versioning period; any later output using the published alpha covenant is an
-unsupported foreign contract.
+unsupported foreign contract. The market-only implementation work was
+completed by [PR #15](https://github.com/Resolvr-io/deadcat-node/pull/15) and
+[PR #16](https://github.com/Resolvr-io/deadcat-node/pull/16).
 
 The roadmap should be archived or split into normative specifications once
 every phase has either shipped or been explicitly rejected and its surviving
@@ -42,7 +43,7 @@ the current alpha implementation or erase its acceptance history:
 
 | Horizon | Supported liquidity scope |
 |---|---|
-| Current alpha | `BinaryMarketV1` and `MakerOrderV1` are implemented and tested |
+| Current alpha | `BinaryMarketV1` only; the maker experiment is retained solely as historical evidence |
 | First public production release | Binary-market lifecycle plus a separate noncustodial RFQ service |
 | Future scope | Permissionless AMM and/or DLOB venues, followed by bounded atomic split routing |
 
@@ -224,14 +225,16 @@ ADR 0006 completes the scope and compatibility decision:
 | CI and acceptance evidence | Replace maker-dependent generic gates; retain dated packets as historical evidence |
 | Existing alpha data | Delete or rebuild; no migration or compatibility decoding |
 
-The remaining Phase 0 implementation work is:
+Phase 0 is complete:
 
-- Make the supported production creation and routing scope consistently
-  market-only across the protocol, README, architecture, RPC, and acceptance
-  docs.
-- Preserve the maker-order audit and acceptance work as dated historical
+- [PR #15](https://github.com/Resolvr-io/deadcat-node/pull/15) replaced
+  maker-dependent generic assurance with atomic market-only coverage.
+- [PR #16](https://github.com/Resolvr-io/deadcat-node/pull/16) made the active
+  contract, client, node, storage, wire, CLI, fixture, CI, and normative
+  documentation surfaces market-only.
+- The maker-order audit and acceptance work remains as dated historical
   evidence with immutable source references.
-- Define the RFQ process as separate from `deadcat-node`.
+- The RFQ process is explicitly separate from `deadcat-node`.
 
 ### Phase 1: one noncustodial RFQ provider
 
@@ -449,9 +452,10 @@ Time validity, state validity, and client freshness policy are distinct.
 
 Parent-market trading state is a global client pre-sign policy for every venue
 unless a venue covenant explicitly consumes or authenticates live market state.
-`MakerOrderV1`, for example, does not natively close its fill path when its
-parent market terminates. A route can therefore be invalid under client policy
-even while each selected venue input remains consensus-spendable.
+The retired alpha `MakerOrderV1`, for example, did not natively close its fill
+path when its parent market terminated. A future venue can likewise be invalid
+under client policy even while each selected venue input remains
+consensus-spendable.
 
 An illustrative validity model is:
 
@@ -545,27 +549,31 @@ bind the user's aggregate result. Every leg confirms together or none does.
 
 The existing
 [multi-contract acceptance packet](acceptance/multi-contract-v1.md) is
-historical proof that the current toolchain, interpreter, store, and Elements
-boundary can process one transaction advancing heterogeneous contracts. It does
-not by itself prove that future RFQ, AMM, and DLOB layouts will compose safely.
+historical proof that the pre-removal toolchain, interpreter, store, and
+Elements boundary processed one transaction advancing heterogeneous contracts.
+The active
+[multi-market gate](../crates/deadcat-client/tests/market_regtest.rs) proves the
+current market-only stack still indexes, replays, rolls back, and rebuilds one
+transaction advancing multiple contracts atomically. Neither result proves
+that future RFQ, AMM, and DLOB layouts will compose safely.
 
 ### Current implementation footholds
 
-The current client already contains useful shapes, but none is the stable venue
+The current client contains useful shapes, but none is the stable venue
 interface proposed here:
 
 - [`BinaryMarketTransitionPlan`](../crates/deadcat-client/src/market_builder.rs)
   exposes mandatory outputs at a caller-chosen base and finalizes only against
   the composed PSET.
-- [`MakerFillPlan`](../crates/deadcat-client/src/maker_builder.rs) accepts
-  caller-selected payment and remainder indices and rejects an aliased output.
-  That is useful historical composition evidence, not a reason to keep its
-  economics or contract in production scope.
 - [Client validation](../crates/deadcat-client/src/validation.rs) is already a
   separate authority boundary from node indexing.
-- The
-  [live multi-contract fixture](../crates/deadcat-client/tests/market_regtest.rs)
-  constructs and confirms one six-input, ten-output heterogeneous transaction.
+- The [live multi-market fixture](../crates/deadcat-client/tests/market_regtest.rs)
+  composes two market transitions and proves transaction-atomic behavior.
+- The retired
+  [`MakerFillPlan`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-client/src/maker_builder.rs)
+  and
+  [heterogeneous live fixture](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-client/tests/market_regtest.rs)
+  remain historical composition evidence, not production interfaces.
 
 Phase 1 should extract and test the smallest generic plan/composer seam from
 these patterns instead of making the router depend on maker-specific types.
@@ -917,17 +925,16 @@ three independently designed fragment layouts compose safely.
 
 ADR 0006 accepted the direction, superseded the release-scope decision in
 [ADR 0002](adr/0002-v1-contract-scope.md), and retired
-[ADR 0003](adr/0003-order-economics.md) as historical. Before production scope
-changes ship:
+[ADR 0003](adr/0003-order-economics.md) as historical. The Phase 0 documentation
+work is complete:
 
-1. update the [README](../README.md) and
-   [architecture](architecture.md) to distinguish the keyless node from the
-   inventory-bearing RFQ service;
-2. mark the [existing implementation plan](implementation-plan.md) as a
+1. the [README](../README.md) and [architecture](architecture.md) distinguish
+   the keyless node from the inventory-bearing RFQ service;
+2. the [existing implementation plan](implementation-plan.md) is a
    completed alpha record;
-3. update the protocol and storage/RPC specifications alongside actual code
-   removal or capability changes;
-4. preserve dated maker-order audits and acceptance packets with immutable
+3. the protocol and storage/RPC specifications match the market-only code and
+   capability surface;
+4. dated maker-order audits and acceptance packets are preserved with immutable
    source references; and
-5. retain the heterogeneous multi-contract acceptance result as evidence for
-   future atomic composition while replacing its active maker-dependent gate.
+5. the heterogeneous multi-contract result remains historical evidence while
+   the active gate uses two independent markets.

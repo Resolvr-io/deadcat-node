@@ -6,14 +6,11 @@ use deadcat_contracts::binary_market::{
     BinaryMarketAction, BinaryMarketSlot, CompiledBinaryMarket, derived_binary_market,
 };
 use deadcat_contracts::interpret::{
-    BinaryMarketLiveOutputs, BinaryMarketPath, InterpretError, MakerOrderSpendKind,
-    TrackedContractOutput, interpret_binary_market_spend, interpret_maker_order_spend,
+    BinaryMarketLiveOutputs, BinaryMarketPath, InterpretError, TrackedContractOutput,
+    interpret_binary_market_spend,
 };
-use deadcat_contracts::maker_order::{CompiledMakerOrder, derived_maker_order};
 use deadcat_contracts::rt::{RtFactors, RtLeg, RtSide, factors};
-use deadcat_types::{
-    BinaryMarketParams, BinaryMarketState, MakerOrderParams, MakerOrderState, OrderDirection,
-};
+use deadcat_types::{BinaryMarketParams, BinaryMarketState};
 use elements::confidential::{Asset, Nonce, Value};
 use elements::hashes::Hash as _;
 use elements::pset::PartiallySignedTransaction;
@@ -29,213 +26,6 @@ fn key(seed: u8) -> [u8; 32] {
         .x_only_public_key()
         .0
         .serialize()
-}
-
-fn maker_params(direction: OrderDirection) -> MakerOrderParams {
-    MakerOrderParams {
-        base_asset_id: asset(0x11),
-        quote_asset_id: asset(0x22),
-        price: 7,
-        min_active_base: 3,
-        direction,
-        instance_id: [0x42; 32],
-        maker_pubkey: key(0x31),
-    }
-}
-
-struct MakerScenario {
-    params: MakerOrderParams,
-    before: MakerOrderState,
-    live: TrackedContractOutput,
-    transaction: Transaction,
-}
-
-fn maker_fill_scenario(
-    direction: OrderDirection,
-    partial: bool,
-    decoy_remainder: bool,
-    annex: bool,
-) -> MakerScenario {
-    let params = maker_params(direction);
-    let compiled = CompiledMakerOrder::new(params).expect("compile order");
-    let input_amount = match direction {
-        OrderDirection::SellBase => 10,
-        OrderDirection::SellQuote => 70,
-    };
-    let payment = match (direction, partial) {
-        (OrderDirection::SellBase, false) => 70,
-        (OrderDirection::SellBase, true) => 28,
-        (OrderDirection::SellQuote, false) => 10,
-        (OrderDirection::SellQuote, true) => 4,
-    };
-    let input_asset = match direction {
-        OrderDirection::SellBase => params.base_asset_id,
-        OrderDirection::SellQuote => params.quote_asset_id,
-    };
-    let payment_asset = match direction {
-        OrderDirection::SellBase => params.quote_asset_id,
-        OrderDirection::SellQuote => params.base_asset_id,
-    };
-    let previous = OutPoint::new(elements::Txid::from_byte_array([0xa1; 32]), 0);
-    let live_txout = explicit_txout(input_asset, input_amount, compiled.script_pubkey().clone());
-    let mut pset = PartiallySignedTransaction::new_v2();
-    let mut input = pset_input(0xa1, 0, live_txout.clone());
-    input.previous_txid = previous.txid;
-    pset.add_input(input);
-    pset.add_output(pset_output(explicit_txout(
-        payment_asset,
-        payment,
-        compiled.maker_receive_spk().clone(),
-    )));
-
-    let remainder_index = if partial {
-        if decoy_remainder {
-            pset.add_output(pset_output(explicit_txout(
-                input_asset,
-                5,
-                compiled.script_pubkey().clone(),
-            )));
-            2
-        } else {
-            1
-        }
-    } else {
-        // A full fill must not adopt a same-script decoy.
-        pset.add_output(pset_output(explicit_txout(
-            input_asset,
-            6,
-            compiled.script_pubkey().clone(),
-        )));
-        1
-    };
-    if partial {
-        let remainder = match direction {
-            OrderDirection::SellBase => 6,
-            OrderDirection::SellQuote => 42,
-        };
-        pset.add_output(pset_output(explicit_txout(
-            input_asset,
-            remainder,
-            compiled.script_pubkey().clone(),
-        )));
-    }
-
-    let witness = derived_maker_order::MakerOrderWitness {
-        payment_index: 0,
-        is_partial: partial,
-        remainder_index,
-    };
-    let net = network(params.quote_asset_id);
-    let mut stack = compiled
-        .program()
-        .as_ref()
-        .finalize(&pset, &witness.build_witness(), 0, &net)
-        .expect("finalize maker fill");
-    if annex {
-        stack.push(vec![0x50, 0x01]);
-    }
-    let mut transaction = pset.extract_tx().expect("extract maker tx");
-    transaction.input[0].witness.script_witness = stack;
-    MakerScenario {
-        params,
-        before: MakerOrderState::Active {
-            remaining_base: 10,
-            total_filled_base: 0,
-        },
-        live: TrackedContractOutput {
-            outpoint: previous,
-            txout: live_txout,
-        },
-        transaction,
-    }
-}
-
-#[test]
-fn interprets_all_maker_fill_transitions_from_finalized_transactions() {
-    for direction in [OrderDirection::SellBase, OrderDirection::SellQuote] {
-        let full = maker_fill_scenario(direction, false, false, false);
-        let interpreted =
-            interpret_maker_order_spend(full.params, full.before, &full.live, &full.transaction)
-                .expect("interpret full fill");
-        assert!(matches!(interpreted.kind, MakerOrderSpendKind::Fill(_)));
-        assert_eq!(interpreted.after, MakerOrderState::Consumed);
-        assert!(interpreted.continuation.is_none());
-
-        let partial = maker_fill_scenario(direction, true, false, false);
-        let interpreted = interpret_maker_order_spend(
-            partial.params,
-            partial.before,
-            &partial.live,
-            &partial.transaction,
-        )
-        .expect("interpret partial fill");
-        assert_eq!(
-            interpreted.after,
-            MakerOrderState::Active {
-                remaining_base: 6,
-                total_filled_base: 4,
-            }
-        );
-        assert_eq!(interpreted.remainder_index, Some(1));
-    }
-}
-
-#[test]
-fn maker_interpreter_uses_designated_remainder_and_handles_annex() {
-    let scenario = maker_fill_scenario(OrderDirection::SellBase, true, true, true);
-    let interpreted = interpret_maker_order_spend(
-        scenario.params,
-        scenario.before,
-        &scenario.live,
-        &scenario.transaction,
-    )
-    .expect("interpret designated remainder");
-    assert_eq!(interpreted.remainder_index, Some(2));
-    assert_eq!(
-        interpreted
-            .continuation
-            .expect("continuation")
-            .outpoint
-            .vout,
-        2
-    );
-    assert!(interpreted.annex_present);
-}
-
-#[test]
-fn maker_key_spend_is_cancellation_after_annex_stripping() {
-    let params = maker_params(OrderDirection::SellBase);
-    let compiled = CompiledMakerOrder::new(params).expect("compile order");
-    let previous = OutPoint::new(elements::Txid::from_byte_array([0xb1; 32]), 0);
-    let live_txout = explicit_txout(params.base_asset_id, 10, compiled.script_pubkey().clone());
-    let mut pset = PartiallySignedTransaction::new_v2();
-    let mut input = pset_input(0xb1, 0, live_txout.clone());
-    input.previous_txid = previous.txid;
-    pset.add_input(input);
-    pset.add_output(pset_output(explicit_txout(
-        params.base_asset_id,
-        10,
-        script(0x77),
-    )));
-    let mut transaction = pset.extract_tx().expect("extract cancellation");
-    transaction.input[0].witness.script_witness = vec![vec![1; 64], vec![0x50, 0x99]];
-    let before = MakerOrderState::Active {
-        remaining_base: 10,
-        total_filled_base: 0,
-    };
-    let interpreted = interpret_maker_order_spend(
-        params,
-        before,
-        &TrackedContractOutput {
-            outpoint: previous,
-            txout: live_txout,
-        },
-        &transaction,
-    )
-    .expect("interpret cancellation");
-    assert_eq!(interpreted.kind, MakerOrderSpendKind::Cancel);
-    assert_eq!(interpreted.after, MakerOrderState::Cancelled);
-    assert!(interpreted.annex_present);
 }
 
 fn binary_params() -> BinaryMarketParams {
@@ -425,14 +215,7 @@ fn market_interpreter_uses_witness_output_base_not_first_matching_script() {
 }
 
 #[test]
-fn interpreters_reject_tampered_designated_outputs_and_control_blocks() {
-    let mut maker = maker_fill_scenario(OrderDirection::SellBase, true, false, false);
-    maker.transaction.output[1].value = elements::confidential::Value::Explicit(5);
-    assert!(
-        interpret_maker_order_spend(maker.params, maker.before, &maker.live, &maker.transaction,)
-            .is_err()
-    );
-
+fn market_interpreter_rejects_tampered_control_blocks() {
     let mut market = resolved_redemption_scenario(false, false, false);
     let compiled = CompiledBinaryMarket::new(market.params).expect("compile market");
     market.transaction.input[0].witness.script_witness[3] = compiled

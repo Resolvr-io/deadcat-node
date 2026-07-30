@@ -8,13 +8,11 @@ use simplex::simplicityhl::simplicity::{BitIter, HasCmr as _, RedeemNode, Value}
 use thiserror::Error;
 
 mod binary_market;
-mod maker_order;
 
 pub use binary_market::{
     BinaryMarketContinuation, BinaryMarketInterpretation, BinaryMarketLiveOutputs,
     BinaryMarketPath, interpret_binary_market_spend, interpret_binary_market_spend_with_compiled,
 };
-pub use maker_order::{MakerOrderInterpretation, MakerOrderSpendKind, interpret_maker_order_spend};
 
 /// A tracked covenant output with the previous output data needed to interpret
 /// explicit amounts and confidential value classes from a confirmed spend.
@@ -45,12 +43,8 @@ pub enum InterpretError {
     AmbiguousInterpretation,
     #[error("transaction contradicts its decoded covenant witness: {0}")]
     Inconsistent(&'static str),
-    #[error("maker-order economics rejected the spend: {0}")]
-    MakerEconomics(#[from] crate::maker_order::MakerOrderError),
     #[error("binary-market economics rejected the spend: {0}")]
     BinaryEconomics(#[from] crate::binary_market::BinaryMarketError),
-    #[error("maker-order compilation failed: {0}")]
-    MakerCompilation(#[from] crate::maker_order::CompiledMakerOrderError),
     #[error("binary-market compilation failed: {0}")]
     BinaryCompilation(#[from] crate::binary_market::CompiledBinaryMarketError),
     #[error("transaction index does not fit the v1 u32 witness domain")]

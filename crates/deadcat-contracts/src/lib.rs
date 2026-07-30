@@ -5,7 +5,6 @@ mod artifacts;
 
 pub mod binary_market;
 pub mod interpret;
-pub mod maker_order;
 pub mod market_crypto;
 pub mod recovery;
 pub mod rt;

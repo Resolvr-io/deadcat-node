@@ -4,6 +4,11 @@
   [ADR 0006](0006-rfq-first-liquidity-scope.md)
 - Date: 2026-07-12
 
+> **Historical alpha record.** No maker contract was deployed to testnet or
+> mainnet. The final implementation governed by this ADR is preserved at
+> [`d7be35b27a020a61333e471b2ded5f59e3a0a039`](https://github.com/Resolvr-io/deadcat-node/tree/d7be35b27a020a61333e471b2ded5f59e3a0a039).
+> Future RFQ, DLOB, or AMM pricing must make a new explicit economics decision.
+
 ## Context
 
 V1 needs an order price that is exactly enforceable in indivisible Liquid asset

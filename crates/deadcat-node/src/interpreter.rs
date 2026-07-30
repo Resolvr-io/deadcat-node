@@ -10,21 +10,16 @@ use std::sync::Arc;
 
 use deadcat_contracts::binary_market::{BinaryMarketSlot, BinaryMarketTransition, BinaryOutcome};
 use deadcat_contracts::interpret::{
-    BinaryMarketLiveOutputs, BinaryMarketPath, InterpretError, MakerOrderSpendKind,
-    TrackedContractOutput, interpret_binary_market_spend, interpret_maker_order_spend,
+    BinaryMarketLiveOutputs, BinaryMarketPath, InterpretError, TrackedContractOutput,
+    interpret_binary_market_spend,
 };
 use deadcat_rpc::RecoveryFamily;
-use deadcat_types::{
-    ContractDescriptor, ContractId, ContractKind, ContractSyncState, LiquidNetwork, MakerOrderState,
-};
+use deadcat_types::{ContractDescriptor, ContractId, ContractSyncState, LiquidNetwork};
 use elements::{AssetId, OutPoint, Transaction};
 use thiserror::Error;
 
 use crate::discovery::scan_transaction_hints;
-use crate::registration::{
-    verify_binary_market_creation_shared, verify_maker_order_creation_shared,
-    verify_maker_order_hint_creation_shared,
-};
+use crate::registration::verify_binary_market_creation_shared;
 use crate::store::{
     ContractParameters, ContractRecord, ContractState, OutpointOwner, StateUpdate, StoreError,
     TrackedOutpoint, TransitionRecord,
@@ -35,24 +30,20 @@ use crate::sync::{
 };
 
 /// Transition tags reserve the high nibble for the payload version, the next
-/// nibble for the contract family (`0` market, `1` maker), and the low byte for
-/// the operation. Payload integers are fixed-width big-endian values.
+/// nibble for the contract family (`0` market), and the low byte for the
+/// operation. Payload integers are fixed-width big-endian values.
 ///
 /// Market payloads begin with the one-byte [`BinaryMarketPath`], followed by:
 /// issued `(pairs:u64, collateral:u64)`, cancelled
 /// `(pairs:u64, collateral:u64, full:u8)`, resolved
 /// `(outcome:u8, collateral:u64)`, expired `(collateral:u64)`, or redeemed
 /// `(outcome:u8, tokens:u64, collateral:u64, complete:u8)`. Outcomes encode
-/// YES as zero and NO as one. Maker fills encode
-/// `(filled_base:u64, payment:u64, has_remaining:u8, remaining_locked:u64)`;
-/// cancellation has an empty payload.
+/// YES as zero and NO as one.
 pub const TRANSITION_V1_MARKET_ISSUED: u16 = 0x1001;
 pub const TRANSITION_V1_MARKET_CANCELLED: u16 = 0x1002;
 pub const TRANSITION_V1_MARKET_RESOLVED: u16 = 0x1003;
 pub const TRANSITION_V1_MARKET_EXPIRED: u16 = 0x1004;
 pub const TRANSITION_V1_MARKET_REDEEMED: u16 = 0x1005;
-pub const TRANSITION_V1_MAKER_FILLED: u16 = 0x1101;
-pub const TRANSITION_V1_MAKER_CANCELLED: u16 = 0x1102;
 
 #[derive(Clone, Copy, Debug)]
 pub struct DeadcatInterpreter {
@@ -104,25 +95,19 @@ impl ChainInterpreter for DeadcatInterpreter {
                 .recovery_hints
                 .iter()
                 .any(|hint| hint.family == RecoveryFamily::BinaryMarketV1);
-            let has_order_hint = result
-                .recovery_hints
-                .iter()
-                .any(|hint| hint.family == RecoveryFamily::MakerOrderV1);
-            let shared_transaction = (!retained.is_empty() || has_market_hint || has_order_hint)
-                .then(|| Arc::new(transaction.clone()));
+            let shared_transaction =
+                (!retained.is_empty() || has_market_hint).then(|| Arc::new(transaction.clone()));
 
             // Explicit declarations are durable watch intent, not authority.
             // Recompile every retained market against this exact canonical
-            // transaction before considering any retained child orders.
+            // transaction.
             for declaration in retained.iter().filter(|declaration| {
                 matches!(
                     declaration.descriptor,
                     ContractDescriptor::BinaryMarketV1 { .. }
                 )
             }) {
-                let ContractDescriptor::BinaryMarketV1 { params } = declaration.descriptor else {
-                    unreachable!("filtered to market declarations")
-                };
+                let ContractDescriptor::BinaryMarketV1 { params } = declaration.descriptor;
                 if let Ok(mut verified) = verify_binary_market_creation_shared(
                     Arc::clone(
                         shared_transaction
@@ -177,124 +162,6 @@ impl ChainInterpreter for DeadcatInterpreter {
                         .find(|hint| hint.output_index == location.output_index)
                         .ok_or(NodeInterpretError::MissingAssociatedHint)?;
                     hint.associated_contract = Some(contract_id);
-                }
-            }
-
-            // Retained declarations remain useful for durable watch intent,
-            // but canonical maker hints now contain enough public information
-            // to derive and validate an order independently.
-            for declaration in retained.iter().filter(|declaration| {
-                matches!(
-                    declaration.descriptor,
-                    ContractDescriptor::MakerOrderV1 { .. }
-                )
-            }) {
-                let ContractDescriptor::MakerOrderV1 {
-                    parent_market,
-                    side,
-                    params,
-                } = declaration.descriptor
-                else {
-                    unreachable!("filtered to maker declarations")
-                };
-                let same_transaction_parent = result
-                    .created_contracts
-                    .iter()
-                    .find(|record| record.contract_id == parent_market);
-                let stored_parent;
-                let parent = if let Some(parent) = same_transaction_parent {
-                    parent
-                } else {
-                    let Some(parent) = contract_in_context(context, parent_market)? else {
-                        continue;
-                    };
-                    stored_parent = parent;
-                    &stored_parent
-                };
-                if let Ok(mut verified) = verify_maker_order_creation_shared(
-                    Arc::clone(
-                        shared_transaction
-                            .as_ref()
-                            .expect("retained declarations allocate shared transaction evidence"),
-                    ),
-                    context.position,
-                    context.anchor,
-                    self.policy_asset,
-                    declaration.contract_id,
-                    parent,
-                    side,
-                    params,
-                ) {
-                    verified.record.sync_state = ContractSyncState::Ready {
-                        synced_through: context.anchor,
-                    };
-                    retain_canonical_creation(
-                        context,
-                        &mut result.created_contracts,
-                        verified.record,
-                    )?;
-                }
-            }
-
-            for hint_index in result
-                .recovery_hints
-                .iter()
-                .filter(|hint| hint.family == RecoveryFamily::MakerOrderV1)
-                .map(|hint| hint.output_index)
-                .collect::<Vec<_>>()
-            {
-                let Some(hint) = result
-                    .recovery_hints
-                    .iter()
-                    .find(|hint| hint.output_index == hint_index)
-                    .and_then(|hint| {
-                        deadcat_contracts::recovery::OrderRecoveryHint::decode(&hint.payload).ok()
-                    })
-                else {
-                    continue;
-                };
-                let parent_market = hint.parent_market.resolve(transaction.txid());
-                let same_transaction_parent = result
-                    .created_contracts
-                    .iter()
-                    .find(|record| record.contract_id == parent_market);
-                let stored_parent;
-                let parent = if let Some(parent) = same_transaction_parent {
-                    parent
-                } else {
-                    let Some(parent) = contract_in_context(context, parent_market)? else {
-                        continue;
-                    };
-                    stored_parent = parent;
-                    &stored_parent
-                };
-                if let Ok(mut verified) = verify_maker_order_hint_creation_shared(
-                    Arc::clone(
-                        shared_transaction
-                            .as_ref()
-                            .expect("maker hints allocate shared transaction evidence"),
-                    ),
-                    context.position,
-                    context.anchor,
-                    self.policy_asset,
-                    hint_index,
-                    parent,
-                ) {
-                    verified.record.sync_state = ContractSyncState::Ready {
-                        synced_through: context.anchor,
-                    };
-                    let contract_id = verified.record.contract_id;
-                    retain_canonical_creation(
-                        context,
-                        &mut result.created_contracts,
-                        verified.record,
-                    )?;
-                    let associated = result
-                        .recovery_hints
-                        .iter_mut()
-                        .find(|candidate| candidate.output_index == hint_index)
-                        .ok_or(NodeInterpretError::MissingAssociatedHint)?;
-                    associated.associated_contract = Some(contract_id);
                 }
             }
         }
@@ -365,8 +232,6 @@ fn ensure_creation_identity(
     if existing.kind != candidate.kind
         || existing.params != candidate.params
         || existing.creation_position != candidate.creation_position
-        || existing.parent_market != candidate.parent_market
-        || existing.outcome_side != candidate.outcome_side
         || existing.scripts != candidate.scripts
         || existing.assets != candidate.assets
     {
@@ -413,82 +278,28 @@ fn interpret_contract(
     record: &ContractRecord,
     transaction: &Transaction,
 ) -> Result<StateUpdate, NodeInterpretError> {
-    match (record.kind, &record.params, record.state) {
-        (
-            ContractKind::BinaryMarketV1,
-            ContractParameters::BinaryMarket(params),
-            ContractState::BinaryMarket(before),
-        ) => {
-            let live = materialize_market_outputs(context, record)?;
-            let interpreted = interpret_binary_market_spend(*params, before, &live, transaction)?;
-            let spent_outpoints = interpreted.spent_outpoints.to_vec();
-            ensure_complete_spend(record, &spent_outpoints)?;
-            let new_outpoints = interpreted
-                .continuations
-                .iter()
-                .map(|continuation| TrackedOutpoint {
-                    role: continuation.slot as u8,
-                    outpoint: continuation.output.outpoint,
-                })
-                .collect();
-            Ok(StateUpdate {
-                contract_id: record.contract_id,
-                old_state: record.state,
-                new_state: ContractState::BinaryMarket(interpreted.after),
-                spent_outpoints,
-                new_outpoints,
-                order_remaining_base: None,
-                transition: market_transition_record(interpreted.path, interpreted.transition),
-            })
-        }
-        (
-            ContractKind::MakerOrderV1,
-            ContractParameters::MakerOrder(params),
-            ContractState::MakerOrder(before),
-        ) => {
-            let live = materialize_maker_output(context, record)?;
-            let interpreted = interpret_maker_order_spend(*params, before, &live, transaction)?;
-            let spent_outpoints = vec![interpreted.spent_outpoint];
-            ensure_complete_spend(record, &spent_outpoints)?;
-            let new_outpoints = interpreted
-                .continuation
-                .as_ref()
-                .map(|continuation| {
-                    vec![TrackedOutpoint {
-                        role: 0,
-                        outpoint: continuation.outpoint,
-                    }]
-                })
-                .unwrap_or_default();
-            let order_remaining_base = match interpreted.after {
-                MakerOrderState::Active { remaining_base, .. } => Some(remaining_base),
-                MakerOrderState::Consumed | MakerOrderState::Cancelled => None,
-            };
-            Ok(StateUpdate {
-                contract_id: record.contract_id,
-                old_state: record.state,
-                new_state: ContractState::MakerOrder(interpreted.after),
-                spent_outpoints,
-                new_outpoints,
-                order_remaining_base,
-                transition: maker_transition_record(interpreted.kind),
-            })
-        }
-        _ => Err(NodeInterpretError::ContractShape(record.contract_id)),
-    }
-}
-
-fn materialize_maker_output(
-    context: &InterpretationContext<'_>,
-    record: &ContractRecord,
-) -> Result<TrackedContractOutput, NodeInterpretError> {
-    let [tracked] = record.outpoints.as_slice() else {
-        return Err(NodeInterpretError::InvalidLiveSet(record.contract_id));
-    };
-    if tracked.role != 0 {
-        return Err(NodeInterpretError::InvalidLiveSet(record.contract_id));
-    }
-    materialize_output(context, *tracked)
+    let ContractParameters::BinaryMarket(params) = &record.params;
+    let ContractState::BinaryMarket(before) = record.state;
+    let live = materialize_market_outputs(context, record)?;
+    let interpreted = interpret_binary_market_spend(*params, before, &live, transaction)?;
+    let spent_outpoints = interpreted.spent_outpoints.to_vec();
+    ensure_complete_spend(record, &spent_outpoints)?;
+    let new_outpoints = interpreted
+        .continuations
+        .iter()
+        .map(|continuation| TrackedOutpoint {
+            role: continuation.slot as u8,
+            outpoint: continuation.output.outpoint,
+        })
+        .collect();
+    Ok(StateUpdate {
+        contract_id: record.contract_id,
+        old_state: record.state,
+        new_state: ContractState::BinaryMarket(interpreted.after),
+        spent_outpoints,
+        new_outpoints,
+        transition: market_transition_record(interpreted.path, interpreted.transition),
+    })
 }
 
 fn materialize_market_outputs(
@@ -631,26 +442,6 @@ fn contract_in_context(
             ensure_complete_spend(record, &update.spent_outpoints)?;
             record.state = update.new_state;
             record.outpoints.clone_from(&update.new_outpoints);
-            match (record.state, update.order_remaining_base) {
-                (ContractState::BinaryMarket(_), None) => {}
-                (
-                    ContractState::MakerOrder(MakerOrderState::Active { remaining_base, .. }),
-                    Some(supplied),
-                ) if remaining_base == supplied => {
-                    let order_book = record
-                        .order_book
-                        .as_mut()
-                        .ok_or(NodeInterpretError::OverlayStateMismatch(contract_id))?;
-                    order_book.remaining_base = supplied;
-                }
-                (
-                    ContractState::MakerOrder(
-                        MakerOrderState::Consumed | MakerOrderState::Cancelled,
-                    ),
-                    None,
-                ) => record.order_book = None,
-                _ => return Err(NodeInterpretError::OverlayStateMismatch(contract_id)),
-            }
         }
     }
     Ok(current)
@@ -726,34 +517,6 @@ fn market_transition_record(
     TransitionRecord { kind, payload }
 }
 
-fn maker_transition_record(kind: MakerOrderSpendKind) -> TransitionRecord {
-    match kind {
-        MakerOrderSpendKind::Fill(fill) => {
-            let mut payload = Vec::with_capacity(25);
-            payload.extend_from_slice(&fill.filled_base.to_be_bytes());
-            payload.extend_from_slice(&fill.maker_payment.to_be_bytes());
-            match fill.remaining_locked {
-                Some(remaining) => {
-                    payload.push(1);
-                    payload.extend_from_slice(&remaining.to_be_bytes());
-                }
-                None => {
-                    payload.push(0);
-                    payload.extend_from_slice(&0_u64.to_be_bytes());
-                }
-            }
-            TransitionRecord {
-                kind: TRANSITION_V1_MAKER_FILLED,
-                payload,
-            }
-        }
-        MakerOrderSpendKind::Cancel => TransitionRecord {
-            kind: TRANSITION_V1_MAKER_CANCELLED,
-            payload: Vec::new(),
-        },
-    }
-}
-
 const fn outcome_byte(outcome: BinaryOutcome) -> u8 {
     match outcome {
         BinaryOutcome::Yes => 0,
@@ -779,8 +542,6 @@ pub enum NodeInterpretError {
     MissingOutput(OutPoint),
     #[error("tracked contract {0:?} has an invalid live-output set")]
     InvalidLiveSet(ContractId),
-    #[error("tracked contract {0:?} has inconsistent kind, parameters, and state")]
-    ContractShape(ContractId),
     #[error("contract {0:?} was created twice in one interpretation overlay")]
     DuplicateOverlayContract(ContractId),
     #[error("contract {0:?} has inconsistent same-block transition state")]

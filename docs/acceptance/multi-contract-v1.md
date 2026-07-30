@@ -1,6 +1,13 @@
 # Multi-contract v1 live acceptance packet
 
-Status: Complete for the local Elements protocol gate; mandatory in CI.
+> **Historical alpha record.** This heterogeneous market-plus-maker gate was
+> replaced by the market-only multi-instance gate before any testnet or mainnet
+> deployment. Its final implementation is preserved at
+> [`d7be35b27a020a61333e471b2ded5f59e3a0a039`](https://github.com/Resolvr-io/deadcat-node/tree/d7be35b27a020a61333e471b2ded5f59e3a0a039).
+> Test names and commands below are non-runnable in the current checkout and
+> apply only to that pinned revision.
+
+Status: Retired; previously complete and mandatory in CI.
 
 This packet records the production-shaped acceptance boundary for one
 transaction advancing heterogeneous Deadcat contracts. It supplements the
@@ -8,7 +15,7 @@ deterministic interpreter and redb atomicity fixtures with a real transaction
 accepted and mined by an isolated `elementsd` liquidregtest chain. It introduces
 no new market or maker-order consensus rule.
 
-The gate is implemented by
+The retired gate was implemented by
 `multi_contract_transaction_is_accepted_and_indexed_by_elementsd` in
 `crates/deadcat-client/tests/market_regtest.rs`.
 
@@ -106,23 +113,24 @@ tip. All three contracts, order-book rows, histories, shared raw-transaction
 evidence, and independent client replays then match the replacement branch;
 the pre-rebuild event cursor remains stale.
 
-## Required commands
+## Historical commands
 
-Run the focused gate:
+At the pinned revision, the focused gate was:
 
 ```sh
 nix develop .#default --command just regtest-multi-contract
 ```
 
-Run every required local and CI gate:
+The complete local/CI gate at that revision was:
 
 ```sh
 nix develop .#default --command just ci
 ```
 
-`.github/workflows/ci.yml` invokes `just regtest`, which includes the
-binary-market A/B, maker-order, and multi-contract live suites. This test is
-ignored only for ordinary `cargo test`; it is mandatory in CI.
+At that revision, `.github/workflows/ci.yml` invoked `just regtest`, including
+the binary-market A/B, maker-order, and heterogeneous multi-contract live
+suites. This test was ignored only by ordinary `cargo test` and was mandatory
+in that revision's CI.
 
 ## Deliberate boundaries
 

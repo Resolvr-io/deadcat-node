@@ -178,9 +178,6 @@ pub enum LiquidNetwork {
 #[serde(rename_all = "snake_case")]
 pub enum ContractKind {
     BinaryMarketV1,
-    MakerOrderV1,
-    /// Reserved for capability negotiation; registration is unsupported in v1.
-    LmsrV1Reserved,
 }
 
 /// Exact chain on which the declarations in a contract package must exist.
@@ -214,65 +211,12 @@ impl BinaryMarketParams {
     }
 }
 
-/// Which outcome token an order trades against collateral.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OrderSide {
-    Yes,
-    No,
-}
-
-/// Asset held by an active maker order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OrderDirection {
-    SellBase,
-    SellQuote,
-}
-
-impl OrderDirection {
-    #[must_use]
-    pub const fn protocol_byte(self) -> u8 {
-        match self {
-            Self::SellBase => 0,
-            Self::SellQuote => 1,
-        }
-    }
-}
-
-/// Public parameters needed to compile and validate a maker order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MakerOrderParams {
-    pub base_asset_id: AssetId,
-    pub quote_asset_id: AssetId,
-    pub price: u32,
-    pub min_active_base: u32,
-    pub direction: OrderDirection,
-    /// Stable order instance commitment. The covenant accepts any value;
-    /// canonical creation derives it from all creation input prevouts and the
-    /// initial order output index.
-    #[serde(with = "hex::serde")]
-    pub instance_id: [u8; 32],
-    /// Per-order base key. The canonical covenant derives independent
-    /// cancellation and payment keys from this key and `instance_id`.
-    #[serde(with = "hex::serde")]
-    pub maker_pubkey: [u8; 32],
-}
-
 /// Complete public semantics needed to compile and independently verify one
 /// supported contract family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContractDescriptor {
-    BinaryMarketV1 {
-        params: BinaryMarketParams,
-    },
-    MakerOrderV1 {
-        parent_market: ContractId,
-        side: OrderSide,
-        params: MakerOrderParams,
-    },
+    BinaryMarketV1 { params: BinaryMarketParams },
 }
 
 impl ContractDescriptor {
@@ -280,15 +224,6 @@ impl ContractDescriptor {
     pub const fn kind(self) -> ContractKind {
         match self {
             Self::BinaryMarketV1 { .. } => ContractKind::BinaryMarketV1,
-            Self::MakerOrderV1 { .. } => ContractKind::MakerOrderV1,
-        }
-    }
-
-    #[must_use]
-    pub const fn parent(self) -> Option<ContractId> {
-        match self {
-            Self::BinaryMarketV1 { .. } => None,
-            Self::MakerOrderV1 { parent_market, .. } => Some(parent_market),
         }
     }
 }
@@ -304,7 +239,7 @@ pub struct ContractDeclaration {
 }
 
 /// Portable ingestion unit. Roots identify the contracts requested by the
-/// sender; declarations may additionally carry their dependency closure.
+/// sender. With the market-only contract set, every declaration is a root.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContractPackage {
@@ -334,20 +269,6 @@ pub enum BinaryMarketState {
         #[serde(with = "serde_u64_string")]
         collateral_unredeemed: u64,
     },
-}
-
-/// Confirmed maker-order materialized state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MakerOrderState {
-    Active {
-        #[serde(with = "serde_u64_string")]
-        remaining_base: u64,
-        #[serde(with = "serde_u64_string")]
-        total_filled_base: u64,
-    },
-    Consumed,
-    Cancelled,
 }
 
 /// Whether a verified registration has replayed through the indexed tip.

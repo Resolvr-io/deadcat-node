@@ -1,19 +1,10 @@
 //! Byte-exact v1 OP_RETURN recovery payloads.
 
-use deadcat_types::{ContractId, OrderDirection, OrderSide};
 use elements::confidential::{Asset, Nonce, Value};
-use elements::hashes::Hash as _;
-use elements::secp256k1_zkp::XOnlyPublicKey;
-use elements::{AssetId, Script, TxOut, TxOutWitness, Txid};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use elements::{AssetId, Script, TxOut, TxOutWitness};
 use thiserror::Error;
 
 pub const MARKET_V1_TAG: u8 = 0x10;
-pub const ORDER_YES_SELL_BASE_V1_TAG: u8 = 0x40;
-pub const ORDER_YES_SELL_QUOTE_V1_TAG: u8 = 0x44;
-pub const ORDER_NO_SELL_BASE_V1_TAG: u8 = 0x48;
-pub const ORDER_NO_SELL_QUOTE_V1_TAG: u8 = 0x4c;
 
 pub const BASE_PAYOUTS: [u64; 16] = [
     100, 200, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000, 500_000,
@@ -22,22 +13,16 @@ pub const BASE_PAYOUTS: [u64; 16] = [
 
 pub const MARKET_KNOWN_PAYLOAD_LEN: usize = 38;
 pub const MARKET_EXOTIC_PAYLOAD_LEN: usize = 70;
-pub const ORDER_PAYLOAD_LEN: usize = 79;
-pub const MAX_RECOVERY_PAYLOAD_LEN: usize = 80;
+pub const MAX_RECOVERY_PAYLOAD_LEN: usize = MARKET_EXOTIC_PAYLOAD_LEN;
 
 /// Build the exact canonical OP_RETURN used by v1 recovery outputs.
 pub fn recovery_script(payload: &[u8]) -> Result<Script, RecoveryError> {
     if payload.is_empty() || payload.len() > MAX_RECOVERY_PAYLOAD_LEN {
         return Err(RecoveryError::InvalidPayloadLength(payload.len()));
     }
-    let mut bytes = Vec::with_capacity(payload.len() + 3);
+    let mut bytes = Vec::with_capacity(payload.len() + 2);
     bytes.push(0x6a);
-    if payload.len() <= 75 {
-        bytes.push(payload.len() as u8);
-    } else {
-        bytes.push(0x4c);
-        bytes.push(payload.len() as u8);
-    }
+    bytes.push(payload.len() as u8);
     bytes.extend_from_slice(payload);
     Ok(Script::from(bytes))
 }
@@ -48,19 +33,12 @@ pub fn parse_recovery_script(script: &Script) -> Result<&[u8], RecoveryError> {
     if bytes.len() < 3 || bytes[0] != 0x6a {
         return Err(RecoveryError::InvalidRecoveryScript);
     }
-    let (payload_len, header_len) = match bytes[1] {
-        1..=75 => (usize::from(bytes[1]), 2),
-        0x4c if bytes.len() >= 4
-            && (76..=MAX_RECOVERY_PAYLOAD_LEN).contains(&usize::from(bytes[2])) =>
-        {
-            (usize::from(bytes[2]), 3)
-        }
-        _ => return Err(RecoveryError::InvalidRecoveryScript),
-    };
-    if bytes.len() != payload_len + header_len {
+    let payload_len = usize::from(bytes[1]);
+    if payload_len == 0 || payload_len > MAX_RECOVERY_PAYLOAD_LEN || bytes.len() != payload_len + 2
+    {
         return Err(RecoveryError::InvalidRecoveryScript);
     }
-    Ok(&bytes[header_len..])
+    Ok(&bytes[2..])
 }
 
 /// Construct the canonical zero-value policy-asset recovery output.
@@ -172,153 +150,6 @@ impl MarketRecoveryHint {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParentMarketRef {
-    Existing(ContractId),
-    SameTransaction { vout: u32 },
-}
-
-impl ParentMarketRef {
-    #[must_use]
-    pub fn resolve(self, creation_txid: Txid) -> ContractId {
-        match self {
-            Self::Existing(contract_id) => contract_id,
-            Self::SameTransaction { vout } => {
-                ContractId::new(elements::OutPoint::new(creation_txid, vout))
-            }
-        }
-    }
-
-    fn fixed_key(self) -> [u8; 36] {
-        match self {
-            Self::Existing(contract_id) => contract_id.to_fixed_key(),
-            Self::SameTransaction { vout } => {
-                let mut key = [0_u8; 36];
-                key[32..].copy_from_slice(&vout.to_be_bytes());
-                key
-            }
-        }
-    }
-}
-
-impl From<ContractId> for ParentMarketRef {
-    fn from(value: ContractId) -> Self {
-        Self::Existing(value)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OrderRecoveryHint {
-    pub side: OrderSide,
-    pub direction: OrderDirection,
-    pub masked_order_index: u16,
-    pub parent_market: ParentMarketRef,
-    pub price: u32,
-    pub min_active_base: u32,
-    pub maker_pubkey: [u8; 32],
-}
-
-impl OrderRecoveryHint {
-    #[must_use]
-    pub const fn tag(self) -> u8 {
-        match (self.side, self.direction) {
-            (OrderSide::Yes, OrderDirection::SellBase) => ORDER_YES_SELL_BASE_V1_TAG,
-            (OrderSide::Yes, OrderDirection::SellQuote) => ORDER_YES_SELL_QUOTE_V1_TAG,
-            (OrderSide::No, OrderDirection::SellBase) => ORDER_NO_SELL_BASE_V1_TAG,
-            (OrderSide::No, OrderDirection::SellQuote) => ORDER_NO_SELL_QUOTE_V1_TAG,
-        }
-    }
-
-    #[must_use]
-    pub fn encode(self) -> [u8; ORDER_PAYLOAD_LEN] {
-        let mut payload = [0_u8; ORDER_PAYLOAD_LEN];
-        payload[0] = self.tag();
-        payload[1..3].copy_from_slice(&self.masked_order_index.to_be_bytes());
-        let parent = self.parent_market.fixed_key();
-        payload[3..39].copy_from_slice(&parent);
-        payload[39..43].copy_from_slice(&self.price.to_be_bytes());
-        payload[43..47].copy_from_slice(&self.min_active_base.to_be_bytes());
-        payload[47..79].copy_from_slice(&self.maker_pubkey);
-        payload
-    }
-
-    pub fn decode(payload: &[u8]) -> Result<Self, RecoveryError> {
-        if payload.len() != ORDER_PAYLOAD_LEN {
-            return Err(RecoveryError::InvalidLength {
-                expected: "79",
-                actual: payload.len(),
-            });
-        }
-        let (side, direction) = decode_order_tag(payload[0])?;
-        let masked_order_index = u16::from_be_bytes([payload[1], payload[2]]);
-        let parent_txid = Txid::from_byte_array(payload[3..35].try_into().expect("fixed slice"));
-        let parent_vout = u32::from_be_bytes(payload[35..39].try_into().expect("fixed slice"));
-        let price = u32::from_be_bytes(payload[39..43].try_into().expect("fixed slice"));
-        let min_active_base = u32::from_be_bytes(payload[43..47].try_into().expect("fixed slice"));
-        let maker_pubkey: [u8; 32] = payload[47..79].try_into().expect("fixed slice");
-        if price == 0 {
-            return Err(RecoveryError::ZeroPrice);
-        }
-        if min_active_base == 0 {
-            return Err(RecoveryError::ZeroMinimum);
-        }
-        XOnlyPublicKey::from_slice(&maker_pubkey)
-            .map_err(|_| RecoveryError::InvalidMakerPublicKey)?;
-
-        let parent_market = if parent_txid == Txid::all_zeros() {
-            ParentMarketRef::SameTransaction { vout: parent_vout }
-        } else {
-            ParentMarketRef::Existing(ContractId::new(elements::OutPoint::new(
-                parent_txid,
-                parent_vout,
-            )))
-        };
-
-        Ok(Self {
-            side,
-            direction,
-            masked_order_index,
-            parent_market,
-            price,
-            min_active_base,
-            maker_pubkey,
-        })
-    }
-
-    /// Recover the candidate derivation index. Script compilation/matching is
-    /// still required because every foreign hint also maps to some `u16`.
-    pub fn unmask_index(self, deadcat_secret_key: &[u8; 32]) -> u16 {
-        self.masked_order_index ^ order_mask(self, deadcat_secret_key)
-    }
-}
-
-#[must_use]
-pub fn order_mask(hint: OrderRecoveryHint, deadcat_secret_key: &[u8; 32]) -> u16 {
-    let mut mac = Hmac::<Sha256>::new_from_slice(deadcat_secret_key).expect("HMAC accepts any key");
-    mac.update(b"deadcat/order_mask");
-    mac.update(&hint.parent_market.fixed_key());
-    mac.update(&hint.price.to_be_bytes());
-    mac.update(&[match hint.side {
-        OrderSide::Yes => 0,
-        OrderSide::No => 1,
-    }]);
-    mac.update(&[hint.direction.protocol_byte()]);
-    mac.update(&hint.min_active_base.to_be_bytes());
-    mac.update(&hint.maker_pubkey);
-    let bytes = mac.finalize().into_bytes();
-    u16::from_be_bytes([bytes[0], bytes[1]])
-}
-
-fn decode_order_tag(tag: u8) -> Result<(OrderSide, OrderDirection), RecoveryError> {
-    match tag {
-        ORDER_YES_SELL_BASE_V1_TAG => Ok((OrderSide::Yes, OrderDirection::SellBase)),
-        ORDER_YES_SELL_QUOTE_V1_TAG => Ok((OrderSide::Yes, OrderDirection::SellQuote)),
-        ORDER_NO_SELL_BASE_V1_TAG => Ok((OrderSide::No, OrderDirection::SellBase)),
-        ORDER_NO_SELL_QUOTE_V1_TAG => Ok((OrderSide::No, OrderDirection::SellQuote)),
-        _ => Err(RecoveryError::UnknownTag(tag)),
-    }
-}
-
 fn validate_expiry_height(height: u32) -> Result<(), RecoveryError> {
     if height == 0 || height >= 500_000_000 {
         return Err(RecoveryError::InvalidExpiryHeight(height));
@@ -345,14 +176,8 @@ pub enum RecoveryError {
     InvalidAssetId,
     #[error("expiry height must be in 1..500000000, got {0}")]
     InvalidExpiryHeight(u32),
-    #[error("order price must be nonzero")]
-    ZeroPrice,
-    #[error("order minimum must be nonzero")]
-    ZeroMinimum,
-    #[error("recovery payload must contain 1..=80 bytes, got {0}")]
+    #[error("recovery payload must contain 1..=70 bytes, got {0}")]
     InvalidPayloadLength(usize),
-    #[error("order recovery hint contains an invalid maker x-only public key")]
-    InvalidMakerPublicKey,
     #[error("invalid recovery OP_RETURN script")]
     InvalidRecoveryScript,
     #[error("invalid recovery output asset, value, nonce, or proofs")]
@@ -393,59 +218,11 @@ mod tests {
     }
 
     #[test]
-    fn order_round_trip_and_mask_are_stable() {
-        let hint = OrderRecoveryHint {
-            side: OrderSide::No,
-            direction: OrderDirection::SellQuote,
-            masked_order_index: 0x1234,
-            parent_market: ContractId::new(elements::OutPoint::new(
-                Txid::from_byte_array([0x44; 32]),
-                9,
-            ))
-            .into(),
-            price: 75_000,
-            min_active_base: 25,
-            maker_pubkey: [
-                0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9,
-                0x7a, 0x5e, 0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a,
-                0xce, 0x80, 0x3a, 0xc0,
-            ],
-        };
-        let payload = hint.encode();
-        assert_eq!(payload.len(), ORDER_PAYLOAD_LEN);
-        assert_eq!(payload[0], ORDER_NO_SELL_QUOTE_V1_TAG);
-        assert_eq!(OrderRecoveryHint::decode(&payload), Ok(hint));
-
-        let mask = order_mask(hint, &[0x55; 32]);
-        assert_eq!(hint.unmask_index(&[0x55; 32]), 0x1234 ^ mask);
-    }
-
-    #[test]
-    fn malformed_lengths_and_zero_order_fields_are_rejected() {
+    fn malformed_market_lengths_are_rejected() {
         assert!(matches!(
             MarketRecoveryHint::decode(&[MARKET_V1_TAG; 39]),
             Err(RecoveryError::InvalidLength { .. })
         ));
-
-        let mut order = OrderRecoveryHint {
-            side: OrderSide::Yes,
-            direction: OrderDirection::SellBase,
-            masked_order_index: 0,
-            parent_market: ParentMarketRef::SameTransaction { vout: 0 },
-            price: 1,
-            min_active_base: 1,
-            maker_pubkey: [
-                0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9,
-                0x7a, 0x5e, 0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a,
-                0xce, 0x80, 0x3a, 0xc0,
-            ],
-        }
-        .encode();
-        order[39..43].fill(0);
-        assert_eq!(
-            OrderRecoveryHint::decode(&order),
-            Err(RecoveryError::ZeroPrice)
-        );
     }
 
     #[test]
@@ -470,64 +247,6 @@ mod tests {
         assert_eq!(
             parse_recovery_script(&nonminimal),
             Err(RecoveryError::InvalidRecoveryScript)
-        );
-    }
-
-    #[test]
-    fn order_payload_uses_canonical_pushdata1() {
-        let policy = AssetId::from_slice(&[0x66; 32]).expect("asset");
-        let hint = OrderRecoveryHint {
-            side: OrderSide::Yes,
-            direction: OrderDirection::SellBase,
-            masked_order_index: 1,
-            parent_market: ContractId::new(elements::OutPoint::new(
-                Txid::from_byte_array([0x88; 32]),
-                3,
-            ))
-            .into(),
-            price: 2,
-            min_active_base: 1,
-            maker_pubkey: [
-                0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9,
-                0x7a, 0x5e, 0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a,
-                0xce, 0x80, 0x3a, 0xc0,
-            ],
-        };
-        let payload = hint.encode();
-        let output = recovery_txout(policy, &payload).expect("output");
-        assert_eq!(
-            &output.script_pubkey.as_bytes()[..3],
-            &[0x6a, 0x4c, ORDER_PAYLOAD_LEN as u8]
-        );
-        assert_eq!(
-            validate_recovery_txout(&output, policy),
-            Ok(payload.as_slice())
-        );
-    }
-
-    #[test]
-    fn same_transaction_parent_uses_zero_txid_sentinel_and_resolves() {
-        let current_txid = Txid::from_byte_array([0x99; 32]);
-        let hint = OrderRecoveryHint {
-            side: OrderSide::No,
-            direction: OrderDirection::SellQuote,
-            masked_order_index: 5,
-            parent_market: ParentMarketRef::SameTransaction { vout: 2 },
-            price: 10,
-            min_active_base: 3,
-            maker_pubkey: [
-                0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9,
-                0x7a, 0x5e, 0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a,
-                0xce, 0x80, 0x3a, 0xc0,
-            ],
-        };
-        let payload = hint.encode();
-        assert_eq!(&payload[3..35], &[0_u8; 32]);
-        let decoded = OrderRecoveryHint::decode(&payload).expect("decode");
-        assert_eq!(decoded, hint);
-        assert_eq!(
-            decoded.parent_market.resolve(current_txid),
-            ContractId::new(elements::OutPoint::new(current_txid, 2))
         );
     }
 }

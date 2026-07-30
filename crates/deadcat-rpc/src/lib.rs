@@ -3,7 +3,7 @@
 use deadcat_types::{
     BinaryMarketParams, BinaryMarketState, ChainAnchor, ChainPosition, ContractId, ContractKind,
     ContractPackage, ContractSyncState, DiscoveryCoverage, EventCursor, LiquidNetwork,
-    MakerOrderParams, MakerOrderState, OrderDirection, OrderSide, RecoveryHintLocation,
+    RecoveryHintLocation,
 };
 use elements::{AssetId, BlockHash, OutPoint, Transaction, Txid};
 use serde::{Deserialize, Serialize};
@@ -63,15 +63,6 @@ pub enum Request {
     GetMarketSnapshot {
         market_id: ContractId,
     },
-    ListOrders {
-        market_id: ContractId,
-        side: Option<OrderSide>,
-        direction: Option<OrderDirection>,
-        page: PageRequest,
-    },
-    GetOrderBook {
-        market_id: ContractId,
-    },
     ListRecoveryHints {
         family: Option<RecoveryFamily>,
         page: PageRequest,
@@ -93,14 +84,6 @@ pub enum Request {
     EstimateFeerate {
         target_blocks: u16,
     },
-    SuggestRoute {
-        market_id: ContractId,
-        side: OrderSide,
-        direction: OrderDirection,
-        #[serde(with = "deadcat_types::serde_u64_string")]
-        base_amount: u64,
-        max_orders: u16,
-    },
     BroadcastSignedTransaction {
         transaction: Transaction,
     },
@@ -114,7 +97,6 @@ pub enum Request {
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryFamily {
     BinaryMarketV1,
-    MakerOrderV1,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,12 +137,6 @@ pub enum Response {
     MarketSnapshot {
         snapshot: MarketSnapshot,
     },
-    Orders {
-        page: ContractPage,
-    },
-    OrderBook {
-        book: OrderBookSnapshot,
-    },
     RecoveryHints {
         page: RecoveryHintPage,
     },
@@ -178,9 +154,6 @@ pub enum Response {
     },
     Feerate {
         estimate: FeeRateEstimate,
-    },
-    Route {
-        route: RouteSuggestion,
     },
     BroadcastAccepted {
         txid: Txid,
@@ -229,7 +202,6 @@ pub enum SyncStatus {
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
     BinaryMarketV1,
-    MakerOrderV1,
     ElementsRpc,
     Esplora,
     FullHintScan,
@@ -237,7 +209,6 @@ pub enum Capability {
     BroadcastSignedTransaction,
     EvidenceQueries,
     DurableSubscriptions,
-    AdvisoryRouting,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,8 +235,6 @@ pub struct ContractView {
     pub creation_position: ChainPosition,
     pub parameters: ContractParametersView,
     pub state: ContractStateView,
-    pub parent_market: Option<ContractId>,
-    pub outcome_side: Option<OrderSide>,
     pub live_outpoints: Vec<LiveOutpoint>,
 }
 
@@ -292,14 +261,7 @@ pub struct SnapshotCursor {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SnapshotScope {
     Markets,
-    Orders {
-        market_id: ContractId,
-        side: Option<OrderSide>,
-        direction: Option<OrderDirection>,
-    },
-    RecoveryHints {
-        family: Option<RecoveryFamily>,
-    },
+    RecoveryHints { family: Option<RecoveryFamily> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,14 +283,12 @@ pub struct ContractPage {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContractParametersView {
     BinaryMarket { params: BinaryMarketParams },
-    MakerOrder { params: MakerOrderParams },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContractStateView {
     BinaryMarket { state: BinaryMarketState },
-    MakerOrder { state: MakerOrderState },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -347,27 +307,6 @@ pub struct MarketSnapshot {
     pub params: BinaryMarketParams,
     pub state: BinaryMarketState,
     pub live_outpoints: Vec<LiveOutpoint>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OrderBookSnapshot {
-    pub snapshot: SnapshotMetadata,
-    pub market_id: ContractId,
-    pub asks: Vec<OrderBookLevel>,
-    pub bids: Vec<OrderBookLevel>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OrderBookLevel {
-    pub contract_id: ContractId,
-    pub side: OrderSide,
-    pub direction: OrderDirection,
-    pub price: u32,
-    #[serde(with = "deadcat_types::serde_u64_string")]
-    pub remaining_base: u64,
-    pub creation_position: ChainPosition,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -439,8 +378,6 @@ pub enum AssetRelationKind {
     NoToken,
     YesReissuanceToken,
     NoReissuanceToken,
-    OrderBase,
-    OrderQuote,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,28 +398,6 @@ pub struct FeeRateEstimate {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RouteSuggestion {
-    pub snapshot: SnapshotMetadata,
-    pub market_id: ContractId,
-    pub legs: Vec<RouteLeg>,
-    #[serde(with = "deadcat_types::serde_u64_string")]
-    pub total_base: u64,
-    #[serde(with = "deadcat_types::serde_u64_string")]
-    pub total_quote: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RouteLeg {
-    pub order_id: ContractId,
-    #[serde(with = "deadcat_types::serde_u64_string")]
-    pub base_amount: u64,
-    #[serde(with = "deadcat_types::serde_u64_string")]
-    pub quote_amount: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RecoveryHintRecord {
     pub location: RecoveryHintLocation,
     pub creation_txid: Txid,
@@ -497,7 +412,6 @@ pub struct RecoveryHintRecord {
 pub enum EventFilter {
     All,
     Contracts { contract_ids: Vec<ContractId> },
-    MarketTree { market_id: ContractId },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -522,7 +436,6 @@ pub enum Event {
         txid: Txid,
         position: ChainPosition,
         affected_contract_ids: Vec<ContractId>,
-        affected_market_ids: Vec<ContractId>,
     },
     BackfillApplied {
         contract_id: ContractId,
@@ -534,7 +447,6 @@ pub enum Event {
         new_tip: ChainAnchor,
         orphaned_positions: Vec<ChainPosition>,
         affected_contract_ids: Vec<ContractId>,
-        affected_market_ids: Vec<ContractId>,
     },
     SyncStatusChanged {
         status: SyncStatus,
@@ -601,11 +513,11 @@ mod tests {
     const PACKAGE_TXID: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
     fn package_fixture() -> ContractPackage {
-        let market_id = ContractId::new(OutPoint::new(
+        let first_market_id = ContractId::new(OutPoint::new(
             Txid::from_str(PACKAGE_TXID).expect("txid"),
             2,
         ));
-        let order_id = ContractId::new(OutPoint::new(
+        let second_market_id = ContractId::new(OutPoint::new(
             Txid::from_str(PACKAGE_TXID).expect("txid"),
             9,
         ));
@@ -618,29 +530,27 @@ mod tests {
                 network: LiquidNetwork::ElementsRegtest,
                 genesis_hash: BlockHash::from_str(&"aa".repeat(32)).expect("genesis hash"),
             },
-            roots: vec![order_id],
-            // Dependency order is intentionally reversed. The wire contract
-            // preserves declaration order even though verification topologically
-            // evaluates the market before its order.
+            roots: vec![second_market_id, first_market_id],
+            // The wire contract and registration receipt preserve caller order
+            // for independent markets sharing one atomic package.
             declarations: vec![
                 ContractDeclaration {
-                    contract_id: order_id,
-                    descriptor: ContractDescriptor::MakerOrderV1 {
-                        parent_market: market_id,
-                        side: OrderSide::Yes,
-                        params: MakerOrderParams {
-                            base_asset_id: asset("22"),
-                            quote_asset_id: asset("11"),
-                            price: 2_500,
-                            min_active_base: 10,
-                            direction: OrderDirection::SellQuote,
-                            instance_id: [0x66; 32],
-                            maker_pubkey: [0x77; 32],
+                    contract_id: second_market_id,
+                    descriptor: ContractDescriptor::BinaryMarketV1 {
+                        params: BinaryMarketParams {
+                            oracle_public_key: [0x03; 32],
+                            collateral_asset_id: asset("66"),
+                            yes_token_asset_id: asset("77"),
+                            no_token_asset_id: asset("88"),
+                            yes_reissuance_token_id: asset("99"),
+                            no_reissuance_token_id: asset("aa"),
+                            base_payout: 50_000_000,
+                            expiry_height: 2_345,
                         },
                     },
                 },
                 ContractDeclaration {
-                    contract_id: market_id,
+                    contract_id: first_market_id,
                     descriptor: ContractDescriptor::BinaryMarketV1 {
                         params: BinaryMarketParams {
                             oracle_public_key: [0x02; 32],
@@ -757,7 +667,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             request_id: RequestId(8),
             request: Request::ListRecoveryHints {
-                family: Some(RecoveryFamily::MakerOrderV1),
+                family: Some(RecoveryFamily::BinaryMarketV1),
                 page: PageRequest {
                     cursor: None,
                     limit: 2,
@@ -800,17 +710,11 @@ mod tests {
             },
             output_index: 4,
         };
-        let mut payload = vec![0x40, 0x00, 0x01];
-        payload.extend_from_slice(&contract_id.txid().to_byte_array());
-        payload.extend_from_slice(&contract_id.vout().to_be_bytes());
-        payload.extend_from_slice(&2_500_u32.to_be_bytes());
-        payload.extend_from_slice(&10_u32.to_be_bytes());
-        payload.extend_from_slice(&[
-            0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9,
-            0x7a, 0x5e, 0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a,
-            0xce, 0x80, 0x3a, 0xc0,
-        ]);
-        assert_eq!(payload.len(), 79);
+        let mut payload = vec![0x10];
+        payload.extend_from_slice(&[0x02; 32]);
+        payload.push(0);
+        payload.extend_from_slice(&1_234_u32.to_be_bytes());
+        assert_eq!(payload.len(), 38);
         let envelope = ServerEnvelope {
             schema_version: SCHEMA_VERSION,
             request_id: RequestId(8),
@@ -822,7 +726,7 @@ mod tests {
                             hints: vec![RecoveryHintRecord {
                                 location,
                                 creation_txid: contract_id.txid(),
-                                family: RecoveryFamily::MakerOrderV1,
+                                family: RecoveryFamily::BinaryMarketV1,
                                 payload,
                                 associated_contract: None,
                             }],
@@ -830,7 +734,7 @@ mod tests {
                                 as_of,
                                 event_high_watermark,
                                 scope: SnapshotScope::RecoveryHints {
-                                    family: Some(RecoveryFamily::MakerOrderV1),
+                                    family: Some(RecoveryFamily::BinaryMarketV1),
                                 },
                                 after_key: vec![0, 0, 0, 42, 0, 0, 0, 3, 0, 0, 0, 4],
                             }),
@@ -878,6 +782,95 @@ mod tests {
             "surprise":true
         }"#;
         assert!(serde_json::from_str::<RequestEnvelope>(json).is_err());
+    }
+
+    #[test]
+    fn removed_maker_wire_variants_are_rejected() {
+        let contract_id = format!("{PACKAGE_TXID}:2");
+        let requests = [
+            serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "request_id": "1",
+                "request": {
+                    "list_orders": {
+                        "market_id": contract_id,
+                        "side": null,
+                        "direction": null,
+                        "page": { "cursor": null, "limit": 1 }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "request_id": "1",
+                "request": { "get_order_book": { "market_id": contract_id } }
+            }),
+            serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "request_id": "1",
+                "request": {
+                    "suggest_route": {
+                        "market_id": contract_id,
+                        "side": "yes",
+                        "direction": "sell_base",
+                        "base_amount": "1",
+                        "max_orders": 1
+                    }
+                }
+            }),
+        ];
+        for request in requests {
+            assert!(serde_json::from_value::<RequestEnvelope>(request).is_err());
+        }
+        assert!(serde_json::from_str::<Capability>(r#""maker_order_v1""#).is_err());
+        assert!(serde_json::from_str::<Capability>(r#""advisory_routing""#).is_err());
+        assert!(serde_json::from_str::<RecoveryFamily>(r#""maker_order_v1""#).is_err());
+
+        let market_id = package_fixture().roots[0];
+        let removed_market_tree = serde_json::json!({
+            "market_tree": { "market_id": market_id }
+        });
+        assert!(serde_json::from_value::<EventFilter>(removed_market_tree).is_err());
+
+        let event = Event::TransactionApplied {
+            anchor: ChainAnchor {
+                height: 42,
+                hash: BlockHash::from_str(&"bb".repeat(32)).expect("block hash"),
+            },
+            txid: Txid::from_str(PACKAGE_TXID).expect("txid"),
+            position: ChainPosition {
+                block_height: 42,
+                tx_index: 3,
+            },
+            affected_contract_ids: vec![market_id],
+        };
+        let mut old_event = serde_json::to_value(event).expect("serialize event");
+        old_event["transaction_applied"]
+            .as_object_mut()
+            .expect("transaction applied object")
+            .insert(
+                "affected_market_ids".to_owned(),
+                serde_json::json!([market_id]),
+            );
+        assert!(serde_json::from_value::<Event>(old_event).is_err());
+
+        let mut package = serde_json::to_value(package_fixture()).expect("serialize package");
+        package["declarations"][0]["descriptor"] = serde_json::json!({
+            "maker_order_v1": {
+                "parent_market": contract_id,
+                "side": "yes",
+                "params": {
+                    "base_asset_id": "22".repeat(32),
+                    "quote_asset_id": "11".repeat(32),
+                    "price": 2500,
+                    "min_active_base": 10,
+                    "direction": "sell_quote",
+                    "instance_id": "66".repeat(32),
+                    "maker_pubkey": "77".repeat(32)
+                }
+            }
+        });
+        assert!(serde_json::from_value::<ContractPackage>(package).is_err());
     }
 
     #[test]

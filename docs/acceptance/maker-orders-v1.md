@@ -1,7 +1,14 @@
 # Maker-order v1 live acceptance packet
 
-Status: Complete for the canonical instance/public-discovery local Elements
-protocol gate.
+> **Historical alpha record.** The maker-order contract and this live gate were
+> removed before any testnet or mainnet deployment. The accepted implementation
+> and test are preserved at
+> [`d7be35b27a020a61333e471b2ded5f59e3a0a039`](https://github.com/Resolvr-io/deadcat-node/tree/d7be35b27a020a61333e471b2ded5f59e3a0a039).
+> Test names and commands below are non-runnable in the current checkout and
+> apply only to that pinned revision.
+
+Status: Retired; previously complete for the canonical
+instance/public-discovery local Elements protocol gate.
 
 This packet records the production-shaped boundary for the v1 maker-order
 covenant. It complements the pure Rust, generated Simplicity, interpreter,
@@ -82,23 +89,24 @@ The harness then creates genuine alternate-hash branches with the regtest
 The final state and independently replayed evidence reference only the
 canonical replacement branch.
 
-## Required commands
+## Historical commands
 
-Run the focused gate:
+At the pinned revision, the focused gate was:
 
 ```sh
 nix develop .#default --command just regtest-maker-orders
 ```
 
-Run every required local/CI gate:
+The complete local/CI gate at that revision was:
 
 ```sh
 nix develop .#default --command just ci
 ```
 
-`.github/workflows/ci.yml` invokes `just regtest`, which includes the
-binary-market A/B, maker-order, and multi-contract live suites. The test is
-ignored only for ordinary `cargo test`; it is mandatory in CI.
+At that revision, `.github/workflows/ci.yml` invoked `just regtest`, including
+the binary-market A/B, maker-order, and heterogeneous multi-contract live
+suites. The maker test was ignored only by ordinary `cargo test` and was
+mandatory in that revision's CI.
 
 ## Deliberate boundaries
 
