@@ -1,6 +1,7 @@
 # Liquidity roadmap: RFQ-first, venue-neutral execution
 
-- Status: Proposed
+- Status: Active roadmap — launch direction accepted by
+  [ADR 0006](adr/0006-rfq-first-liquidity-scope.md)
 - Date: 2026-07-29
 - Scope: Product and architecture roadmap
 
@@ -10,6 +11,12 @@ This document describes the intended evolution of Deadcat liquidity and client
 execution. It is not a consensus specification, a stable wire protocol, or an
 activation decision.
 
+[ADR 0006](adr/0006-rfq-first-liquidity-scope.md) is authoritative for the
+market-only production scope, RFQ-first liquidity boundary, complete
+`MakerOrderV1` retirement, and clean alpha compatibility policy. The detailed
+future interfaces and phases in this roadmap remain non-normative until their
+own specifications and acceptance work exist.
+
 In particular, this roadmap does not by itself:
 
 - remove or disable `MakerOrderV1`;
@@ -18,13 +25,12 @@ In particular, this roadmap does not by itself:
 - define a stable RFQ, AMM, DLOB, or router API; or
 - promise that every future route can be settled atomically.
 
-Those changes require their own implementation, tests, documentation updates,
-and, where appropriate, a superseding ADR. Before removing support for an
-existing contract family, the project must determine whether its published
-contract identity or activation rules allow new outputs to appear, not merely
-check whether known outputs currently contain funds. Recognition, recovery,
-cancellation, wire compatibility, and creation support may therefore have
-different retirement dates.
+Those changes require their own implementation, tests, and documentation
+updates. ADR 0006 records that no maker contract reached Liquid testnet,
+mainnet, or production and that incompatible local alpha data is disposable.
+`MakerOrderV1` therefore has no compatibility, migration, recovery, indexing,
+or versioning period; any later output using the published alpha covenant is an
+unsupported foreign contract.
 
 The roadmap should be archived or split into normative specifications once
 every phase has either shipped or been explicitly rejected and its surviving
@@ -66,12 +72,12 @@ user trade intent -> client ----+-- AMM pool(s) ----> validated plan -> PSET
                       router    +-- DLOB order(s)
 ```
 
-The client owns route selection, transaction construction, intent validation,
-blinding, signing, and broadcaster choice. A hosted service may suggest a route,
-but it is advisory and independently reproducible from evidence validated under
-the client's configured chain-source trust model. A single hosted node can
-provide internally valid yet stale or incomplete evidence; clients that require
-stronger freshness use an independent cross-check or local Elements node.
+The client owns venue discovery, route selection, transaction construction,
+intent validation, blinding, signing, and broadcaster choice. Venues provide
+quotes or executable state, and `deadcat-node` provides indexed evidence, but
+neither selects the user's route. A single hosted node can provide internally
+valid yet stale or incomplete evidence; clients that require stronger freshness
+use an independent cross-check or local Elements node.
 
 ## Goals
 
@@ -141,7 +147,8 @@ metrics retain their venue and methodology provenance.
 - index canonical market, AMM, and DLOB contract state;
 - provide raw state and transition evidence;
 - report exact live outpoints and chain positions;
-- publish advisory liquidity views or route suggestions; and
+- publish reproducible liquidity views derived from indexed public contracts;
+  and
 - relay a fully signed transaction.
 
 It does not hold LP inventory, reserve quote inputs, receive wallet secrets,
@@ -205,26 +212,25 @@ a protocol commitment.
 
 ### Phase 0: scope and documentation alignment
 
-- Inventory known `MakerOrderV1` outputs, published contract identities,
-  activation behavior, and the ability for third parties to create new
-  instances.
-- Record an explicit compatibility disposition for each surface:
+ADR 0006 completes the scope and compatibility decision:
 
-  | Surface | Production-launch question |
-  |---|---|
-  | Creation and routing | Is new maker-order creation removed from supported client flows? |
-  | Recognition and indexing | Must nodes continue to recognize historical or newly appearing instances? |
-  | Cancellation and recovery | Which spend tools remain available to protect reachable funds? |
-  | RPC and wire variants | Are variants retained, deprecated, or removed through a version boundary? |
-  | Activation and capability reporting | Can a published contract remain usable even if no known output is currently funded? |
-  | CI and acceptance evidence | Which compatibility regressions remain live, and which tests become archived evidence? |
+| Surface | Accepted disposition |
+|---|---|
+| Creation and routing | Remove all official maker creation and routing |
+| Recognition and indexing | Remove maker registration, discovery, interpretation, and materialization |
+| Cancellation and recovery | Retain no legacy utility because no deployed output exists |
+| RPC, package, store, and ALPN | Remove maker variants in place and retain current version numbers |
+| Activation and capabilities | Remove maker and unused LMSR reservations |
+| CI and acceptance evidence | Replace maker-dependent generic gates; retain dated packets as historical evidence |
+| Existing alpha data | Delete or rebuild; no migration or compatibility decoding |
 
-- Record the RFQ-first launch decision in a superseding ADR.
+The remaining Phase 0 implementation work is:
+
 - Make the supported production creation and routing scope consistently
   market-only across the protocol, README, architecture, RPC, and acceptance
-  docs while explicitly documenting any retained maker compatibility surfaces.
+  docs.
 - Preserve the maker-order audit and acceptance work as dated historical
-  evidence.
+  evidence with immutable source references.
 - Define the RFQ process as separate from `deadcat-node`.
 
 ### Phase 1: one noncustodial RFQ provider
@@ -909,23 +915,19 @@ three independently designed fragment layouts compose safely.
 
 ## Documentation follow-up
 
-After this direction is accepted and before production scope changes:
+ADR 0006 accepted the direction, superseded the release-scope decision in
+[ADR 0002](adr/0002-v1-contract-scope.md), and retired
+[ADR 0003](adr/0003-order-economics.md) as historical. Before production scope
+changes ship:
 
-1. add an ADR for RFQ-first liquidity and client-side multi-venue routing;
-2. mark the
-   [existing two-contract scope ADR](adr/0002-v1-contract-scope.md) as
-   superseded rather than rewriting its historical decision;
-3. classify the
-   [maker-order economics ADR](adr/0003-order-economics.md) as historical or
-   compatibility-only;
-4. update the [README](../README.md) and
+1. update the [README](../README.md) and
    [architecture](architecture.md) to distinguish the keyless node from the
    inventory-bearing RFQ service;
-5. mark the [existing implementation plan](implementation-plan.md) as a
+2. mark the [existing implementation plan](implementation-plan.md) as a
    completed alpha record;
-6. update the protocol and storage/RPC specifications alongside actual code
+3. update the protocol and storage/RPC specifications alongside actual code
    removal or capability changes;
-7. preserve dated maker-order audits and acceptance packets with explicit
-   deferred dispositions; and
-8. retain the heterogeneous multi-contract acceptance result as evidence for
-   future atomic composition.
+4. preserve dated maker-order audits and acceptance packets with immutable
+   source references; and
+5. retain the heterogeneous multi-contract acceptance result as evidence for
+   future atomic composition while replacing its active maker-dependent gate.

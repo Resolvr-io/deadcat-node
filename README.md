@@ -8,9 +8,9 @@ The node is deliberately not a wallet. Keys, wallet discovery, route selection,
 PSET construction, confidential-transaction blinding, intent validation, and
 signing stay on the client.
 
-## V1 scope
+## Current alpha scope
 
-V1 includes:
+The current alpha includes:
 
 - a binary prediction-market covenant that enforces collateral solvency;
 - a persistent maker limit-order covenant;
@@ -18,9 +18,12 @@ V1 includes:
 - transaction-atomic, reorg-aware redb persistence; and
 - an evidence-first Iroh RPC for hosted and self-hosted nodes.
 
-An LMSR pool is part of the long-term protocol shape but is not implemented in
-the first milestone. Until it exists, the protocol exposes best bid, best ask,
-spread, and last fill, but no canonical continuous market price.
+This is not the selected production scope.
+[ADR 0006](docs/adr/0006-rfq-first-liquidity-scope.md) accepts a market-only
+first public release with a separate noncustodial RFQ service and client-owned
+routing. `MakerOrderV1`, node-side advisory routing, and the unused LMSR
+reservation remain in the alpha tree only until the accepted removal work
+lands. Future AMM and DLOB designs are intentionally undecided.
 
 ## Status
 

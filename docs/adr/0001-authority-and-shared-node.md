@@ -2,6 +2,8 @@
 
 - Status: Accepted
 - Date: 2026-07-12
+- Amended by: [ADR 0006](0006-rfq-first-liquidity-scope.md), which removes
+  node-side route suggestions and assigns venue routing exclusively to clients
 
 ## Context
 
@@ -33,7 +35,7 @@ The node:
 - follows confirmed chain state;
 - stores current state and ordered transition evidence;
 - serves snapshots, histories, subscriptions, and raw transactions;
-- provides advisory fee estimates and optional route suggestions; and
+- provides advisory fee estimates; and
 - may relay a fully signed transaction.
 
 The node never receives wallet seeds, xpubs, descriptors, private keys,
@@ -50,9 +52,10 @@ The client:
 - constructs, blinds, inspects, and signs PSETs locally; and
 - can relay through the node or an independent broadcaster.
 
-The node may return a candidate route, but it is advisory. The client verifies
-the route's inputs, outputs, assets, amounts, fees, change, contract witnesses,
-and accepted slippage before signing.
+The node may return indexed venue state and fee estimates, but the client
+discovers venues and selects its route locally. It verifies the route's inputs,
+outputs, assets, amounts, fees, change, contract witnesses, and accepted
+slippage before signing.
 
 ## Residual hosted-node trust
 
@@ -62,8 +65,8 @@ that a single server supplied a complete or current view of the chain.
 A hosted node can still:
 
 - serve an old but internally valid tip;
-- omit a resolution, cancellation, fill, order, or better liquidity source;
-- provide a suboptimal route or inflated fee estimate;
+- omit a resolution, cancellation, fill, order, or public liquidity source;
+- provide an inflated fee estimate;
 - withhold transaction relay; or
 - learn which markets a client queries and when it broadcasts.
 
