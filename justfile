@@ -22,7 +22,8 @@ clippy: generate
     cargo clippy --locked --workspace --all-targets -- -D warnings
 
 test: generate
-    cargo test --locked --workspace
+    cargo nextest run --locked --workspace
+    cargo test --locked --workspace --doc
 
 # Run the production-shaped A/B binary-market lifecycle against an isolated
 # liquidregtest elementsd + Electrs pair.
