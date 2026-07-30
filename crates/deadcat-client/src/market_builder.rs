@@ -36,7 +36,7 @@ use elements::{
 };
 use rand::SeedableRng as _;
 use rand::rngs::StdRng;
-use simplex::program::{ProgramTrait as _, WitnessTrait as _};
+use simplex::program::WitnessTrait as _;
 use thiserror::Error;
 
 /// Network-known assets needed to verify a compact market recovery hint.
@@ -281,10 +281,26 @@ impl BinaryMarketTransitionPlan {
         attestation: Option<OracleAttestation>,
     ) -> Result<Self, MarketBuilderError> {
         let compiled = compile(params)?;
+        Self::new_with_compiled(&compiled, before, action, live, attestation)
+    }
+
+    /// Build a transition plan from an already compiled canonical market.
+    ///
+    /// Callers processing multiple transitions for the same market can reuse
+    /// one compilation instead of recompiling the parameterized covenant for
+    /// every plan.
+    pub fn new_with_compiled(
+        compiled: &CompiledBinaryMarket,
+        before: BinaryMarketState,
+        action: BinaryMarketAction,
+        live: BinaryMarketLiveInputs,
+        attestation: Option<OracleAttestation>,
+    ) -> Result<Self, MarketBuilderError> {
+        let params = compiled.params();
         let economics = BinaryMarketEconomics::new(params.base_payout)?;
         let applied = economics.apply(before, action)?;
         let path = select_path(before, action, applied)?;
-        validate_live_shape(&compiled, params, before, path, &live)?;
+        validate_live_shape(compiled, params, before, path, &live)?;
         let oracle_signature = validate_attestation(params, action, attestation)?;
         let (tokens_burned, redeem_yes) = match action {
             BinaryMarketAction::Redeem { outcome, tokens } => {
@@ -368,7 +384,7 @@ impl BinaryMarketTransitionPlan {
 
         append_non_rt_outputs(
             &mut output_templates,
-            &compiled,
+            compiled,
             params,
             path,
             applied,
@@ -517,14 +533,33 @@ impl BinaryMarketTransitionPlan {
         output_base: usize,
         network: &SimplicityNetwork,
     ) -> Result<(), MarketBuilderError> {
+        let compiled = compile(self.params)?;
+        self.finalize_with_compiled(&compiled, pset, input_base, output_base, network)
+    }
+
+    /// Finalize with the compiled market used to create this plan.
+    ///
+    /// This is the reusable-compilation counterpart to [`Self::finalize`].
+    pub fn finalize_with_compiled(
+        &self,
+        compiled: &CompiledBinaryMarket,
+        pset: &mut PartiallySignedTransaction,
+        input_base: usize,
+        output_base: usize,
+        network: &SimplicityNetwork,
+    ) -> Result<(), MarketBuilderError> {
+        if compiled.params() != self.params {
+            return Err(MarketBuilderError::CompiledParamsMismatch);
+        }
         let mut staged = pset.clone();
-        self.finalize_staged(&mut staged, input_base, output_base, network)?;
+        self.finalize_staged(compiled, &mut staged, input_base, output_base, network)?;
         *pset = staged;
         Ok(())
     }
 
     fn finalize_staged(
         &self,
+        compiled: &CompiledBinaryMarket,
         pset: &mut PartiallySignedTransaction,
         input_base: usize,
         output_base: usize,
@@ -537,7 +572,7 @@ impl BinaryMarketTransitionPlan {
         {
             return Err(MarketBuilderError::MissingWitnessUtxo);
         }
-        self.verify_inputs(pset, input_base)?;
+        self.verify_inputs(compiled, pset, input_base)?;
         self.verify_expiry(pset, input_base)?;
         for (index, expected) in self.mandatory_outputs(output_base)? {
             let actual = pset
@@ -596,7 +631,6 @@ impl BinaryMarketTransitionPlan {
             )?;
         }
 
-        let compiled = compile(self.params)?;
         let output_base_u32 =
             u32::try_from(output_base).map_err(|_| MarketBuilderError::IndexOverflow)?;
         let input_slots = self.input_slots();
@@ -621,9 +655,7 @@ impl BinaryMarketTransitionPlan {
                 redeem_yes: self.redeem_yes,
             };
             let stack = compiled
-                .program(slot)
-                .as_ref()
-                .finalize(pset, &witness.build_witness(), input_index, network)
+                .finalize(slot, pset, &witness.build_witness(), input_index, network)
                 .map_err(|error| MarketBuilderError::Covenant(error.to_string()))?;
             let stack =
                 crate::simplicity::ensure_budget(stack).map_err(MarketBuilderError::Covenant)?;
@@ -637,10 +669,10 @@ impl BinaryMarketTransitionPlan {
 
     fn verify_inputs(
         &self,
+        compiled: &CompiledBinaryMarket,
         pset: &PartiallySignedTransaction,
         input_base: usize,
     ) -> Result<(), MarketBuilderError> {
-        let compiled = compile(self.params)?;
         let slots = self.input_slots();
         let indices = self.contract_input_indices(input_base)?;
         for (index, slot) in indices.iter().copied().zip(slots.iter().copied()) {
@@ -1442,6 +1474,8 @@ pub enum MarketBuilderError {
     RtCommitment(#[from] RtCommitmentError),
     #[error("contract compilation failed: {0}")]
     Compilation(String),
+    #[error("compiled binary-market parameters do not match the transition plan")]
+    CompiledParamsMismatch,
     #[error("market recovery hint disagrees with the supplied parameters")]
     RecoveryHintMismatch,
     #[error("the recovery hint uses a collateral index unavailable on this network")]
