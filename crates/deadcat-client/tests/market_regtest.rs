@@ -3,7 +3,8 @@
 //! This test is ignored by ordinary `cargo test` because it starts an isolated
 //! `elementsd` + Electrs pair. It is required by `just ci` through the explicit
 //! `just regtest` suite. Its focused recipes are `just regtest-market-ab` and
-//! `just regtest-maker-orders`, `just regtest-multi-contract`,
+//! `just regtest-maker-orders`, `just regtest-multi-market`,
+//! `just regtest-multi-contract`,
 //! `just regtest-backend-equivalence`, and `just regtest-process-boundary`.
 
 #[path = "support/process.rs"]
@@ -569,6 +570,33 @@ fn assert_rt_pair(
     }
 }
 
+fn assert_rt_pair_at(
+    transaction: &Transaction,
+    output_base: usize,
+    params: BinaryMarketParams,
+    side: RtSide,
+) {
+    let yes = &transaction.output[output_base];
+    let no = &transaction.output[output_base + 1];
+    assert_eq!(
+        infer_side(
+            RtLeg::Yes,
+            params.yes_reissuance_token_id,
+            yes.asset,
+            yes.value,
+        ),
+        Ok(side)
+    );
+    assert_eq!(
+        infer_side(RtLeg::No, params.no_reissuance_token_id, no.asset, no.value,),
+        Ok(side)
+    );
+    assert!(yes.witness.rangeproof.is_some());
+    assert!(no.witness.rangeproof.is_some());
+    assert!(yes.witness.surjection_proof.is_some());
+    assert!(no.witness.surjection_proof.is_some());
+}
+
 fn assert_reissuances(
     transaction: &Transaction,
     entropies: MarketIssuanceEntropies,
@@ -576,6 +604,27 @@ fn assert_reissuances(
     pairs: u64,
 ) {
     for (input, entropy) in transaction.input[..2]
+        .iter()
+        .zip([entropies.yes, entropies.no])
+    {
+        assert_eq!(
+            input.asset_issuance.asset_blinding_nonce,
+            Tweak::from_inner(side.abf()).expect("side ABF")
+        );
+        assert_eq!(input.asset_issuance.asset_entropy, entropy);
+        assert_eq!(input.asset_issuance.amount, Value::Explicit(pairs));
+        assert_eq!(input.asset_issuance.inflation_keys, Value::Null);
+    }
+}
+
+fn assert_reissuances_at(
+    transaction: &Transaction,
+    input_base: usize,
+    entropies: MarketIssuanceEntropies,
+    side: RtSide,
+    pairs: u64,
+) {
+    for (input, entropy) in transaction.input[input_base..input_base + 2]
         .iter()
         .zip([entropies.yes, entropies.no])
     {
@@ -728,6 +777,12 @@ struct ComposedTransactionPlans {
     market: BinaryMarketTransitionPlan,
     sell_base: MakerFillPlan,
     sell_quote: MakerFillPlan,
+}
+
+#[derive(Clone)]
+struct ComposedMarketPlans {
+    first: BinaryMarketTransitionPlan,
+    second: BinaryMarketTransitionPlan,
 }
 
 fn explicit_value(txout: &TxOut) -> u64 {
@@ -1055,6 +1110,174 @@ fn build_composed_issuance_and_maker_fills(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn build_composed_mixed_market_issuances(
+    signer: &Signer,
+    network: &SimplicityNetwork,
+    first: &CreatedMarket,
+    first_before: BinaryMarketState,
+    first_live: &BinaryMarketLiveInputs,
+    first_collateral_txout: &TxOut,
+    first_pairs: u64,
+    second: &CreatedMarket,
+    second_before: BinaryMarketState,
+    second_live: &BinaryMarketLiveInputs,
+    second_pairs: u64,
+    funding: &Funding,
+) -> (PartiallySignedTransaction, ComposedMarketPlans) {
+    let first_plan = BinaryMarketTransitionPlan::new(
+        first.params,
+        first_before,
+        BinaryMarketAction::Issue { pairs: first_pairs },
+        first_live.clone(),
+        None,
+    )
+    .expect("first composed market issuance plan");
+    let second_plan = BinaryMarketTransitionPlan::new(
+        second.params,
+        second_before,
+        BinaryMarketAction::Issue {
+            pairs: second_pairs,
+        },
+        second_live.clone(),
+        None,
+    )
+    .expect("second composed market issuance plan");
+
+    let first_yes = first_live.yes_rt.as_ref().expect("first live YES RT");
+    let first_no = first_live.no_rt.as_ref().expect("first live NO RT");
+    let second_yes = second_live.yes_rt.as_ref().expect("second live YES RT");
+    let second_no = second_live.no_rt.as_ref().expect("second live NO RT");
+    let mut pset = PartiallySignedTransaction::new_v2();
+    pset.add_input(pset_input(first_yes.outpoint, first_yes.txout.clone()));
+    pset.add_input(pset_input(first_no.outpoint, first_no.txout.clone()));
+    pset.add_input(pset_input(
+        first_live.collateral.expect("first live market collateral"),
+        first_collateral_txout.clone(),
+    ));
+    pset.add_input(pset_input(second_yes.outpoint, second_yes.txout.clone()));
+    pset.add_input(pset_input(second_no.outpoint, second_no.txout.clone()));
+    assert!(
+        second_live.collateral.is_none(),
+        "second market must use the two-input initial-issuance path"
+    );
+    pset.add_input(pset_input(funding.outpoint, funding.txout.clone()));
+
+    // The three-input subsequent issuance and two-input initial issuance own
+    // disjoint three-output windows. Neither plan assumes that its window
+    // begins at zero or that it owns the complete transaction.
+    for (_, output) in first_plan
+        .mandatory_outputs(0)
+        .expect("first composed market outputs")
+    {
+        pset.add_output(PsetOutput::from_txout(output));
+    }
+    for (_, output) in second_plan
+        .mandatory_outputs(3)
+        .expect("second composed market outputs")
+    {
+        pset.add_output(PsetOutput::from_txout(output));
+    }
+    for (asset, value) in [
+        (first.params.yes_token_asset_id, first_pairs),
+        (first.params.no_token_asset_id, first_pairs),
+        (second.params.yes_token_asset_id, second_pairs),
+        (second.params.no_token_asset_id, second_pairs),
+    ] {
+        pset.add_output(PsetOutput::from_txout(explicit_txout(
+            asset,
+            value,
+            signer.get_address().script_pubkey(),
+        )));
+    }
+
+    let first_economics =
+        BinaryMarketEconomics::new(first.params.base_payout).expect("first economics");
+    let second_economics =
+        BinaryMarketEconomics::new(second.params.base_payout).expect("second economics");
+    let BinaryMarketState::Trading {
+        outstanding_pairs: first_old_pairs,
+    } = first_before
+    else {
+        panic!("first composed issuance must start in Trading")
+    };
+    let BinaryMarketState::Trading {
+        outstanding_pairs: first_new_pairs,
+    } = first_plan.after()
+    else {
+        panic!("first composed issuance must end in Trading")
+    };
+    let BinaryMarketState::Trading {
+        outstanding_pairs: second_old_pairs,
+    } = second_before
+    else {
+        panic!("second composed issuance must start in Trading")
+    };
+    let BinaryMarketState::Trading {
+        outstanding_pairs: second_new_pairs,
+    } = second_plan.after()
+    else {
+        panic!("second composed issuance must end in Trading")
+    };
+    let first_old_collateral = first_economics
+        .collateral_for_pairs(first_old_pairs)
+        .expect("first old collateral");
+    let first_new_collateral = first_economics
+        .collateral_for_pairs(first_new_pairs)
+        .expect("first new collateral");
+    let second_old_collateral = second_economics
+        .collateral_for_pairs(second_old_pairs)
+        .expect("second old collateral");
+    let second_new_collateral = second_economics
+        .collateral_for_pairs(second_new_pairs)
+        .expect("second new collateral");
+    assert_eq!(explicit_value(first_collateral_txout), first_old_collateral);
+    assert_eq!(second_old_collateral, 0);
+    let funding_change = FUNDING_VALUE
+        .checked_add(first_old_collateral)
+        .and_then(|value| value.checked_add(second_old_collateral))
+        .and_then(|value| value.checked_sub(first_new_collateral))
+        .and_then(|value| value.checked_sub(second_new_collateral))
+        .and_then(|value| value.checked_sub(FEE))
+        .expect("two-market funding change");
+    pset.add_output(PsetOutput::from_txout(explicit_txout(
+        first.params.collateral_asset_id,
+        funding_change,
+        signer.get_address().script_pubkey(),
+    )));
+    pset.add_output(PsetOutput::from_txout(TxOut::new_fee(
+        FEE,
+        first.params.collateral_asset_id,
+    )));
+    assert_eq!(
+        first.params.collateral_asset_id,
+        second.params.collateral_asset_id
+    );
+    assert_eq!(pset.inputs().len(), 6);
+    assert_eq!(pset.outputs().len(), 12);
+
+    first_plan
+        .configure_reissuance_inputs(&mut pset, 0, first.entropies)
+        .expect("configure first composed reissuances");
+    second_plan
+        .configure_reissuance_inputs(&mut pset, 3, second.entropies)
+        .expect("configure second composed reissuances");
+    first_plan
+        .finalize(&mut pset, 0, 0, network)
+        .expect("finalize first composed market covenants");
+    second_plan
+        .finalize(&mut pset, 3, 3, network)
+        .expect("finalize second composed market covenants");
+
+    (
+        pset,
+        ComposedMarketPlans {
+            first: first_plan,
+            second: second_plan,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_sell_base_fill(
     signer: &Signer,
     network: &SimplicityNetwork,
@@ -1338,7 +1561,7 @@ fn node_elements_auth(auth: &Auth) -> ElementsRpcAuth {
     }
 }
 
-fn maker_rpc_config(
+fn node_rpc_config(
     _genesis_hash: BlockHash,
     _policy_asset: AssetId,
     _baseline: ChainAnchor,
@@ -3494,7 +3717,7 @@ async fn maker_order_lifecycle_is_accepted_by_elementsd() {
     let handler = NodeRpcHandler::new(
         Arc::clone(&source),
         Arc::clone(&store),
-        maker_rpc_config(genesis_hash, policy_asset, baseline, resolution_tip),
+        node_rpc_config(genesis_hash, policy_asset, baseline, resolution_tip),
     )
     .expect("production node RPC handler");
     eprintln!("DEADCAT_MAKER_REGTEST_PHASE=package_registration");
@@ -3845,7 +4068,7 @@ async fn maker_order_lifecycle_is_accepted_by_elementsd() {
     let reopened_handler = NodeRpcHandler::new(
         Arc::clone(&source),
         Arc::clone(&reopened),
-        maker_rpc_config(genesis_hash, policy_asset, baseline, final_tip),
+        node_rpc_config(genesis_hash, policy_asset, baseline, final_tip),
     )
     .expect("reopened production node RPC handler");
     let Response::RegistrationAccepted {
@@ -3940,6 +4163,1102 @@ async fn maker_order_lifecycle_is_accepted_by_elementsd() {
     eprintln!(
         "DEADCAT_MAKER_REGTEST_METRICS={}",
         serde_json::to_string(&report).expect("serialize maker metrics")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "starts elementsd and liquid-enabled Electrs from the Nix development shell"]
+async fn multi_market_transaction_is_accepted_and_indexed_by_elementsd() {
+    const FIRST_INITIAL_PAIRS: u64 = 30;
+    const FIRST_COMPOSED_PAIRS: u64 = 10;
+    const SECOND_COMPOSED_PAIRS: u64 = 7;
+
+    let (client, signer) =
+        Regtest::from_config(&RegtestConfig::default()).expect("regtest environment");
+    let network = SimplicityNetwork::default_regtest();
+    let policy_asset = network.policy_asset();
+    let miner = ElementsRpc::new(client.rpc_url(), client.auth()).expect("Elements RPC");
+    let rpc = Client::new(&client.rpc_url(), client.auth()).expect("raw Elements RPC");
+    let genesis_hash = BlockHash::from_str(
+        &rpc.get_block_hash(0)
+            .expect("regtest genesis block")
+            .to_string(),
+    )
+    .expect("Elements genesis hash");
+    let (_funding_tx, funding_accepted, funding) =
+        prepare_funding(&signer, &rpc, &miner, policy_asset);
+    let baseline = ChainAnchor {
+        height: u32::try_from(funding_accepted.block_height).expect("baseline height"),
+        hash: BlockHash::from_str(&funding_accepted.block_hash).expect("baseline hash"),
+    };
+    let expiry_height = baseline.height.checked_add(1_000).expect("future expiry");
+    let first_market = create_market(
+        &signer,
+        &rpc,
+        &miner,
+        policy_asset,
+        &funding[0],
+        &funding[1],
+        expiry_height,
+    );
+    let second_market = create_market(
+        &signer,
+        &rpc,
+        &miner,
+        policy_asset,
+        &funding[2],
+        &funding[3],
+        expiry_height,
+    );
+    let initial_state = BinaryMarketState::Trading {
+        outstanding_pairs: 0,
+    };
+    let (first_issuance, first_pre_state) = build_issuance(
+        &signer,
+        &network,
+        first_market.params,
+        first_market.entropies,
+        initial_state,
+        &dormant_live(&first_market.transaction),
+        None,
+        &funding[4],
+        FIRST_INITIAL_PAIRS,
+        RtSide::A,
+        false,
+    );
+    accept_broadcast_mine(&rpc, &miner, &first_issuance);
+    let second_pre_state = initial_state;
+    assert_eq!(
+        first_pre_state,
+        BinaryMarketState::Trading {
+            outstanding_pairs: FIRST_INITIAL_PAIRS,
+        }
+    );
+    assert_eq!(
+        second_pre_state,
+        BinaryMarketState::Trading {
+            outstanding_pairs: 0,
+        }
+    );
+
+    let source = Arc::new(
+        ElementsRpcChainSource::new(ElementsRpcConfig::new(
+            client.rpc_url(),
+            node_elements_auth(&client.auth()),
+        ))
+        .expect("production Elements chain source"),
+    );
+    let database_directory = tempfile::tempdir().expect("multi-market database directory");
+    let database_path = database_directory.path().join("deadcat.redb");
+    let store = Arc::new(Store::open(&database_path).expect("open multi-market store"));
+    store
+        .initialize_chain(
+            StoreChainIdentity {
+                network: LiquidNetwork::ElementsRegtest,
+                genesis_hash,
+                policy_asset,
+            },
+            baseline,
+        )
+        .expect("initialize multi-market chain");
+    let interpreter = DeadcatInterpreter::new(LiquidNetwork::ElementsRegtest, policy_asset);
+    eprintln!("DEADCAT_MULTI_MARKET_REGTEST_PHASE=initial_sync");
+    let SyncOutcome::Ready(initial_sync) =
+        SyncCoordinator::new(source.as_ref(), store.as_ref(), &interpreter)
+            .sync_to_tip()
+            .await
+            .expect("initial multi-market sync")
+    else {
+        panic!("initial multi-market sync unexpectedly required a rescan")
+    };
+    assert_eq!(initial_sync.blocks_applied, 3);
+
+    let first_id = ContractId::new(OutPoint::new(first_market.transaction.txid(), 0));
+    let second_id = ContractId::new(OutPoint::new(second_market.transaction.txid(), 0));
+    assert_ne!(first_id, second_id);
+    assert_eq!(stored_market_state(&store, first_id), first_pre_state);
+    assert_eq!(stored_market_state(&store, second_id), second_pre_state);
+    assert_tracked_outpoints(
+        &store,
+        first_id,
+        vec![
+            (
+                BinaryMarketSlot::UnresolvedYesRt as u8,
+                OutPoint::new(first_issuance.txid(), 0),
+            ),
+            (
+                BinaryMarketSlot::UnresolvedNoRt as u8,
+                OutPoint::new(first_issuance.txid(), 1),
+            ),
+            (
+                BinaryMarketSlot::UnresolvedCollateral as u8,
+                OutPoint::new(first_issuance.txid(), 2),
+            ),
+        ],
+    );
+    assert_tracked_outpoints(
+        &store,
+        second_id,
+        vec![
+            (
+                BinaryMarketSlot::DormantYesRt as u8,
+                OutPoint::new(second_market.transaction.txid(), 0),
+            ),
+            (
+                BinaryMarketSlot::DormantNoRt as u8,
+                OutPoint::new(second_market.transaction.txid(), 1),
+            ),
+        ],
+    );
+
+    let package = ContractPackage {
+        format_version: CONTRACT_PACKAGE_FORMAT_VERSION,
+        chain: ChainIdentity {
+            network: LiquidNetwork::ElementsRegtest,
+            genesis_hash,
+        },
+        roots: vec![first_id, second_id],
+        declarations: vec![
+            ContractDeclaration {
+                contract_id: first_id,
+                descriptor: ContractDescriptor::BinaryMarketV1 {
+                    params: first_market.params,
+                },
+            },
+            ContractDeclaration {
+                contract_id: second_id,
+                descriptor: ContractDescriptor::BinaryMarketV1 {
+                    params: second_market.params,
+                },
+            },
+        ],
+    };
+    let registration_tip = source.tip().await.expect("registration tip");
+    let handler = NodeRpcHandler::new(
+        Arc::clone(&source),
+        Arc::clone(&store),
+        node_rpc_config(genesis_hash, policy_asset, baseline, registration_tip),
+    )
+    .expect("multi-market RPC handler");
+    eprintln!("DEADCAT_MULTI_MARKET_REGTEST_PHASE=package_registration");
+    let Response::RegistrationAccepted { registration } = node_response(
+        &handler,
+        Request::RegisterContractPackage {
+            package: package.clone(),
+            bearer_token: None,
+        },
+    )
+    .await
+    else {
+        panic!("multi-market registration returned the wrong response")
+    };
+    assert_eq!(registration.roots, package.roots);
+    assert_eq!(registration.contracts.len(), 2);
+    assert!(
+        registration
+            .contracts
+            .iter()
+            .all(|receipt| receipt.already_registered)
+    );
+    let first_pre_history = store
+        .contract_history(first_id)
+        .expect("first pre-composition market history");
+    let second_pre_history = store
+        .contract_history(second_id)
+        .expect("second pre-composition market history");
+    assert_eq!(first_pre_history.len(), 1);
+    assert!(second_pre_history.is_empty());
+    assert_eq!(first_pre_history[0].txid, first_issuance.txid());
+
+    let (base_pset, plans) = build_composed_mixed_market_issuances(
+        &signer,
+        &network,
+        &first_market,
+        first_pre_state,
+        &active_live(&first_issuance),
+        &first_issuance.output[2],
+        FIRST_COMPOSED_PAIRS,
+        &second_market,
+        second_pre_state,
+        &dormant_live(&second_market.transaction),
+        SECOND_COMPOSED_PAIRS,
+        &funding[5],
+    );
+    let first_post_state = BinaryMarketState::Trading {
+        outstanding_pairs: FIRST_INITIAL_PAIRS + FIRST_COMPOSED_PAIRS,
+    };
+    let second_post_state = BinaryMarketState::Trading {
+        outstanding_pairs: SECOND_COMPOSED_PAIRS,
+    };
+    assert_eq!(plans.first.after(), first_post_state);
+    assert_eq!(plans.second.after(), second_post_state);
+    assert_eq!(plans.first.path() as u8, 1);
+    assert_eq!(plans.second.path() as u8, 0);
+
+    // Keep the first market leg and all asset/value balances valid while
+    // redirecting only the second market's collateral continuation. The
+    // second covenant must reject, making the complete transaction invalid.
+    let mut wrong_second_continuation = base_pset.clone();
+    assert_ne!(
+        wrong_second_continuation.outputs()[5].script_pubkey,
+        signer.get_address().script_pubkey()
+    );
+    wrong_second_continuation.outputs_mut()[5].script_pubkey = signer.get_address().script_pubkey();
+    sign_input(&signer, &mut wrong_second_continuation, 5);
+    let wrong_second_continuation = wrong_second_continuation
+        .extract_tx()
+        .expect("balanced wrong-second-market transaction");
+    let wrong_second_rejection = assert_mempool_rejects(
+        &rpc,
+        &wrong_second_continuation,
+        "multi_market_wrong_second_collateral_continuation",
+    );
+
+    let mut valid_pset = base_pset;
+    sign_input(&signer, &mut valid_pset, 5);
+    let composed = valid_pset
+        .extract_tx()
+        .expect("composed two-market transaction");
+    assert_eq!(composed.input.len(), 6);
+    assert_eq!(composed.output.len(), 12);
+    assert_reissuances_at(
+        &composed,
+        0,
+        first_market.entropies,
+        RtSide::B,
+        FIRST_COMPOSED_PAIRS,
+    );
+    assert_reissuances_at(
+        &composed,
+        3,
+        second_market.entropies,
+        RtSide::A,
+        SECOND_COMPOSED_PAIRS,
+    );
+    assert_rt_pair_at(&composed, 0, first_market.params, RtSide::A);
+    assert_rt_pair_at(&composed, 3, second_market.params, RtSide::B);
+    assert_eq!(composed.output[2].value, Value::Explicit(8_000));
+    assert_eq!(composed.output[5].value, Value::Explicit(1_400));
+    assert_eq!(
+        composed.output[10].value,
+        Value::Explicit(
+            FUNDING_VALUE - (FIRST_COMPOSED_PAIRS + SECOND_COMPOSED_PAIRS) * BASE_PAYOUT * 2 - FEE
+        )
+    );
+    assert_eq!(composed.output[11].value, Value::Explicit(FEE));
+    eprintln!("DEADCAT_MULTI_MARKET_REGTEST_PHASE=consensus_acceptance");
+    let composed_accepted = accept_broadcast_mine(&rpc, &miner, &composed);
+    let original_block_hash =
+        BlockHash::from_str(&composed_accepted.block_hash).expect("original composed block hash");
+    let before_composed_cursor = store
+        .event_high_watermark()
+        .expect("event cursor before composed indexing");
+
+    eprintln!("DEADCAT_MULTI_MARKET_REGTEST_PHASE=atomic_indexing");
+    let SyncOutcome::Ready(applied) =
+        SyncCoordinator::new(source.as_ref(), store.as_ref(), &interpreter)
+            .sync_to_tip()
+            .await
+            .expect("index composed two-market transaction")
+    else {
+        panic!("composed two-market sync unexpectedly required a rescan")
+    };
+    assert_eq!(applied.blocks_applied, 1);
+    assert_eq!(applied.blocks_rolled_back, 0);
+    assert_eq!(stored_market_state(&store, first_id), first_post_state);
+    assert_eq!(stored_market_state(&store, second_id), second_post_state);
+    assert_tracked_outpoints(
+        &store,
+        first_id,
+        vec![
+            (
+                BinaryMarketSlot::UnresolvedYesRt as u8,
+                OutPoint::new(composed.txid(), 0),
+            ),
+            (
+                BinaryMarketSlot::UnresolvedNoRt as u8,
+                OutPoint::new(composed.txid(), 1),
+            ),
+            (
+                BinaryMarketSlot::UnresolvedCollateral as u8,
+                OutPoint::new(composed.txid(), 2),
+            ),
+        ],
+    );
+    assert_tracked_outpoints(
+        &store,
+        second_id,
+        vec![
+            (
+                BinaryMarketSlot::UnresolvedYesRt as u8,
+                OutPoint::new(composed.txid(), 3),
+            ),
+            (
+                BinaryMarketSlot::UnresolvedNoRt as u8,
+                OutPoint::new(composed.txid(), 4),
+            ),
+            (
+                BinaryMarketSlot::UnresolvedCollateral as u8,
+                OutPoint::new(composed.txid(), 5),
+            ),
+        ],
+    );
+    for spent in [
+        OutPoint::new(first_issuance.txid(), 0),
+        OutPoint::new(first_issuance.txid(), 1),
+        OutPoint::new(first_issuance.txid(), 2),
+        OutPoint::new(second_market.transaction.txid(), 0),
+        OutPoint::new(second_market.transaction.txid(), 1),
+    ] {
+        assert!(
+            store
+                .outpoint_owner(spent)
+                .expect("read spent owner")
+                .is_none()
+        );
+    }
+
+    let first_post_history = store
+        .contract_history(first_id)
+        .expect("first post-composition market history");
+    let second_post_history = store
+        .contract_history(second_id)
+        .expect("second post-composition market history");
+    assert_eq!(first_post_history.len(), 2);
+    assert_eq!(second_post_history.len(), 1);
+    let first_entry = first_post_history
+        .iter()
+        .find(|entry| entry.txid == composed.txid())
+        .expect("first composed market transition");
+    let second_entry = second_post_history
+        .iter()
+        .find(|entry| entry.txid == composed.txid())
+        .expect("second composed market transition");
+    let original_position = first_entry.position;
+    assert_eq!(second_entry.position, original_position);
+    assert_eq!(
+        original_position.block_height,
+        u32::try_from(composed_accepted.block_height).expect("composed height")
+    );
+    for (entry, before, after, plan) in [
+        (first_entry, first_pre_state, first_post_state, &plans.first),
+        (
+            second_entry,
+            second_pre_state,
+            second_post_state,
+            &plans.second,
+        ),
+    ] {
+        assert_eq!(entry.old_state, ContractState::BinaryMarket(before));
+        assert_eq!(entry.new_state, ContractState::BinaryMarket(after));
+        assert_eq!(entry.transition.kind, TRANSITION_V1_MARKET_ISSUED);
+        let BinaryMarketTransition::Issued {
+            pairs,
+            collateral_locked,
+        } = plan.transition()
+        else {
+            panic!("composed market plan was not an issuance")
+        };
+        let mut expected_payload = vec![plan.path() as u8];
+        expected_payload.extend_from_slice(&pairs.to_be_bytes());
+        expected_payload.extend_from_slice(&collateral_locked.to_be_bytes());
+        assert_eq!(entry.transition.payload, expected_payload);
+    }
+
+    let mut expected_affected = vec![first_id, second_id];
+    expected_affected.sort();
+    let expected_markets = expected_affected.clone();
+    let composed_events = store
+        .events_after(Some(before_composed_cursor), 100)
+        .expect("events from composed indexing");
+    let applied_events = composed_events
+        .iter()
+        .filter(|event| {
+            matches!(
+                &event.event,
+                StoredEvent::TransactionApplied { txid, .. } if *txid == composed.txid()
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(applied_events.len(), 1);
+    let StoredEvent::TransactionApplied {
+        anchor,
+        txid,
+        position,
+        affected_contract_ids,
+        affected_market_ids,
+    } = &applied_events[0].event
+    else {
+        unreachable!("filtered to the composed TransactionApplied event")
+    };
+    assert_eq!(
+        *anchor,
+        ChainAnchor {
+            height: original_position.block_height,
+            hash: original_block_hash,
+        }
+    );
+    assert_eq!(*txid, composed.txid());
+    assert_eq!(*position, original_position);
+    assert_eq!(affected_contract_ids, &expected_affected);
+    assert_eq!(affected_market_ids, &expected_markets);
+    let post_apply_cursor = store
+        .event_high_watermark()
+        .expect("event cursor after composed indexing");
+    let original_evidence = store
+        .transaction(original_position)
+        .expect("read composed evidence")
+        .expect("one shared composed evidence row");
+    assert_eq!(original_evidence.block_hash, original_block_hash);
+    assert_eq!(original_evidence.txid, composed.txid());
+    assert_eq!(
+        original_evidence.raw_tx,
+        elements::encode::serialize(&composed)
+    );
+    assert_eq!(original_evidence.affected_contract_ids, expected_affected);
+    for (vout, expected_output) in composed.output.iter().enumerate() {
+        let stored = store
+            .output(OutPoint::new(composed.txid(), vout as u32))
+            .expect("read composed output evidence")
+            .expect("composed output reference");
+        assert_eq!(stored.position, original_position);
+        assert_eq!(&stored.output, expected_output);
+    }
+
+    drop(handler);
+    drop(store);
+    eprintln!("DEADCAT_MULTI_MARKET_REGTEST_PHASE=restart");
+    let reopened = Arc::new(Store::open(&database_path).expect("reopen multi-market store"));
+    let SyncOutcome::Ready(restart_sync) =
+        SyncCoordinator::new(source.as_ref(), reopened.as_ref(), &interpreter)
+            .sync_to_tip()
+            .await
+            .expect("idempotent multi-market restart sync")
+    else {
+        panic!("restarted multi-market node unexpectedly required a rescan")
+    };
+    assert_eq!(restart_sync.blocks_applied, 0);
+    assert_eq!(restart_sync.blocks_rolled_back, 0);
+    assert_eq!(restart_sync.backfill_blocks_applied, 0);
+    assert_eq!(
+        reopened
+            .event_high_watermark()
+            .expect("restarted event cursor"),
+        post_apply_cursor
+    );
+    assert_eq!(
+        reopened
+            .contract_history(first_id)
+            .expect("restarted first history"),
+        first_post_history
+    );
+    assert_eq!(
+        reopened
+            .contract_history(second_id)
+            .expect("restarted second history"),
+        second_post_history
+    );
+    assert_eq!(
+        reopened
+            .transaction(original_position)
+            .expect("restarted composed evidence"),
+        Some(original_evidence.clone())
+    );
+
+    let mining_address = signer.get_address().to_unconfidential().to_string();
+    let mine_exact = |txids: Vec<String>| -> String {
+        let result: JsonValue = rpc
+            .call(
+                "generateblock",
+                &[json!(mining_address.clone()), json!(txids)],
+            )
+            .expect("mine exact multi-market regtest block");
+        result["hash"]
+            .as_str()
+            .expect("generateblock hash")
+            .to_owned()
+    };
+
+    // Move the shared transaction one block later on a two-block fork. Both
+    // histories and the one evidence row must move together.
+    let _original_successor_hash = mine_exact(vec![]);
+    let SyncOutcome::Ready(successor_sync) =
+        SyncCoordinator::new(source.as_ref(), reopened.as_ref(), &interpreter)
+            .sync_to_tip()
+            .await
+            .expect("index original empty successor")
+    else {
+        panic!("empty successor unexpectedly required a rescan")
+    };
+    assert_eq!(successor_sync.blocks_applied, 1);
+    let original_branch_tip = source.tip().await.expect("original branch tip");
+    let before_two_block_cursor = reopened
+        .event_high_watermark()
+        .expect("event cursor before two-block reorg");
+    let invalidated: JsonValue = rpc
+        .call(
+            "invalidateblock",
+            &[json!(composed_accepted.block_hash.clone())],
+        )
+        .expect("invalidate original composed block");
+    assert!(invalidated.is_null());
+    let two_block_ancestor = source.tip().await.expect("two-block reorg ancestor");
+    let empty_at_original_height = mine_exact(vec![]);
+    let moved_block_hash_string = mine_exact(vec![composed.txid().to_string()]);
+    assert_ne!(empty_at_original_height, composed_accepted.block_hash);
+    let moved_block_hash =
+        BlockHash::from_str(&moved_block_hash_string).expect("moved composed block hash");
+    eprintln!("DEADCAT_MULTI_MARKET_REGTEST_PHASE=two_block_reorg");
+    let SyncOutcome::Ready(two_block_reorg) =
+        SyncCoordinator::new(source.as_ref(), reopened.as_ref(), &interpreter)
+            .sync_to_tip()
+            .await
+            .expect("two-block composed reorg")
+    else {
+        panic!("two-block composed reorg exceeded retention")
+    };
+    assert_eq!(two_block_reorg.blocks_rolled_back, 2);
+    assert_eq!(two_block_reorg.blocks_applied, 2);
+    assert_eq!(stored_market_state(&reopened, first_id), first_post_state);
+    assert_eq!(stored_market_state(&reopened, second_id), second_post_state);
+    let moved_first_history = reopened
+        .contract_history(first_id)
+        .expect("moved first history");
+    let moved_second_history = reopened
+        .contract_history(second_id)
+        .expect("moved second history");
+    let moved_position = moved_first_history
+        .iter()
+        .find(|entry| entry.txid == composed.txid())
+        .expect("moved first market transition")
+        .position;
+    assert_eq!(
+        moved_position.block_height,
+        original_position.block_height + 1
+    );
+    assert_eq!(
+        moved_second_history
+            .iter()
+            .find(|entry| entry.txid == composed.txid())
+            .expect("moved second market transition")
+            .position,
+        moved_position
+    );
+    let two_block_events = reopened
+        .events_after(Some(before_two_block_cursor), 100)
+        .expect("events from two-block reorg");
+    let rollback_events = two_block_events
+        .iter()
+        .filter(|event| matches!(&event.event, StoredEvent::ChainRolledBack { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(rollback_events.len(), 1);
+    let StoredEvent::ChainRolledBack {
+        old_tip,
+        new_tip,
+        orphaned_positions,
+        affected_contract_ids,
+        affected_market_ids,
+    } = &rollback_events[0].event
+    else {
+        unreachable!("filtered to a ChainRolledBack event")
+    };
+    assert_eq!(*old_tip, original_branch_tip);
+    assert_eq!(*new_tip, two_block_ancestor);
+    assert_eq!(orphaned_positions, &[original_position]);
+    assert_eq!(affected_contract_ids, &expected_affected);
+    assert_eq!(affected_market_ids, &expected_markets);
+    let moved_applied_events = two_block_events
+        .iter()
+        .filter(|event| {
+            matches!(
+                &event.event,
+                StoredEvent::TransactionApplied { txid, .. } if *txid == composed.txid()
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(moved_applied_events.len(), 1);
+    assert!(
+        rollback_events[0].cursor.sequence < moved_applied_events[0].cursor.sequence,
+        "subscription consumers must observe rollback before replacement apply"
+    );
+    let moved_evidence = reopened
+        .transaction(moved_position)
+        .expect("moved evidence lookup")
+        .expect("moved shared evidence row");
+    assert_eq!(moved_evidence.block_hash, moved_block_hash);
+    assert_eq!(moved_evidence.raw_tx, original_evidence.raw_tx);
+    assert_eq!(moved_evidence.affected_contract_ids, expected_affected);
+    assert!(
+        reopened
+            .transaction(original_position)
+            .expect("orphaned original evidence lookup")
+            .is_none()
+    );
+
+    // Replace the moved transaction with an empty block. Both markets must
+    // return to their exact pre-transaction state in one coordinator update.
+    let moved_branch_tip = source.tip().await.expect("moved branch tip");
+    let before_one_block_cursor = reopened
+        .event_high_watermark()
+        .expect("event cursor before one-block rollback");
+    let invalidated: JsonValue = rpc
+        .call("invalidateblock", &[json!(moved_block_hash_string.clone())])
+        .expect("invalidate moved composed block");
+    assert!(invalidated.is_null());
+    let one_block_ancestor = source.tip().await.expect("one-block reorg ancestor");
+    let empty_replacement_hash = mine_exact(vec![]);
+    assert_ne!(empty_replacement_hash, moved_block_hash_string);
+    eprintln!("DEADCAT_MULTI_MARKET_REGTEST_PHASE=one_block_atomic_rollback");
+    let SyncOutcome::Ready(one_block_reorg) =
+        SyncCoordinator::new(source.as_ref(), reopened.as_ref(), &interpreter)
+            .sync_to_tip()
+            .await
+            .expect("one-block composed rollback")
+    else {
+        panic!("one-block composed rollback exceeded retention")
+    };
+    assert_eq!(one_block_reorg.blocks_rolled_back, 1);
+    assert_eq!(one_block_reorg.blocks_applied, 1);
+    assert_eq!(stored_market_state(&reopened, first_id), first_pre_state);
+    assert_eq!(stored_market_state(&reopened, second_id), second_pre_state);
+    assert_eq!(
+        reopened
+            .contract_history(first_id)
+            .expect("rolled-back first history"),
+        first_pre_history
+    );
+    assert_eq!(
+        reopened
+            .contract_history(second_id)
+            .expect("rolled-back second history"),
+        second_pre_history
+    );
+    assert!(
+        reopened
+            .transaction(moved_position)
+            .expect("rolled-back moved evidence")
+            .is_none()
+    );
+    for vout in 0..composed.output.len() {
+        assert!(
+            reopened
+                .output(OutPoint::new(composed.txid(), vout as u32))
+                .expect("rolled-back output lookup")
+                .is_none()
+        );
+    }
+    let one_block_events = reopened
+        .events_after(Some(before_one_block_cursor), 100)
+        .expect("events from one-block rollback");
+    let rollback_events = one_block_events
+        .iter()
+        .filter(|event| matches!(&event.event, StoredEvent::ChainRolledBack { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(rollback_events.len(), 1);
+    let StoredEvent::ChainRolledBack {
+        old_tip,
+        new_tip,
+        orphaned_positions,
+        affected_contract_ids,
+        affected_market_ids,
+    } = &rollback_events[0].event
+    else {
+        unreachable!("filtered to a one-block ChainRolledBack event")
+    };
+    assert_eq!(*old_tip, moved_branch_tip);
+    assert_eq!(*new_tip, one_block_ancestor);
+    assert_eq!(orphaned_positions, &[moved_position]);
+    assert_eq!(affected_contract_ids, &expected_affected);
+    assert_eq!(affected_market_ids, &expected_markets);
+    assert!(one_block_events.iter().all(|event| {
+        !matches!(
+            &event.event,
+            StoredEvent::TransactionApplied { txid, .. } if *txid == composed.txid()
+        )
+    }));
+
+    // Mine the same transaction once more and independently replay both market
+    // histories through only the public RPC evidence surface.
+    let before_final_cursor = reopened
+        .event_high_watermark()
+        .expect("event cursor before final remine");
+    let final_block_hash_string = mine_exact(vec![composed.txid().to_string()]);
+    let final_block_hash =
+        BlockHash::from_str(&final_block_hash_string).expect("final composed block hash");
+    eprintln!("DEADCAT_MULTI_MARKET_REGTEST_PHASE=canonical_remine");
+    let SyncOutcome::Ready(final_sync) =
+        SyncCoordinator::new(source.as_ref(), reopened.as_ref(), &interpreter)
+            .sync_to_tip()
+            .await
+            .expect("index final composed remine")
+    else {
+        panic!("final composed remine unexpectedly required a rescan")
+    };
+    assert_eq!(final_sync.blocks_applied, 1);
+    assert_eq!(final_sync.blocks_rolled_back, 0);
+    assert_eq!(stored_market_state(&reopened, first_id), first_post_state);
+    assert_eq!(stored_market_state(&reopened, second_id), second_post_state);
+    let final_first_history = reopened
+        .contract_history(first_id)
+        .expect("final first history");
+    let final_second_history = reopened
+        .contract_history(second_id)
+        .expect("final second history");
+    let final_position = final_first_history
+        .iter()
+        .find(|entry| entry.txid == composed.txid())
+        .expect("final first transition")
+        .position;
+    assert_eq!(
+        final_second_history
+            .iter()
+            .find(|entry| entry.txid == composed.txid())
+            .expect("final second transition")
+            .position,
+        final_position
+    );
+    assert_eq!(
+        final_position.block_height,
+        original_position.block_height + 2
+    );
+    let final_evidence = reopened
+        .transaction(final_position)
+        .expect("final evidence lookup")
+        .expect("final shared evidence row");
+    assert_eq!(final_evidence.block_hash, final_block_hash);
+    assert_eq!(final_evidence.raw_tx, original_evidence.raw_tx);
+    assert_eq!(final_evidence.affected_contract_ids, expected_affected);
+    let final_events = reopened
+        .events_after(Some(before_final_cursor), 100)
+        .expect("events from final remine");
+    assert_eq!(
+        final_events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.event,
+                    StoredEvent::TransactionApplied { txid, .. } if *txid == composed.txid()
+                )
+            })
+            .count(),
+        1
+    );
+
+    let final_tip = source.tip().await.expect("final multi-market tip");
+    let reopened_handler = NodeRpcHandler::new(
+        Arc::clone(&source),
+        Arc::clone(&reopened),
+        node_rpc_config(genesis_hash, policy_asset, baseline, final_tip),
+    )
+    .expect("final multi-market RPC handler");
+    eprintln!("DEADCAT_MULTI_MARKET_REGTEST_PHASE=client_replay");
+    for (market_id, expected_state, expected_history_len) in [
+        (first_id, first_post_state, 2),
+        (second_id, second_post_state, 1),
+    ] {
+        let (view, history) =
+            assert_rpc_contract_replay(&reopened_handler, source.as_ref(), market_id, None).await;
+        assert_eq!(
+            view.state,
+            ContractStateView::BinaryMarket {
+                state: expected_state,
+            }
+        );
+        assert_eq!(history.entries.len(), expected_history_len);
+        assert_eq!(
+            history
+                .entries
+                .iter()
+                .find(|entry| entry.txid == composed.txid())
+                .expect("RPC composed transition")
+                .position,
+            final_position
+        );
+    }
+    let rpc_evidence = rpc_transaction_evidence(&reopened_handler, final_position).await;
+    assert_eq!(rpc_evidence.block_hash, final_block_hash);
+    assert_eq!(rpc_evidence.transaction, composed);
+    assert_eq!(rpc_evidence.affected_contract_ids, expected_affected);
+
+    // Push the shared transition outside the two-block undo window, replace
+    // the complete suffix, and prove an activation-based rebuild preserves
+    // both retained market declarations and rematerializes them atomically.
+    eprintln!("DEADCAT_MULTI_MARKET_REGTEST_PHASE=deep_reorg_invalidation");
+    let _stale_successor_one = mine_exact(vec![]);
+    let _stale_successor_two = mine_exact(vec![]);
+    let SyncOutcome::Ready(stale_successor_sync) =
+        SyncCoordinator::new(source.as_ref(), reopened.as_ref(), &interpreter)
+            .sync_to_tip()
+            .await
+            .expect("index successors beyond undo retention")
+    else {
+        panic!("successor indexing unexpectedly required a rescan")
+    };
+    assert_eq!(stale_successor_sync.blocks_applied, 2);
+    let stale_branch_tip = source.tip().await.expect("stale branch tip");
+    let before_deep_reorg_cursor = reopened
+        .event_high_watermark()
+        .expect("cursor before deep reorg");
+    let retained_before_rebuild = [first_id, second_id]
+        .into_iter()
+        .map(|contract_id| {
+            (
+                contract_id,
+                reopened
+                    .retained_declaration(contract_id)
+                    .expect("retained declaration lookup")
+                    .expect("market declaration retained"),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let invalidated: JsonValue = rpc
+        .call("invalidateblock", &[json!(final_block_hash_string.clone())])
+        .expect("invalidate composed block beyond undo retention");
+    assert!(invalidated.is_null());
+    let deep_empty_hash_string = mine_exact(vec![]);
+    let deep_composed_hash_string = mine_exact(vec![composed.txid().to_string()]);
+    let _deep_successor_hash_string = mine_exact(vec![]);
+    let deep_composed_hash =
+        BlockHash::from_str(&deep_composed_hash_string).expect("deep replacement block hash");
+    assert_ne!(deep_empty_hash_string, final_block_hash_string);
+    assert_ne!(deep_composed_hash_string, final_block_hash_string);
+    let deep_source_tip = source.tip().await.expect("deep replacement tip");
+    assert_eq!(deep_source_tip.height, stale_branch_tip.height);
+
+    let SyncOutcome::RescanRequired {
+        indexed_tip,
+        source_tip,
+    } = SyncCoordinator::new(source.as_ref(), reopened.as_ref(), &interpreter)
+        .sync_to_tip()
+        .await
+        .expect("detect real three-block fork")
+    else {
+        panic!("three-block fork did not enter RescanRequired")
+    };
+    assert_eq!(indexed_tip, stale_branch_tip);
+    assert_eq!(source_tip, deep_source_tip);
+    assert_eq!(
+        reopened.sync_status().expect("invalidated status"),
+        deadcat_rpc::SyncStatus::RescanRequired
+    );
+    let invalidated_cursor = reopened
+        .event_high_watermark()
+        .expect("invalidated event cursor");
+    assert_ne!(invalidated_cursor.epoch, before_deep_reorg_cursor.epoch);
+    assert_eq!(invalidated_cursor.sequence, 1);
+    assert_eq!(stored_market_state(&reopened, first_id), first_post_state);
+    assert_eq!(stored_market_state(&reopened, second_id), second_post_state);
+    assert!(matches!(
+        reopened.events_after(Some(before_deep_reorg_cursor), 1),
+        Err(StoreError::StaleCursor { .. })
+    ));
+    let stale_read = reopened_handler
+        .handle(
+            [0x92; 32],
+            Request::GetContract {
+                contract_id: first_id,
+            },
+        )
+        .await
+        .expect_err("known-stale RPC state must fail closed");
+    assert_eq!(stale_read.code, RpcErrorCode::RescanRequired);
+    drop(reopened_handler);
+    drop(reopened);
+
+    eprintln!("DEADCAT_MULTI_MARKET_REGTEST_PHASE=deep_rebuild_reset");
+    let invalidated_store = Store::open(&database_path).expect("reopen invalidated store");
+    assert_eq!(
+        invalidated_store
+            .sync_status()
+            .expect("reopened invalidated status"),
+        deadcat_rpc::SyncStatus::RescanRequired
+    );
+    for (contract_id, declaration) in &retained_before_rebuild {
+        assert_eq!(
+            invalidated_store
+                .retained_declaration(*contract_id)
+                .expect("reopened retained declaration"),
+            Some(*declaration)
+        );
+    }
+    let reset_cursor = invalidated_store
+        .reset_for_rebuild()
+        .expect("explicit activation reset");
+    assert_eq!(reset_cursor.epoch, invalidated_cursor.epoch);
+    assert_eq!(invalidated_store.tip().expect("reset tip"), Some(baseline));
+    assert_eq!(
+        invalidated_store.sync_status().expect("reset status"),
+        deadcat_rpc::SyncStatus::Syncing
+    );
+    for (contract_id, declaration) in &retained_before_rebuild {
+        assert!(
+            invalidated_store
+                .contract(*contract_id)
+                .expect("cleared contract lookup")
+                .is_none()
+        );
+        assert_eq!(
+            invalidated_store
+                .retained_declaration(*contract_id)
+                .expect("retained declaration after reset"),
+            Some(*declaration)
+        );
+    }
+    drop(invalidated_store);
+
+    eprintln!("DEADCAT_MULTI_MARKET_REGTEST_PHASE=deep_rebuild_replay");
+    let rebuilt = Arc::new(Store::open(&database_path).expect("reopen reset store"));
+    let SyncOutcome::Ready(deep_rebuild) =
+        SyncCoordinator::new(source.as_ref(), rebuilt.as_ref(), &interpreter)
+            .rebuild_to_tip()
+            .await
+            .expect("resume explicit rebuild after reopen")
+    else {
+        panic!("replacement branch changed deeply during rebuild")
+    };
+    assert!(deep_rebuild.blocks_applied > 0);
+    assert_eq!(deep_rebuild.indexed_tip, deep_source_tip);
+    assert_eq!(
+        rebuilt.sync_status().expect("rebuilt status"),
+        deadcat_rpc::SyncStatus::Ready
+    );
+    assert_eq!(
+        rebuilt
+            .event_high_watermark()
+            .expect("rebuilt cursor")
+            .epoch,
+        invalidated_cursor.epoch
+    );
+    assert_eq!(stored_market_state(&rebuilt, first_id), first_post_state);
+    assert_eq!(stored_market_state(&rebuilt, second_id), second_post_state);
+    assert_tracked_outpoints(
+        &rebuilt,
+        first_id,
+        vec![
+            (
+                BinaryMarketSlot::UnresolvedYesRt as u8,
+                OutPoint::new(composed.txid(), 0),
+            ),
+            (
+                BinaryMarketSlot::UnresolvedNoRt as u8,
+                OutPoint::new(composed.txid(), 1),
+            ),
+            (
+                BinaryMarketSlot::UnresolvedCollateral as u8,
+                OutPoint::new(composed.txid(), 2),
+            ),
+        ],
+    );
+    assert_tracked_outpoints(
+        &rebuilt,
+        second_id,
+        vec![
+            (
+                BinaryMarketSlot::UnresolvedYesRt as u8,
+                OutPoint::new(composed.txid(), 3),
+            ),
+            (
+                BinaryMarketSlot::UnresolvedNoRt as u8,
+                OutPoint::new(composed.txid(), 4),
+            ),
+            (
+                BinaryMarketSlot::UnresolvedCollateral as u8,
+                OutPoint::new(composed.txid(), 5),
+            ),
+        ],
+    );
+    for (contract_id, declaration) in &retained_before_rebuild {
+        assert_eq!(
+            rebuilt
+                .retained_declaration(*contract_id)
+                .expect("retained declaration after replay"),
+            Some(*declaration)
+        );
+    }
+    let deep_first_history = rebuilt
+        .contract_history(first_id)
+        .expect("deep rebuilt first history");
+    let deep_second_history = rebuilt
+        .contract_history(second_id)
+        .expect("deep rebuilt second history");
+    let deep_position = deep_first_history
+        .iter()
+        .find(|entry| entry.txid == composed.txid())
+        .expect("deep rebuilt first transition")
+        .position;
+    assert_eq!(
+        deep_second_history
+            .iter()
+            .find(|entry| entry.txid == composed.txid())
+            .expect("deep rebuilt second transition")
+            .position,
+        deep_position
+    );
+    assert_eq!(deep_position.block_height, final_position.block_height + 1);
+    let deep_evidence = rebuilt
+        .transaction(deep_position)
+        .expect("deep rebuilt evidence lookup")
+        .expect("deep rebuilt shared evidence");
+    assert_eq!(deep_evidence.block_hash, deep_composed_hash);
+    assert_eq!(deep_evidence.txid, composed.txid());
+    assert_eq!(deep_evidence.raw_tx, elements::encode::serialize(&composed));
+    assert_eq!(deep_evidence.affected_contract_ids, expected_affected);
+    assert!(matches!(
+        rebuilt.events_after(Some(before_deep_reorg_cursor), 1),
+        Err(StoreError::StaleCursor { .. })
+    ));
+
+    let deep_handler = NodeRpcHandler::new(
+        Arc::clone(&source),
+        Arc::clone(&rebuilt),
+        node_rpc_config(genesis_hash, policy_asset, baseline, deep_source_tip),
+    )
+    .expect("deep rebuilt RPC handler");
+    for (market_id, expected_state, expected_history_len) in [
+        (first_id, first_post_state, 2),
+        (second_id, second_post_state, 1),
+    ] {
+        let (view, history) =
+            assert_rpc_contract_replay(&deep_handler, source.as_ref(), market_id, None).await;
+        assert_eq!(
+            view.state,
+            ContractStateView::BinaryMarket {
+                state: expected_state,
+            }
+        );
+        assert_eq!(history.entries.len(), expected_history_len);
+        assert_eq!(
+            history
+                .entries
+                .iter()
+                .find(|entry| entry.txid == composed.txid())
+                .expect("deep RPC composed transition")
+                .position,
+            deep_position
+        );
+    }
+
+    let report = json!({
+        "schema": "deadcat.multi-market-regtest.v1",
+        "market_ids": [first_id.to_string(), second_id.to_string()],
+        "txid": composed.txid().to_string(),
+        "inputs": composed.input.len(),
+        "outputs": composed.output.len(),
+        "mempool_vsize": composed_accepted.mempool_vsize,
+        "original_position": original_position,
+        "original_block_hash": composed_accepted.block_hash,
+        "moved_position": moved_position,
+        "moved_block_hash": moved_block_hash_string,
+        "final_position": final_position,
+        "final_block_hash": final_block_hash_string,
+        "deep_rebuild_position": deep_position,
+        "deep_rebuild_block_hash": deep_composed_hash_string,
+        "negative_test": wrong_second_rejection,
+    });
+    eprintln!(
+        "DEADCAT_MULTI_MARKET_REGTEST_METRICS={}",
+        serde_json::to_string(&report).expect("serialize multi-market metrics")
     );
 }
 
@@ -4094,7 +5413,7 @@ async fn multi_contract_transaction_is_accepted_and_indexed_by_elementsd() {
     let handler = NodeRpcHandler::new(
         Arc::clone(&source),
         Arc::clone(&store),
-        maker_rpc_config(genesis_hash, policy_asset, baseline, registration_tip),
+        node_rpc_config(genesis_hash, policy_asset, baseline, registration_tip),
     )
     .expect("multi-contract RPC handler");
     eprintln!("DEADCAT_MULTI_CONTRACT_REGTEST_PHASE=package_registration");
@@ -4826,7 +6145,7 @@ async fn multi_contract_transaction_is_accepted_and_indexed_by_elementsd() {
     let moved_handler = NodeRpcHandler::new(
         Arc::clone(&source),
         Arc::clone(&reopened),
-        maker_rpc_config(genesis_hash, policy_asset, baseline, moved_tip),
+        node_rpc_config(genesis_hash, policy_asset, baseline, moved_tip),
     )
     .expect("moved-branch RPC handler");
     let (moved_parent_view, moved_parent_rpc_history) =
@@ -5151,7 +6470,7 @@ async fn multi_contract_transaction_is_accepted_and_indexed_by_elementsd() {
     let reopened_handler = NodeRpcHandler::new(
         Arc::clone(&source),
         Arc::clone(&reopened),
-        maker_rpc_config(genesis_hash, policy_asset, baseline, final_tip),
+        node_rpc_config(genesis_hash, policy_asset, baseline, final_tip),
     )
     .expect("final multi-contract RPC handler");
     eprintln!("DEADCAT_MULTI_CONTRACT_REGTEST_PHASE=client_replay");
@@ -5431,7 +6750,7 @@ async fn multi_contract_transaction_is_accepted_and_indexed_by_elementsd() {
     let deep_handler = NodeRpcHandler::new(
         Arc::clone(&source),
         Arc::clone(&rebuilt),
-        maker_rpc_config(genesis_hash, policy_asset, baseline, deep_source_tip),
+        node_rpc_config(genesis_hash, policy_asset, baseline, deep_source_tip),
     )
     .expect("deep rebuilt RPC handler");
     let (deep_parent_view, deep_parent_history) =

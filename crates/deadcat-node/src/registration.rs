@@ -1150,6 +1150,50 @@ mod tests {
         (transaction, params, position, anchor(100, 0x55))
     }
 
+    fn declared_market_outputs(policy_asset: AssetId, params: BinaryMarketParams) -> [TxOut; 3] {
+        let compiled = CompiledBinaryMarket::new(params).expect("compile declared market");
+        let yes_commitments = commitments(
+            params.yes_reissuance_token_id,
+            factors(RtLeg::Yes, RtSide::A),
+        )
+        .expect("declared YES commitments");
+        let no_commitments =
+            commitments(params.no_reissuance_token_id, factors(RtLeg::No, RtSide::A))
+                .expect("declared NO commitments");
+        let hint = MarketRecoveryHint {
+            oracle_public_key: params.oracle_public_key,
+            collateral: MarketCollateral::PolicyAsset,
+            base_payout: params.base_payout,
+            expiry_height: params.expiry_height,
+        }
+        .encode()
+        .expect("declared market hint");
+
+        [
+            TxOut {
+                asset: yes_commitments.0,
+                value: yes_commitments.1,
+                nonce: Nonce::Null,
+                script_pubkey: compiled
+                    .slot(BinaryMarketSlot::DormantYesRt)
+                    .script_pubkey()
+                    .clone(),
+                witness: TxOutWitness::default(),
+            },
+            TxOut {
+                asset: no_commitments.0,
+                value: no_commitments.1,
+                nonce: Nonce::Null,
+                script_pubkey: compiled
+                    .slot(BinaryMarketSlot::DormantNoRt)
+                    .script_pubkey()
+                    .clone(),
+                witness: TxOutWitness::default(),
+            },
+            recovery_txout(policy_asset, &hint).expect("declared market recovery output"),
+        ]
+    }
+
     struct RegistrationSource {
         transactions: BTreeMap<Txid, Transaction>,
         status: TransactionStatus,
@@ -1515,6 +1559,146 @@ mod tests {
                 .is_some()
         );
         assert_eq!(store.pending_backfills().expect("backfills").len(), 3);
+    }
+
+    #[tokio::test]
+    async fn reversed_same_transaction_package_registers_two_markets_atomically() {
+        let policy_asset = asset(0x90);
+        let first_yes_input = issuance_input(0x31, 1);
+        let first_no_input = issuance_input(0x32, 2);
+        let second_yes_input = issuance_input(0x41, 3);
+        let second_no_input = issuance_input(0x42, 4);
+        let first_ids = derive_issuance_assets(
+            first_yes_input.previous_output,
+            first_no_input.previous_output,
+        );
+        let second_ids = derive_issuance_assets(
+            second_yes_input.previous_output,
+            second_no_input.previous_output,
+        );
+        let first_params = BinaryMarketParams {
+            oracle_public_key: VALID_XONLY,
+            collateral_asset_id: policy_asset,
+            yes_token_asset_id: first_ids.yes_token,
+            no_token_asset_id: first_ids.no_token,
+            yes_reissuance_token_id: first_ids.yes_reissuance_token,
+            no_reissuance_token_id: first_ids.no_reissuance_token,
+            base_payout: 1_000,
+            expiry_height: 50_000,
+        };
+        let second_params = BinaryMarketParams {
+            oracle_public_key: VALID_XONLY,
+            collateral_asset_id: policy_asset,
+            yes_token_asset_id: second_ids.yes_token,
+            no_token_asset_id: second_ids.no_token,
+            yes_reissuance_token_id: second_ids.yes_reissuance_token,
+            no_reissuance_token_id: second_ids.no_reissuance_token,
+            base_payout: 2_000,
+            expiry_height: 60_000,
+        };
+        let transaction = Transaction {
+            version: 2,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                first_yes_input,
+                first_no_input,
+                second_yes_input,
+                second_no_input,
+            ],
+            output: declared_market_outputs(policy_asset, first_params)
+                .into_iter()
+                .chain(declared_market_outputs(policy_asset, second_params))
+                .collect(),
+        };
+        let position = ChainPosition {
+            block_height: 100,
+            tx_index: 2,
+        };
+        let creation_anchor = anchor(100, 0x54);
+        let first_market_id = ContractId::new(OutPoint::new(transaction.txid(), 0));
+        let second_market_id = ContractId::new(OutPoint::new(transaction.txid(), 3));
+        let package = ContractPackage {
+            format_version: CONTRACT_PACKAGE_FORMAT_VERSION,
+            chain: deadcat_types::ChainIdentity {
+                network: LiquidNetwork::ElementsRegtest,
+                genesis_hash: BlockHash::all_zeros(),
+            },
+            // Deliberately reverse creation-output order. Registration receipts
+            // must retain caller order even though both declarations share one
+            // fetched and validated creation transaction.
+            roots: vec![second_market_id, first_market_id],
+            declarations: vec![
+                ContractDeclaration {
+                    contract_id: second_market_id,
+                    descriptor: ContractDescriptor::BinaryMarketV1 {
+                        params: second_params,
+                    },
+                },
+                ContractDeclaration {
+                    contract_id: first_market_id,
+                    descriptor: ContractDescriptor::BinaryMarketV1 {
+                        params: first_params,
+                    },
+                },
+            ],
+        };
+        let source = RegistrationSource::new(
+            transaction.clone(),
+            TransactionStatus::Confirmed {
+                anchor: creation_anchor,
+                tx_index: position.tx_index,
+            },
+        );
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store =
+            Store::open(directory.path().join("two-market-package.redb")).expect("open store");
+        store
+            .initialize_tip(creation_anchor)
+            .expect("initialize tip");
+        let verifier = RegistrationVerifier::new(
+            &source,
+            &store,
+            LiquidNetwork::ElementsRegtest,
+            BlockHash::all_zeros(),
+            policy_asset,
+        );
+
+        let registrations = verifier
+            .verify_and_register_package(&package)
+            .await
+            .expect("register two-market package");
+        assert_eq!(source.transaction_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(source.status_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(registrations.len(), 2);
+        assert_eq!(registrations[0].0.record.contract_id, second_market_id);
+        assert_eq!(registrations[1].0.record.contract_id, first_market_id);
+        assert!(Arc::ptr_eq(
+            &registrations[0].0.creation_transaction,
+            &registrations[1].0.creation_transaction,
+        ));
+        assert!(registrations.iter().all(|(_, inserted)| *inserted));
+        assert!(
+            store
+                .contract(first_market_id)
+                .expect("first market lookup")
+                .is_some()
+        );
+        assert!(
+            store
+                .contract(second_market_id)
+                .expect("second market lookup")
+                .is_some()
+        );
+        assert_eq!(store.pending_backfills().expect("backfills").len(), 2);
+        let evidence = store
+            .transaction(position)
+            .expect("creation evidence lookup")
+            .expect("shared creation evidence");
+        assert_eq!(
+            elements::encode::deserialize::<Transaction>(&evidence.raw_tx)
+                .expect("decode shared creation evidence"),
+            transaction
+        );
     }
 
     #[test]
