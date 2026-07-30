@@ -93,6 +93,13 @@ outputs if the creation-time reissuance-token supply checks ever regressed.
 
 **Severity:** High
 
+**Disposition:** Remediation is proposed in
+[PR #11](https://github.com/Resolvr-io/deadcat-node/pull/11). It makes the
+shared interpreter reproduce the transaction-global `check_lock_height`
+predicate and retains covenant/interpreter regressions for a non-final
+follower, all-final inputs, and a time-typed lock. Mark this finding resolved
+when that PR merges.
+
 **Affected components:**
 
 - [`binary_market.simf`](../crates/deadcat-contracts/simplicityhl/binary_market.simf#L574-L616)
