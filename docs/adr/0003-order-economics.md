@@ -1,6 +1,7 @@
 # ADR 0003: Limit-order economics and quantity policy
 
-- Status: Accepted
+- Status: Historical — `MakerOrderV1` retired by
+  [ADR 0006](0006-rfq-first-liquidity-scope.md)
 - Date: 2026-07-12
 
 ## Context

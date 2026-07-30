@@ -1,6 +1,6 @@
 # ADR 0002: V1 contract scope and lifecycle
 
-- Status: Accepted
+- Status: Superseded by [ADR 0006](0006-rfq-first-liquidity-scope.md)
 - Date: 2026-07-12
 
 ## Decision
