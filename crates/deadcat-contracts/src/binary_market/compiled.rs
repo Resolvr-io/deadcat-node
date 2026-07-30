@@ -1,15 +1,24 @@
 //! Validation-first compilation of the canonical binary-market covenant.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use elements::confidential::{Asset, Value};
 use elements::hashes::{Hash as _, HashEngine as _, sha256};
+use elements::pset::PartiallySignedTransaction;
 use elements::secp256k1_zkp::{Secp256k1, XOnlyPublicKey};
 use elements::taproot::{ControlBlock, TaprootBuilder, TaprootBuilderError};
-use elements::{AssetId, Script};
-use simplex::program::ArgumentsTrait as _;
-use simplex::simplicityhl::CompiledProgram;
-use simplex::simplicityhl::simplicity::{HasCmr as _, leaf_version};
+use elements::{AssetId, Script, Transaction, TxOut};
+use simplex::global::GlobalConfig;
+use simplex::program::logger::ProgramLogger;
+use simplex::program::{ArgumentsTrait as _, ProgramError};
+use simplex::provider::SimplicityNetwork;
+use simplex::simplicityhl::simplicity::jet::Elements;
+use simplex::simplicityhl::simplicity::jet::elements::{ElementsEnv, ElementsUtxo};
+use simplex::simplicityhl::simplicity::{
+    BitMachine, HasCmr as _, RedeemNode, Value as SimplicityValue, leaf_version,
+};
+use simplex::simplicityhl::{CompiledProgram, WitnessValues};
 use thiserror::Error;
 
 use super::{BinaryMarketEconomics, BinaryMarketParams, BinaryMarketSlot};
@@ -61,6 +70,7 @@ impl CompiledBinaryMarketSlot {
 pub struct CompiledBinaryMarket {
     params: BinaryMarketParams,
     arguments: derived_binary_market::BinaryMarketArguments,
+    compiled: CompiledProgram,
     cmr: [u8; 32],
     slots: [CompiledBinaryMarketSlot; 8],
 }
@@ -101,6 +111,7 @@ impl CompiledBinaryMarket {
         Ok(Self {
             params,
             arguments,
+            compiled,
             cmr,
             slots,
         })
@@ -136,6 +147,100 @@ impl CompiledBinaryMarket {
         let mut program = BinaryMarketProgram::new(self.arguments.clone()).with_storage_capacity(1);
         program.set_storage_at(0, slot.storage_word());
         program
+    }
+
+    /// Execute one storage slot without recompiling the parameterized source.
+    pub fn execute(
+        &self,
+        slot: BinaryMarketSlot,
+        pset: &PartiallySignedTransaction,
+        witness: &WitnessValues,
+        input_index: usize,
+        network: &SimplicityNetwork,
+    ) -> Result<(Arc<RedeemNode<Elements>>, SimplicityValue), ProgramError> {
+        let satisfied = self
+            .compiled
+            .satisfy(witness.clone())
+            .map_err(ProgramError::WitnessSatisfaction)?;
+        let mut tracker =
+            ProgramLogger::make_tracker(satisfied.debug_symbols(), GlobalConfig::get_log_level());
+        let environment = self.environment(slot, pset, input_index, network)?;
+        let pruned = satisfied
+            .redeem()
+            .prune_with_tracker(&environment, &mut tracker)?;
+
+        if GlobalConfig::is_max_verbose() {
+            ProgramLogger::buffer_cost_log(&pruned);
+        }
+
+        let mut machine = BitMachine::for_program(&pruned)?;
+        let result = machine
+            .exec(&pruned, &environment)
+            .map_err(ProgramError::Execution)?;
+        Ok((pruned, result))
+    }
+
+    /// Finalize one storage slot without recompiling the parameterized source.
+    pub fn finalize(
+        &self,
+        slot: BinaryMarketSlot,
+        pset: &PartiallySignedTransaction,
+        witness: &WitnessValues,
+        input_index: usize,
+        network: &SimplicityNetwork,
+    ) -> Result<Vec<Vec<u8>>, ProgramError> {
+        let pruned = self.execute(slot, pset, witness, input_index, network)?.0;
+        let (program_bytes, witness_bytes) = pruned.to_vec_with_witness();
+        Ok(vec![
+            witness_bytes,
+            program_bytes,
+            pruned.cmr().as_ref().to_vec(),
+            self.slot(slot).control_block().serialize(),
+        ])
+    }
+
+    fn environment(
+        &self,
+        slot: BinaryMarketSlot,
+        pset: &PartiallySignedTransaction,
+        input_index: usize,
+        network: &SimplicityNetwork,
+    ) -> Result<ElementsEnv<Arc<Transaction>>, ProgramError> {
+        let utxos: Vec<TxOut> = pset
+            .inputs()
+            .iter()
+            .filter_map(|input| input.witness_utxo.clone())
+            .collect();
+        let Some(target_utxo) = utxos.get(input_index) else {
+            return Err(ProgramError::UtxoIndexOutOfBounds {
+                input_index,
+                utxo_count: utxos.len(),
+            });
+        };
+        let expected_script = self.slot(slot).script_pubkey();
+        if target_utxo.script_pubkey != *expected_script {
+            return Err(ProgramError::ScriptPubkeyMismatch {
+                expected_hash: expected_script.script_hash().to_string(),
+                actual_hash: target_utxo.script_pubkey.script_hash().to_string(),
+            });
+        }
+
+        Ok(ElementsEnv::new(
+            Arc::new(pset.extract_tx()?),
+            utxos
+                .iter()
+                .map(|utxo| ElementsUtxo {
+                    script_pubkey: utxo.script_pubkey.clone(),
+                    asset: utxo.asset,
+                    value: utxo.value,
+                })
+                .collect(),
+            u32::try_from(input_index)?,
+            self.compiled.commit().cmr(),
+            self.slot(slot).control_block().clone(),
+            None,
+            network.genesis_block_hash(),
+        ))
     }
 }
 

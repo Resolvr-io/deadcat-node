@@ -12,7 +12,7 @@ mod maker_order;
 
 pub use binary_market::{
     BinaryMarketContinuation, BinaryMarketInterpretation, BinaryMarketLiveOutputs,
-    BinaryMarketPath, interpret_binary_market_spend,
+    BinaryMarketPath, interpret_binary_market_spend, interpret_binary_market_spend_with_compiled,
 };
 pub use maker_order::{MakerOrderInterpretation, MakerOrderSpendKind, interpret_maker_order_spend};
 

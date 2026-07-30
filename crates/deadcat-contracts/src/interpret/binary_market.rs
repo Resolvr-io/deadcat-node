@@ -87,7 +87,21 @@ pub fn interpret_binary_market_spend(
     transaction: &Transaction,
 ) -> Result<BinaryMarketInterpretation, InterpretError> {
     let compiled = CompiledBinaryMarket::new(params)?;
-    validate_live_outputs(&compiled, params, before, live)?;
+    interpret_binary_market_spend_with_compiled(&compiled, before, live, transaction)
+}
+
+/// Interpret a spend using an already compiled canonical binary market.
+///
+/// This avoids recompiling the same parameterized covenant when a caller
+/// interprets multiple transactions for one market.
+pub fn interpret_binary_market_spend_with_compiled(
+    compiled: &CompiledBinaryMarket,
+    before: BinaryMarketState,
+    live: &BinaryMarketLiveOutputs,
+    transaction: &Transaction,
+) -> Result<BinaryMarketInterpretation, InterpretError> {
+    let params = compiled.params();
+    validate_live_outputs(compiled, params, before, live)?;
     let head = match before {
         BinaryMarketState::Trading { .. } => live.yes_rt.as_ref(),
         BinaryMarketState::ResolvedYes { .. }
@@ -159,7 +173,7 @@ pub fn interpret_binary_market_spend(
                     if let Ok(interpretation) = interpret_candidate(
                         params,
                         economics,
-                        &compiled,
+                        compiled,
                         before,
                         live,
                         live_rt_sides,
