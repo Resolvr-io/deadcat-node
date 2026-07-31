@@ -1,9 +1,13 @@
 use std::fmt::Write as _;
 
-use deadcat_contracts::binary_market::{BinaryMarketSlot, CompiledBinaryMarket};
+use deadcat_contracts::binary_market::{
+    BinaryMarketProgram, BinaryMarketSlot, CompiledBinaryMarket,
+};
 use deadcat_contracts::rt::{ABF_A, ABF_B, RtLeg, RtSide, YES_CBF, commitments, factors, no_cbf};
 use deadcat_types::BinaryMarketParams;
 use elements::AssetId;
+use simplex::simplicityhl::ast::ElementsJetHinter;
+use simplex::simplicityhl::{TemplateProgram, UnstableFeature, UnstableFeatures};
 
 const NUMS_PUBLIC_KEY: [u8; 32] = [
     0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
@@ -27,6 +31,27 @@ fn sample_params() -> BinaryMarketParams {
     }
 }
 
+fn sequential_asset(start: u8) -> AssetId {
+    let mut bytes = [0_u8; 32];
+    for (offset, byte) in bytes.iter_mut().enumerate() {
+        *byte = start + u8::try_from(offset).expect("32-byte asset offset");
+    }
+    AssetId::from_slice(&bytes).expect("asset ID")
+}
+
+fn nonuniform_params() -> BinaryMarketParams {
+    BinaryMarketParams {
+        oracle_public_key: NUMS_PUBLIC_KEY,
+        collateral_asset_id: sequential_asset(0x00),
+        yes_token_asset_id: sequential_asset(0x20),
+        no_token_asset_id: sequential_asset(0x40),
+        yes_reissuance_token_id: sequential_asset(0x60),
+        no_reissuance_token_id: sequential_asset(0x80),
+        base_payout: 1_000,
+        expiry_height: 250_000,
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -41,6 +66,53 @@ fn compressed_commitments(leg: RtLeg, side: RtSide, asset_id: AssetId) -> (Strin
         hex(&asset.commitment().expect("generator").serialize()),
         hex(&value.commitment().expect("commitment").serialize()),
     )
+}
+
+#[test]
+fn nonuniform_contract_arguments_compile_to_stable_cmr() {
+    // Every asset byte is position-sensitive. This golden therefore changes if
+    // `contract_arguments` accidentally substitutes display order for consensus
+    // byte order before compiling the parameterized program.
+    let compiled = CompiledBinaryMarket::new(nonuniform_params()).expect("compile market");
+    assert_eq!(
+        hex(&compiled.cmr()),
+        "17cc73d71216f687eaed7cd5dc05743f35eb75d907fbd7c996e2012f22caf7bf"
+    );
+}
+
+#[test]
+fn binary_market_abi_is_stable() {
+    let template = TemplateProgram::new_with_unstable(
+        BinaryMarketProgram::SOURCE,
+        &UnstableFeatures::new([UnstableFeature::Imports]),
+        Box::new(ElementsJetHinter),
+    )
+    .expect("parse binary-market template");
+    let abi = template.generate_abi_meta().expect("generate ABI metadata");
+
+    let mut parameters: Vec<String> = abi
+        .param_types
+        .iter()
+        .map(|(name, ty)| format!("{name}: {ty}"))
+        .collect();
+    parameters.sort_unstable();
+    let mut witnesses: Vec<String> = abi
+        .witness_types
+        .iter()
+        .map(|(name, ty)| format!("{name}: {ty}"))
+        .collect();
+    witnesses.sort_unstable();
+
+    let actual = format!(
+        "parameters:\n{}\nwitnesses:\n{}\n",
+        parameters.join("\n"),
+        witnesses.join("\n")
+    );
+    assert_eq!(
+        actual,
+        include_str!("fixtures/binary_market_abi.txt"),
+        "binary-market parameter/witness ABI changed"
+    );
 }
 
 #[test]

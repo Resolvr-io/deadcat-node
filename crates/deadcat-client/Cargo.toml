@@ -23,6 +23,8 @@ deadcat-iroh = { path = "../deadcat-iroh" }
 deadcat-node = { path = "../deadcat-node" }
 serde.workspace = true
 serde_json.workspace = true
+# Enable serde for the smplx-reexported Simplicity Cost/NodeBounds metrics.
+simplicity-lang = { version = "=0.8.0", features = ["serde"] }
 smplx-regtest.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

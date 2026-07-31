@@ -24,19 +24,24 @@ use elements::{AssetId, LockTime, OutPoint, Script, Sequence, TxOut, TxOutWitnes
 use serde::Serialize;
 use simplex::program::{ProgramTrait as _, WitnessTrait as _};
 use simplex::simplicityhl::simplicity::jet::Elements;
-use simplex::simplicityhl::simplicity::{BitIter, RedeemNode};
+use simplex::simplicityhl::simplicity::{BitIter, Cost, RedeemNode};
 
-#[derive(Debug)]
-struct Underbudget {
-    label: String,
-    milliweight: String,
-    stack_bytes: usize,
-    required_annex_bytes: usize,
-}
+// Rounded CI ceilings with headroom above the reviewed maxima of 4,557,857 mw,
+// 70,903 cells, 62 frames, 6,223 stack bytes, 15,334 transaction bytes,
+// 17,284 WU, and 4,321 vB. The exact measurements remain in the JSON report.
+const MAX_MARKET_COVENANT_COST_MILLIWEIGHT: u64 = 5_000_000;
+const MAX_MARKET_INPUT_EXTRA_CELLS: usize = 80_000;
+const MAX_MARKET_INPUT_EXTRA_FRAMES: usize = 70;
+const MAX_MARKET_COVENANT_STACK_BYTES: usize = 7_000;
+const MAX_MARKET_TX_BYTES: usize = 17_000;
+const MAX_MARKET_TX_WEIGHT: usize = 19_000;
+const MAX_MARKET_TX_VSIZE: usize = 5_000;
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 struct CovenantMetrics {
     cost_milliweight: u64,
+    max_extra_cells: usize,
+    max_extra_frames: usize,
     program_bytes: usize,
     witness_bytes: usize,
     stack_bytes: usize,
@@ -45,12 +50,24 @@ struct CovenantMetrics {
 
 impl CovenantMetrics {
     fn add_assign(&mut self, other: Self) {
-        self.cost_milliweight += other.cost_milliweight;
+        self.cost_milliweight = self
+            .cost_milliweight
+            .checked_add(other.cost_milliweight)
+            .expect("aggregate Simplicity cost fits u64");
+        self.max_extra_cells = self.max_extra_cells.max(other.max_extra_cells);
+        self.max_extra_frames = self.max_extra_frames.max(other.max_extra_frames);
         self.program_bytes += other.program_bytes;
         self.witness_bytes += other.witness_bytes;
         self.stack_bytes += other.stack_bytes;
         self.padding_bytes += other.padding_bytes;
     }
+}
+
+fn cost_milliweight(cost: Cost) -> u64 {
+    serde_json::to_value(cost)
+        .expect("serialize typed Simplicity cost")
+        .as_u64()
+        .expect("Simplicity cost serializes as integer milliweight")
 }
 
 #[derive(Debug, Serialize)]
@@ -65,59 +82,183 @@ struct MarketMetrics<'a> {
     tx_discount_vsize: usize,
 }
 
-impl std::fmt::Display for Underbudget {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "{}: cost={}mw stack={}B required_annex={}B",
-            self.label, self.milliweight, self.stack_bytes, self.required_annex_bytes
-        )
-    }
+fn assert_at_most<T>(label: &str, metric: &str, actual: T, ceiling: T)
+where
+    T: Copy + PartialOrd + std::fmt::Display,
+{
+    assert!(
+        actual <= ceiling,
+        "{label}: {metric} {actual} exceeds CI ceiling {ceiling}"
+    );
 }
 
-fn failure_report(failures: &[Underbudget]) -> String {
-    failures
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n")
+fn assert_market_resource_ceilings(metrics: &MarketMetrics<'_>) {
+    let label = format!("{}/{}", metrics.stage, metrics.rt_input_side);
+    assert_at_most(
+        &label,
+        "aggregate covenant cost (milliweight)",
+        metrics.covenant.cost_milliweight,
+        MAX_MARKET_COVENANT_COST_MILLIWEIGHT,
+    );
+    assert_at_most(
+        &label,
+        "maximum per-input extra cells",
+        metrics.covenant.max_extra_cells,
+        MAX_MARKET_INPUT_EXTRA_CELLS,
+    );
+    assert_at_most(
+        &label,
+        "maximum per-input extra frames",
+        metrics.covenant.max_extra_frames,
+        MAX_MARKET_INPUT_EXTRA_FRAMES,
+    );
+    assert_at_most(
+        &label,
+        "aggregate covenant stack bytes",
+        metrics.covenant.stack_bytes,
+        MAX_MARKET_COVENANT_STACK_BYTES,
+    );
+    assert_at_most(
+        &label,
+        "transaction bytes",
+        metrics.tx_bytes,
+        MAX_MARKET_TX_BYTES,
+    );
+    assert_at_most(
+        &label,
+        "transaction weight",
+        metrics.tx_weight,
+        MAX_MARKET_TX_WEIGHT,
+    );
+    assert_at_most(
+        &label,
+        "transaction vsize",
+        metrics.tx_vsize,
+        MAX_MARKET_TX_VSIZE,
+    );
 }
 
-fn record_budget(
-    label: impl Into<String>,
-    stack: &[Vec<u8>],
-    failures: &mut Vec<Underbudget>,
-) -> CovenantMetrics {
+fn assert_canonical_padding(label: &str, annex: &[u8]) {
+    assert_eq!(annex.first(), Some(&0x50), "{label}: annex tag");
+    assert!(
+        annex[1..].iter().all(|byte| *byte == 0),
+        "{label}: annex must contain only the 0x50 tag followed by zero padding"
+    );
+}
+
+fn record_budget(label: impl Into<String>, stack: &[Vec<u8>]) -> CovenantMetrics {
+    let label = label.into();
     let stack = stack.to_vec();
     let (core_stack, annex) = strip_taproot_annex(&stack);
     assert_eq!(
         core_stack.len(),
         4,
-        "finalized Simplicity stack must have four core elements"
+        "{label}: finalized Simplicity stack must have four core elements"
     );
     let redeem = RedeemNode::decode::<_, _, Elements>(
         BitIter::from(core_stack[1].iter().copied()),
         BitIter::from(core_stack[0].iter().copied()),
     )
     .expect("decode finalized Simplicity program");
-    let cost = redeem.bounds().cost;
-    if !cost.is_budget_valid(&stack) {
-        failures.push(Underbudget {
-            label: label.into(),
-            milliweight: cost.to_string(),
-            stack_bytes: elements::encode::serialize(&stack).len(),
-            required_annex_bytes: cost.get_padding(&stack).map_or(0, |annex| annex.len()),
-        });
+    let bounds = redeem.bounds();
+    let cost = bounds.cost;
+    assert!(
+        cost.is_budget_valid(&stack),
+        "{label}: finalized stack is underbudget for execution cost {cost}mw"
+    );
+
+    let canonical_padding = cost.get_padding(&core_stack.to_vec());
+    assert_eq!(
+        annex,
+        canonical_padding.as_deref(),
+        "{label}: finalized stack must use exactly the canonical budget padding"
+    );
+    if let Some(annex) = annex {
+        assert_canonical_padding(&label, annex);
+        if annex.len() > 1 {
+            let mut shortened = stack.clone();
+            assert_eq!(
+                shortened.last_mut().expect("annex").pop(),
+                Some(0),
+                "{label}: last annex byte must be zero padding"
+            );
+            assert!(
+                !cost.is_budget_valid(&shortened),
+                "{label}: finalized annex contains unnecessary zero padding"
+            );
+        }
     }
+
     CovenantMetrics {
-        cost_milliweight: cost
-            .to_string()
-            .parse()
-            .expect("Simplicity cost is an integer milliweight"),
+        cost_milliweight: cost_milliweight(cost),
+        max_extra_cells: bounds.extra_cells,
+        max_extra_frames: bounds.extra_frames,
         program_bytes: core_stack[1].len(),
         witness_bytes: core_stack[0].len(),
         stack_bytes: elements::encode::serialize(&stack).len(),
         padding_bytes: annex.map_or(0, <[u8]>::len),
+    }
+}
+
+#[test]
+fn simplicity_budget_padding_is_minimal_at_compact_size_boundaries() {
+    // Keep the four-item shape of a finalized Simplicity stack. The contents do
+    // not matter for budget accounting, which uses consensus-encoded length.
+    let stack = vec![Vec::new(); 4];
+    let base_budget = elements::encode::serialize(&stack).len() + 50;
+    let cases = [
+        ("tag-only-annex", 1_usize, 1_usize),
+        ("annex-252/deficit-253", 253, 252),
+        ("annex-253/deficit-254", 254, 253),
+        ("annex-253/deficit-255", 255, 253),
+        ("annex-253/deficit-256", 256, 253),
+        ("annex-254/deficit-257", 257, 254),
+        ("annex-65535/deficit-65538", 65_538, 65_535),
+        ("annex-65536/deficit-65539", 65_539, 65_536),
+        ("annex-65536/deficit-65540", 65_540, 65_536),
+        ("annex-65536/deficit-65541", 65_541, 65_536),
+        ("annex-65537/deficit-65542", 65_542, 65_537),
+    ];
+
+    for (label, deficit, expected_annex_len) in cases {
+        let milliweight =
+            u32::try_from((base_budget + deficit) * 1_000).expect("boundary test cost fits u32");
+        let cost = Cost::from_milliweight(milliweight);
+        assert!(
+            !cost.is_budget_valid(&stack),
+            "{label}: unpadded stack unexpectedly has sufficient budget"
+        );
+
+        let annex = cost
+            .get_padding(&stack)
+            .unwrap_or_else(|| panic!("{label}: expected padding"));
+        assert_eq!(annex.len(), expected_annex_len, "{label}: annex length");
+        assert_canonical_padding(label, &annex);
+
+        let mut padded = stack.clone();
+        padded.push(annex);
+        assert!(
+            cost.is_budget_valid(&padded),
+            "{label}: generated padding must satisfy the budget"
+        );
+        if expected_annex_len == 1 {
+            let removed = padded.pop().expect("tag-only annex");
+            assert_eq!(removed.as_slice(), &[0x50], "{label}: removed annex");
+            assert!(
+                !cost.is_budget_valid(&padded),
+                "{label}: removing the tag-only annex must leave the core stack underbudget"
+            );
+        } else {
+            assert_eq!(
+                padded.last_mut().expect("annex").pop(),
+                Some(0),
+                "{label}: boundary annex must end in zero padding"
+            );
+            assert!(
+                !cost.is_budget_valid(&padded),
+                "{label}: removing one zero must make the padding insufficient"
+            );
+        }
     }
 }
 
@@ -741,7 +882,6 @@ fn every_finalized_market_stack_has_sufficient_simplicity_budget() {
     let network = SimplicityNetwork::ElementsRegtest {
         policy_asset: params.collateral_asset_id,
     };
-    let mut failures = Vec::new();
     let mut measurements = Vec::new();
     let compiled = CompiledBinaryMarket::new(params).expect("compile canonical market");
     for side in [RtSide::A, RtSide::B] {
@@ -834,12 +974,11 @@ fn every_finalized_market_stack_has_sufficient_simplicity_budget() {
                 covenant.add_assign(record_budget(
                     format!("{label}/{side:?}/input-{input_index}"),
                     stack,
-                    &mut failures,
                 ));
             }
 
             let transaction = pset.extract_tx().expect("extract finalized market tx");
-            measurements.push(MarketMetrics {
+            let metrics = MarketMetrics {
                 stage: label,
                 rt_input_side: match side {
                     RtSide::A => "a",
@@ -851,7 +990,9 @@ fn every_finalized_market_stack_has_sufficient_simplicity_budget() {
                 tx_vsize: transaction.vsize(),
                 tx_discount_weight: transaction.discount_weight(),
                 tx_discount_vsize: transaction.discount_vsize(),
-            });
+            };
+            assert_market_resource_ceilings(&metrics);
+            measurements.push(metrics);
             let interpreted = interpret_binary_market_spend_with_compiled(
                 &compiled,
                 before,
@@ -948,11 +1089,6 @@ fn every_finalized_market_stack_has_sufficient_simplicity_budget() {
             }
         }
     }
-    let report = failure_report(&failures);
-    assert!(
-        failures.is_empty(),
-        "underbudget finalized market stacks:\n{report}"
-    );
     eprintln!(
         "DEADCAT_AB_MARKET_METRICS={}",
         serde_json::to_string(&measurements).expect("serialize market measurements")
@@ -1688,17 +1824,7 @@ fn market_followers_ignore_transition_witnesses_but_require_the_exact_coordinato
         if canonical_stack.len() == 5 {
             mixed_stack.push(canonical_stack[4].clone());
         }
-        let mut failures = Vec::new();
-        record_budget(
-            format!("mixed-follower-{slot:?}"),
-            &mixed_stack,
-            &mut failures,
-        );
-        assert!(
-            failures.is_empty(),
-            "mixed follower is underbudget: {}",
-            failure_report(&failures)
-        );
+        record_budget(format!("mixed-follower-{slot:?}"), &mixed_stack);
         mixed_witness_pset.inputs_mut()[input_index].final_script_witness = Some(mixed_stack);
     }
     let mixed_transaction = mixed_witness_pset

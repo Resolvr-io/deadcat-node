@@ -18,7 +18,7 @@ use simplex::simplicityhl::simplicity::jet::elements::{ElementsEnv, ElementsUtxo
 use simplex::simplicityhl::simplicity::{
     BitMachine, HasCmr as _, RedeemNode, Value as SimplicityValue, leaf_version,
 };
-use simplex::simplicityhl::{CompiledProgram, UnstableFeatures, WitnessValues};
+use simplex::simplicityhl::{CompiledProgram, UnstableFeature, UnstableFeatures, WitnessValues};
 use thiserror::Error;
 
 use super::{BinaryMarketEconomics, BinaryMarketParams, BinaryMarketSlot};
@@ -83,7 +83,7 @@ impl CompiledBinaryMarket {
         let arguments = contract_arguments(params)?;
         let compiled = CompiledProgram::new_with_unstable(
             BinaryMarketProgram::SOURCE,
-            &UnstableFeatures::all(),
+            &UnstableFeatures::new([UnstableFeature::Imports]),
             arguments.build_arguments(),
             false,
             Box::new(ElementsJetHinter),

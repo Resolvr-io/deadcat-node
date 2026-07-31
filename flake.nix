@@ -47,7 +47,12 @@
         checks.simplex-version = pkgs.runCommand "deadcat-simplex-version" {
           nativeBuildInputs = [ smplx ];
         } ''
-          simplex --version | grep -F "0.0.9"
+          actual="$(simplex --version)"
+          expected="Simplex ${smplx.version}"
+          if [ "$actual" != "$expected" ]; then
+            echo "expected '$expected', got '$actual'" >&2
+            exit 1
+          fi
           touch $out
         '';
 
@@ -55,7 +60,9 @@
           packages = with pkgs; [
             just
             git
+            jq
             pkg-config
+            python3
             cargo-nextest
           ] ++ [
             smplx
