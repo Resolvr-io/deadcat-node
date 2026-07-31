@@ -18,7 +18,7 @@ use elements::secp256k1_zkp::{Generator, Keypair, PedersenCommitment, Secp256k1,
 use elements::{
     AssetId, ContractHash, LockTime, OutPoint, Script, Sequence, TxOut, TxOutWitness, Txid,
 };
-use simplex::program::{ProgramTrait as _, WitnessTrait as _};
+use simplex::program::WitnessTrait as _;
 
 use support::{asset, bare_op_return, explicit_txout, network, pset_input, pset_output};
 
@@ -162,12 +162,7 @@ fn execute_active_expiry_with_locktime(
             tokens_burned: 0,
             redeem_yes: false,
         };
-        compiled.program(slot).as_ref().execute(
-            &pset,
-            &witness.build_witness(),
-            input_index,
-            &net,
-        )?;
+        compiled.execute(slot, &pset, &witness.build_witness(), input_index, &net)?;
     }
     Ok(())
 }
@@ -282,12 +277,7 @@ fn execute_initial_issuance(
             tokens_burned: 0,
             redeem_yes: false,
         };
-        compiled.program(slot).as_ref().execute(
-            &pset,
-            &witness.build_witness(),
-            input_index,
-            &network,
-        )?;
+        compiled.execute(slot, &pset, &witness.build_witness(), input_index, &network)?;
     }
     Ok(())
 }

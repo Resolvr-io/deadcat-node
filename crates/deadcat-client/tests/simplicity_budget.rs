@@ -7,7 +7,7 @@ use deadcat_contracts::binary_market::{
     BinaryMarketAction, BinaryMarketEconomics, BinaryMarketSlot, BinaryOutcome,
     CompiledBinaryMarket, derived_binary_market,
 };
-use deadcat_contracts::interpret::strip_taproot_annex;
+use deadcat_contracts::finalized_spend::FinalizedSimplicitySpend;
 use deadcat_contracts::interpret::{
     BinaryMarketLiveOutputs, TrackedContractOutput, interpret_binary_market_spend_with_compiled,
 };
@@ -22,9 +22,8 @@ use elements::pset::{Input as PsetInput, Output as PsetOutput, PartiallySignedTr
 use elements::secp256k1_zkp::{Keypair, Message, Secp256k1, Tweak};
 use elements::{AssetId, LockTime, OutPoint, Script, Sequence, TxOut, TxOutWitness, Txid};
 use serde::Serialize;
-use simplex::program::{ProgramTrait as _, WitnessTrait as _};
-use simplex::simplicityhl::simplicity::jet::Elements;
-use simplex::simplicityhl::simplicity::{BitIter, Cost, RedeemNode};
+use simplex::program::WitnessTrait as _;
+use simplex::simplicityhl::simplicity::Cost;
 
 // Rounded CI ceilings with headroom above the reviewed maxima of 4,557,857 mw,
 // 70,903 cells, 62 frames, 6,223 stack bytes, 15,334 transaction bytes,
@@ -149,34 +148,15 @@ fn assert_canonical_padding(label: &str, annex: &[u8]) {
 fn record_budget(label: impl Into<String>, stack: &[Vec<u8>]) -> CovenantMetrics {
     let label = label.into();
     let stack = stack.to_vec();
-    let (core_stack, annex) = strip_taproot_annex(&stack);
-    assert_eq!(
-        core_stack.len(),
-        4,
-        "{label}: finalized Simplicity stack must have four core elements"
-    );
-    let redeem = RedeemNode::decode::<_, _, Elements>(
-        BitIter::from(core_stack[1].iter().copied()),
-        BitIter::from(core_stack[0].iter().copied()),
-    )
-    .expect("decode finalized Simplicity program");
-    let bounds = redeem.bounds();
+    let finalized = FinalizedSimplicitySpend::from_witness_stack(stack.clone())
+        .unwrap_or_else(|error| panic!("{label}: {error}"));
+    let bounds = finalized.bounds();
     let cost = bounds.cost;
-    assert!(
-        cost.is_budget_valid(&stack),
-        "{label}: finalized stack is underbudget for execution cost {cost}mw"
-    );
-
-    let canonical_padding = cost.get_padding(&core_stack.to_vec());
-    assert_eq!(
-        annex,
-        canonical_padding.as_deref(),
-        "{label}: finalized stack must use exactly the canonical budget padding"
-    );
+    let annex = finalized.annex();
     if let Some(annex) = annex {
         assert_canonical_padding(&label, annex);
         if annex.len() > 1 {
-            let mut shortened = stack.clone();
+            let mut shortened = stack;
             assert_eq!(
                 shortened.last_mut().expect("annex").pop(),
                 Some(0),
@@ -189,14 +169,15 @@ fn record_budget(label: impl Into<String>, stack: &[Vec<u8>]) -> CovenantMetrics
         }
     }
 
+    let sizes = finalized.encoded_sizes();
     CovenantMetrics {
         cost_milliweight: cost_milliweight(cost),
         max_extra_cells: bounds.extra_cells,
         max_extra_frames: bounds.extra_frames,
-        program_bytes: core_stack[1].len(),
-        witness_bytes: core_stack[0].len(),
-        stack_bytes: elements::encode::serialize(&stack).len(),
-        padding_bytes: annex.map_or(0, <[u8]>::len),
+        program_bytes: sizes.program_bytes,
+        witness_bytes: sizes.witness_bytes,
+        stack_bytes: sizes.stack_bytes,
+        padding_bytes: sizes.annex_bytes,
     }
 }
 
@@ -656,7 +637,7 @@ fn finalized_market_fixture(
 }
 
 #[test]
-fn reusable_compiled_market_execution_matches_program_api() {
+fn typed_finalized_spend_round_trips_and_reexecutes_from_the_installed_stack() {
     let params = market_params();
     let compiled = CompiledBinaryMarket::new(params).expect("compile canonical market");
     let before = BinaryMarketState::Trading {
@@ -678,17 +659,29 @@ fn reusable_compiled_market_execution_matches_program_api() {
     let network = SimplicityNetwork::ElementsRegtest {
         policy_asset: params.collateral_asset_id,
     };
-
-    let reused = compiled
-        .finalize(slot, &pset, &witness.build_witness(), input_base, &network)
-        .expect("finalize retained compiled program");
-    let program_api = compiled
-        .program(slot)
+    let installed = pset.inputs()[input_base]
+        .final_script_witness
         .as_ref()
-        .finalize(&pset, &witness.build_witness(), input_base, &network)
-        .expect("finalize SDK program");
+        .expect("installed finalized witness");
 
-    assert_eq!(reused, program_api);
+    let finalized = compiled
+        .finalize(slot, &pset, &witness.build_witness(), input_base, &network)
+        .expect("build typed finalized spend");
+    assert_eq!(finalized.witness_stack(), installed);
+    assert_eq!(finalized.cmr(), compiled.cmr());
+    assert_eq!(
+        finalized.control_block(),
+        compiled.slot(slot).control_block()
+    );
+    assert_eq!(
+        finalized.encoded_sizes().stack_bytes,
+        elements::encode::serialize(installed).len()
+    );
+    assert_eq!(finalized.into_witness_stack(), *installed);
+
+    compiled
+        .execute_finalized(slot, &pset, input_base, &network)
+        .expect("re-execute installed finalized witness");
 }
 
 #[test]
@@ -1812,7 +1805,7 @@ fn market_followers_ignore_transition_witnesses_but_require_the_exact_coordinato
             .as_ref()
             .expect("canonical follower stack")
             .clone();
-        let mut mixed_stack = compiled
+        let mixed_stack = compiled
             .finalize(
                 slot,
                 &mixed_witness_pset,
@@ -1820,10 +1813,9 @@ fn market_followers_ignore_transition_witnesses_but_require_the_exact_coordinato
                 input_index,
                 &network,
             )
-            .expect("finalize mixed follower");
-        if canonical_stack.len() == 5 {
-            mixed_stack.push(canonical_stack[4].clone());
-        }
+            .expect("finalize mixed follower")
+            .into_witness_stack();
+        assert!((4..=5).contains(&canonical_stack.len()));
         record_budget(format!("mixed-follower-{slot:?}"), &mixed_stack);
         mixed_witness_pset.inputs_mut()[input_index].final_script_witness = Some(mixed_stack);
     }

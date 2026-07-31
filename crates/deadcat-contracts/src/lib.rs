@@ -4,6 +4,7 @@
 mod artifacts;
 
 pub mod binary_market;
+pub mod finalized_spend;
 pub mod interpret;
 pub mod market_crypto;
 pub mod recovery;

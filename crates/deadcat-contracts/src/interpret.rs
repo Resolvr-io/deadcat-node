@@ -1,11 +1,13 @@
 //! Confirmed-transaction decoding and typed covenant interpretation.
 
+use elements::taproot::ControlBlock;
 use elements::{OutPoint, TxOut};
+use simplex::simplicityhl::simplicity::Value;
 use simplex::simplicityhl::simplicity::dag::{DagLike as _, InternalSharing};
-use simplex::simplicityhl::simplicity::jet::Elements;
 use simplex::simplicityhl::simplicity::node::Inner;
-use simplex::simplicityhl::simplicity::{BitIter, HasCmr as _, RedeemNode, Value};
 use thiserror::Error;
+
+use crate::finalized_spend::{FinalizedSimplicitySpend, FinalizedSimplicitySpendError};
 
 mod binary_market;
 
@@ -29,12 +31,10 @@ pub enum InterpretError {
     NotCovenantSpend,
     #[error("tracked contract output is inconsistent with its parameters/state: {0}")]
     InvalidTrackedOutput(&'static str),
-    #[error("taproot witness stack has unsupported shape after annex stripping (len {len})")]
-    BadWitnessStack { len: usize },
     #[error("unexpected key-path spend")]
     UnexpectedKeySpend,
-    #[error("simplicity witness decode failed: {0}")]
-    Decode(String),
+    #[error("invalid finalized Simplicity spend: {0}")]
+    FinalizedSpend(#[from] FinalizedSimplicitySpendError),
     #[error("decoded Simplicity CMR does not match the compiled contract")]
     CmrMismatch,
     #[error("required decoded witness value is missing: {0}")]
@@ -60,20 +60,24 @@ pub enum InterpretError {
 /// assuming a fixed positional ABI.
 #[derive(Clone)]
 pub struct DecodedSimplicityWitness {
-    cmr: [u8; 32],
-    control_block: Vec<u8>,
+    finalized_spend: FinalizedSimplicitySpend,
     values: Vec<Value>,
 }
 
 impl DecodedSimplicityWitness {
     #[must_use]
     pub const fn cmr(&self) -> [u8; 32] {
-        self.cmr
+        self.finalized_spend.cmr()
     }
 
     #[must_use]
-    pub fn control_block(&self) -> &[u8] {
-        &self.control_block
+    pub const fn control_block(&self) -> &ControlBlock {
+        self.finalized_spend.control_block()
+    }
+
+    #[must_use]
+    pub const fn finalized_spend(&self) -> &FinalizedSimplicitySpend {
+        &self.finalized_spend
     }
 
     #[must_use]
@@ -123,54 +127,26 @@ impl DecodedSimplicityWitness {
     }
 }
 
-/// Remove a BIP341 annex from a finalized Taproot witness.
-///
-/// Annex recognition requires at least two elements, preventing a key-spend
-/// signature beginning with `0x50` from being mistaken for an annex.
-#[must_use]
-pub fn strip_taproot_annex(stack: &[Vec<u8>]) -> (&[Vec<u8>], Option<&[u8]>) {
-    if stack.len() >= 2
-        && stack
-            .last()
-            .and_then(|element| element.first())
-            .is_some_and(|byte| *byte == 0x50)
-    {
-        let (without, annex) = stack.split_at(stack.len() - 1);
-        (without, Some(annex[0].as_slice()))
-    } else {
-        (stack, None)
-    }
-}
-
 /// Decode the four-element smplx script-path stack
-/// `[witness_bits, program_bits, cmr, control_block]`.
+/// `[witness_bits, program_bits, cmr, control_block]` and validate its
+/// canonical minimal budget annex.
 pub fn decode_simplicity_witness(
     stack: &[Vec<u8>],
 ) -> Result<DecodedSimplicityWitness, InterpretError> {
-    let (stack, _) = strip_taproot_annex(stack);
-    if stack.len() != 4 {
-        return Err(InterpretError::BadWitnessStack { len: stack.len() });
-    }
-    let redeem = RedeemNode::decode::<_, _, Elements>(
-        BitIter::from(stack[1].iter().copied()),
-        BitIter::from(stack[0].iter().copied()),
-    )
-    .map_err(|error| InterpretError::Decode(format!("{error:?}")))?;
-    if redeem.cmr().as_ref() != stack[2].as_slice() {
-        return Err(InterpretError::CmrMismatch);
-    }
-    let mut cmr = [0_u8; 32];
-    cmr.copy_from_slice(&stack[2]);
+    let finalized_spend = FinalizedSimplicitySpend::parse_witness_stack(stack)?;
 
     let mut values = Vec::new();
-    for item in redeem.as_ref().post_order_iter::<InternalSharing>() {
+    for item in finalized_spend
+        .redeem_node()
+        .as_ref()
+        .post_order_iter::<InternalSharing>()
+    {
         if let Inner::Witness(value) = item.node.inner() {
             values.push(value.shallow_clone());
         }
     }
     Ok(DecodedSimplicityWitness {
-        cmr,
-        control_block: stack[3].clone(),
+        finalized_spend,
         values,
     })
 }

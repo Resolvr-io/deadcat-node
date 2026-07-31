@@ -13,7 +13,10 @@ mod compiled;
 
 pub use crate::artifacts::binary_market::BinaryMarketProgram;
 pub use crate::artifacts::binary_market::derived_binary_market;
-pub use compiled::{CompiledBinaryMarket, CompiledBinaryMarketError, CompiledBinaryMarketSlot};
+pub use compiled::{
+    CompiledBinaryMarket, CompiledBinaryMarketError, CompiledBinaryMarketExecutionError,
+    CompiledBinaryMarketSlot,
+};
 
 /// Version byte stored in market slot scripts.
 pub const BINARY_MARKET_STORAGE_VERSION: u8 = 0x01;
