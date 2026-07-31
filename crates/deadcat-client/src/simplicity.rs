@@ -8,7 +8,7 @@ pub(crate) fn ensure_budget(mut stack: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>, Str
             stack.len()
         ));
     }
-    let redeem = RedeemNode::<Elements>::decode(
+    let redeem = RedeemNode::decode::<_, _, Elements>(
         BitIter::from(stack[1].iter().copied()),
         BitIter::from(stack[0].iter().copied()),
     )

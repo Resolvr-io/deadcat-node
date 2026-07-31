@@ -43,9 +43,11 @@ deadcat-rpc = { path = "crates/deadcat-rpc" }
 deadcat-iroh = { path = "crates/deadcat-iroh" }
 
 # The CLI and Rust libraries must remain on the exact same smplx release.
-smplx-std = "=0.0.6"
-smplx-sdk = "=0.0.6"
-smplx-regtest = "=0.0.6"
+# smplx 0.0.9 caps simplicityhl at 0.6.x; Cargo.lock pins the newest
+# compatible simplicityhl/simplicity-lang/simplicity-sys stack.
+smplx-std = "=0.0.9"
+smplx-sdk = "=0.0.9"
+smplx-regtest = "=0.0.9"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

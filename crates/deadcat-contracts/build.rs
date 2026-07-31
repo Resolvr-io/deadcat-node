@@ -1,6 +1,6 @@
 use std::process::Command;
 
-const EXPECTED_SMPLX_VERSION: &str = "0.0.6";
+const EXPECTED_SMPLX_VERSION: &str = "0.0.9";
 
 fn main() {
     println!("cargo::rerun-if-changed=simplicityhl");

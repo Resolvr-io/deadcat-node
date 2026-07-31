@@ -28,11 +28,11 @@
         ];
         smplx = pkgsUnstable.rustPlatform.buildRustPackage rec {
           pname = "smplx";
-          version = "0.0.6";
+          version = "0.0.9";
           src = pkgs.fetchgit {
             url = "https://github.com/BlockstreamResearch/smplx.git";
-            rev = "97782c796fbb4f2845f6fdb9dfb8d5a228dc8f2c";
-            hash = "sha256-g93UmL7P4gU5KpwT7s5OCHv0pqiCrIzzX1qxaSqFniE=";
+            rev = "b7f38a05ce5ca2d8852489a2a664799e27745d20";
+            hash = "sha256-G7RyqxPZvMNh5uP77O2joh+eVuFarZhSg/HJZIANigo=";
             fetchSubmodules = false;
           };
           cargoLock.lockFile = ./nix/smplx-Cargo.lock;
@@ -47,7 +47,7 @@
         checks.simplex-version = pkgs.runCommand "deadcat-simplex-version" {
           nativeBuildInputs = [ smplx ];
         } ''
-          simplex --version | grep -F "0.0.6"
+          simplex --version | grep -F "0.0.9"
           touch $out
         '';
 

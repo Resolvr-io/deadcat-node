@@ -13,12 +13,12 @@ use simplex::global::GlobalConfig;
 use simplex::program::logger::ProgramLogger;
 use simplex::program::{ArgumentsTrait as _, ProgramError};
 use simplex::provider::SimplicityNetwork;
-use simplex::simplicityhl::simplicity::jet::Elements;
+use simplex::simplicityhl::ast::ElementsJetHinter;
 use simplex::simplicityhl::simplicity::jet::elements::{ElementsEnv, ElementsUtxo};
 use simplex::simplicityhl::simplicity::{
     BitMachine, HasCmr as _, RedeemNode, Value as SimplicityValue, leaf_version,
 };
-use simplex::simplicityhl::{CompiledProgram, WitnessValues};
+use simplex::simplicityhl::{CompiledProgram, UnstableFeatures, WitnessValues};
 use thiserror::Error;
 
 use super::{BinaryMarketEconomics, BinaryMarketParams, BinaryMarketSlot};
@@ -81,10 +81,12 @@ impl CompiledBinaryMarket {
         validate_params(params)?;
 
         let arguments = contract_arguments(params)?;
-        let compiled = CompiledProgram::new(
+        let compiled = CompiledProgram::new_with_unstable(
             BinaryMarketProgram::SOURCE,
+            &UnstableFeatures::all(),
             arguments.build_arguments(),
             false,
+            Box::new(ElementsJetHinter),
         )
         .map_err(CompiledBinaryMarketError::Compilation)?;
         let cmr_node = compiled.commit().cmr();
@@ -157,7 +159,7 @@ impl CompiledBinaryMarket {
         witness: &WitnessValues,
         input_index: usize,
         network: &SimplicityNetwork,
-    ) -> Result<(Arc<RedeemNode<Elements>>, SimplicityValue), ProgramError> {
+    ) -> Result<(Arc<RedeemNode>, SimplicityValue), ProgramError> {
         let satisfied = self
             .compiled
             .satisfy(witness.clone())
