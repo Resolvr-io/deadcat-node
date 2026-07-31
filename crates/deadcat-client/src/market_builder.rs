@@ -8,13 +8,14 @@
 
 use deadcat_contracts::SimplicityNetwork;
 use deadcat_contracts::binary_market::{
-    AppliedBinaryMarketTransition, BinaryMarketAction, BinaryMarketEconomics, BinaryMarketError,
-    BinaryMarketSlot, BinaryMarketTransition, BinaryOutcome, CompiledBinaryMarket,
-    CompiledBinaryMarketError, CompiledBinaryMarketExecutionError, derived_binary_market,
+    AppliedBinaryMarketTransition, BinaryMarketAction, BinaryMarketCoordinatorAction,
+    BinaryMarketEconomics, BinaryMarketError, BinaryMarketLayout, BinaryMarketLayoutError,
+    BinaryMarketPath, BinaryMarketResolution, BinaryMarketSlot, BinaryMarketTransition,
+    BinaryMarketWitness, BinaryOutcome, CompiledBinaryMarket, CompiledBinaryMarketError,
+    CompiledBinaryMarketExecutionError,
 };
 #[cfg(test)]
 use deadcat_contracts::finalized_spend::FinalizedSimplicitySpend;
-use deadcat_contracts::interpret::BinaryMarketPath;
 use deadcat_contracts::market_crypto::{
     BinaryOutcome as OracleOutcome, derive_issuance_assets, oracle_message,
 };
@@ -38,7 +39,6 @@ use elements::{
 };
 use rand::SeedableRng as _;
 use rand::rngs::StdRng;
-use simplex::program::WitnessTrait as _;
 use thiserror::Error;
 
 /// Network-known assets needed to verify a compact market recovery hint.
@@ -264,14 +264,12 @@ pub struct BinaryMarketTransitionPlan {
     params: BinaryMarketParams,
     before: BinaryMarketState,
     applied: AppliedBinaryMarketTransition,
-    path: BinaryMarketPath,
+    layout: BinaryMarketLayout,
     live: BinaryMarketLiveInputs,
     output_templates: Vec<TxOut>,
     yes_output_factors: Option<RtFactors>,
     no_output_factors: Option<RtFactors>,
-    oracle_signature: [u8; 64],
-    tokens_burned: u64,
-    redeem_yes: bool,
+    resolution: Option<BinaryMarketResolution>,
 }
 
 impl BinaryMarketTransitionPlan {
@@ -301,9 +299,10 @@ impl BinaryMarketTransitionPlan {
         let params = compiled.params();
         let economics = BinaryMarketEconomics::new(params.base_payout)?;
         let applied = economics.apply(before, action)?;
-        let path = select_path(before, action, applied)?;
+        let layout = BinaryMarketLayout::for_transition(before, action, applied)?;
+        let path = layout.path();
         validate_live_shape(compiled, params, before, path, &live)?;
-        let oracle_signature = validate_attestation(params, action, attestation)?;
+        let resolution = validate_attestation(params, action, attestation)?;
         let (tokens_burned, redeem_yes) = match action {
             BinaryMarketAction::Redeem { outcome, tokens } => {
                 (tokens, outcome == BinaryOutcome::Yes)
@@ -397,20 +396,23 @@ impl BinaryMarketTransitionPlan {
             params,
             before,
             applied,
-            path,
+            layout,
             live,
             output_templates,
             yes_output_factors,
             no_output_factors,
-            oracle_signature,
-            tokens_burned,
-            redeem_yes,
+            resolution,
         })
     }
 
     #[must_use]
     pub const fn path(&self) -> BinaryMarketPath {
-        self.path
+        self.layout.path()
+    }
+
+    #[must_use]
+    pub const fn layout(&self) -> BinaryMarketLayout {
+        self.layout
     }
 
     #[must_use]
@@ -507,7 +509,7 @@ impl BinaryMarketTransitionPlan {
         input_base: usize,
     ) -> Result<(), MarketBuilderError> {
         if !matches!(
-            self.path,
+            self.path(),
             BinaryMarketPath::ActiveExpiry | BinaryMarketPath::DormantExpiry
         ) {
             return Err(MarketBuilderError::NotExpiryPath);
@@ -588,7 +590,7 @@ impl BinaryMarketTransitionPlan {
             }
         }
 
-        if path_consumes_rt(self.path) {
+        if path_consumes_rt(self.path()) {
             let yes = self
                 .live
                 .yes_rt
@@ -636,27 +638,17 @@ impl BinaryMarketTransitionPlan {
 
         let output_base_u32 =
             u32::try_from(output_base).map_err(|_| MarketBuilderError::IndexOverflow)?;
-        let input_slots = self.input_slots();
-        let mut finalized = Vec::with_capacity(input_slots.len());
-        for (offset, slot) in input_slots.iter().copied().enumerate() {
+        let action = BinaryMarketCoordinatorAction::for_layout(
+            self.layout,
+            output_base_u32,
+            self.resolution,
+        )?;
+        let input_roles = self.layout.input_roles();
+        let mut finalized = Vec::with_capacity(input_roles.len());
+        for (offset, role) in input_roles.iter().copied().enumerate() {
             let input_index = add_index(input_base, offset)?;
-            let oracle_outcome_yes = self.redeem_yes
-                || matches!(
-                    self.applied.transition,
-                    BinaryMarketTransition::Resolved {
-                        outcome: BinaryOutcome::Yes,
-                        ..
-                    }
-                );
-            let witness = derived_binary_market::BinaryMarketWitness {
-                path: self.path as u8,
-                slot: slot as u8,
-                output_base: output_base_u32,
-                oracle_outcome_yes,
-                oracle_signature: self.oracle_signature,
-                tokens_burned: self.tokens_burned,
-                redeem_yes: self.redeem_yes,
-            };
+            let slot = role.slot();
+            let witness = BinaryMarketWitness::new(self.layout, role, action)?;
             let spend =
                 compiled.finalize(slot, pset, &witness.build_witness(), input_index, network)?;
             finalized.push((input_index, spend.into_witness_stack()));
@@ -664,9 +656,9 @@ impl BinaryMarketTransitionPlan {
         for (input_index, stack) in finalized {
             pset.inputs_mut()[input_index].final_script_witness = Some(stack);
         }
-        for (offset, slot) in input_slots.iter().copied().enumerate() {
+        for (offset, role) in input_roles.iter().copied().enumerate() {
             let input_index = add_index(input_base, offset)?;
-            compiled.execute_finalized(slot, pset, input_index, network)?;
+            compiled.execute_finalized(role.slot(), pset, input_index, network)?;
         }
         Ok(())
     }
@@ -808,7 +800,7 @@ impl BinaryMarketTransitionPlan {
         input_base: usize,
     ) -> Result<(), MarketBuilderError> {
         if !matches!(
-            self.path,
+            self.path(),
             BinaryMarketPath::ActiveExpiry | BinaryMarketPath::DormantExpiry
         ) {
             return Ok(());
@@ -836,29 +828,11 @@ impl BinaryMarketTransitionPlan {
     }
 
     fn input_slots(&self) -> Vec<BinaryMarketSlot> {
-        match self.path {
-            BinaryMarketPath::InitialIssuance
-            | BinaryMarketPath::DormantResolution
-            | BinaryMarketPath::DormantExpiry => vec![
-                BinaryMarketSlot::DormantYesRt,
-                BinaryMarketSlot::DormantNoRt,
-            ],
-            BinaryMarketPath::SubsequentIssuance
-            | BinaryMarketPath::PartialCancellation
-            | BinaryMarketPath::FullCancellation
-            | BinaryMarketPath::ActiveResolution
-            | BinaryMarketPath::ActiveExpiry => vec![
-                BinaryMarketSlot::UnresolvedYesRt,
-                BinaryMarketSlot::UnresolvedNoRt,
-                BinaryMarketSlot::UnresolvedCollateral,
-            ],
-            BinaryMarketPath::ResolvedRedemption => vec![match self.before {
-                BinaryMarketState::ResolvedYes { .. } => BinaryMarketSlot::ResolvedYesCollateral,
-                BinaryMarketState::ResolvedNo { .. } => BinaryMarketSlot::ResolvedNoCollateral,
-                _ => unreachable!("path selection validates resolved state"),
-            }],
-            BinaryMarketPath::ExpiryRedemption => vec![BinaryMarketSlot::ExpiredCollateral],
-        }
+        self.layout
+            .input_roles()
+            .iter()
+            .map(|role| role.slot())
+            .collect()
     }
 
     fn contract_input_indices(&self, input_base: usize) -> Result<Vec<usize>, MarketBuilderError> {
@@ -1096,54 +1070,6 @@ fn append_non_rt_outputs(
     }
 }
 
-fn select_path(
-    before: BinaryMarketState,
-    action: BinaryMarketAction,
-    applied: AppliedBinaryMarketTransition,
-) -> Result<BinaryMarketPath, MarketBuilderError> {
-    Ok(match action {
-        BinaryMarketAction::Issue { .. } => match before {
-            BinaryMarketState::Trading {
-                outstanding_pairs: 0,
-            } => BinaryMarketPath::InitialIssuance,
-            BinaryMarketState::Trading { .. } => BinaryMarketPath::SubsequentIssuance,
-            _ => return Err(MarketBuilderError::UnsupportedTransition),
-        },
-        BinaryMarketAction::Cancel { .. } => match applied.transition {
-            BinaryMarketTransition::Cancelled { full: true, .. } => {
-                BinaryMarketPath::FullCancellation
-            }
-            BinaryMarketTransition::Cancelled { full: false, .. } => {
-                BinaryMarketPath::PartialCancellation
-            }
-            _ => return Err(MarketBuilderError::UnsupportedTransition),
-        },
-        BinaryMarketAction::Resolve { .. } => match before {
-            BinaryMarketState::Trading {
-                outstanding_pairs: 0,
-            } => BinaryMarketPath::DormantResolution,
-            BinaryMarketState::Trading { .. } => BinaryMarketPath::ActiveResolution,
-            _ => return Err(MarketBuilderError::UnsupportedTransition),
-        },
-        BinaryMarketAction::Expire => match before {
-            BinaryMarketState::Trading {
-                outstanding_pairs: 0,
-            } => BinaryMarketPath::DormantExpiry,
-            BinaryMarketState::Trading { .. } => BinaryMarketPath::ActiveExpiry,
-            _ => return Err(MarketBuilderError::UnsupportedTransition),
-        },
-        BinaryMarketAction::Redeem { .. } => match before {
-            BinaryMarketState::ResolvedYes { .. } | BinaryMarketState::ResolvedNo { .. } => {
-                BinaryMarketPath::ResolvedRedemption
-            }
-            BinaryMarketState::Expired { .. } => BinaryMarketPath::ExpiryRedemption,
-            BinaryMarketState::Trading { .. } => {
-                return Err(MarketBuilderError::UnsupportedTransition);
-            }
-        },
-    })
-}
-
 fn validate_live_shape(
     compiled: &CompiledBinaryMarket,
     params: BinaryMarketParams,
@@ -1255,12 +1181,12 @@ fn validate_attestation(
     params: BinaryMarketParams,
     action: BinaryMarketAction,
     attestation: Option<OracleAttestation>,
-) -> Result<[u8; 64], MarketBuilderError> {
+) -> Result<Option<BinaryMarketResolution>, MarketBuilderError> {
     let BinaryMarketAction::Resolve { outcome } = action else {
         if attestation.is_some() {
             return Err(MarketBuilderError::UnexpectedOracleAttestation);
         }
-        return Ok([0; 64]);
+        return Ok(None);
     };
     let attestation = attestation.ok_or(MarketBuilderError::MissingOracleAttestation)?;
     if attestation.outcome != outcome {
@@ -1282,7 +1208,10 @@ fn validate_attestation(
     Secp256k1::verification_only()
         .verify_schnorr(&signature, &message, &public_key)
         .map_err(|_| MarketBuilderError::InvalidOracleAttestation)?;
-    Ok(attestation.signature)
+    Ok(Some(BinaryMarketResolution::new(
+        attestation.outcome,
+        attestation.signature,
+    )))
 }
 
 fn validate_market_hint(
@@ -1471,6 +1400,8 @@ fn compile(params: BinaryMarketParams) -> Result<CompiledBinaryMarket, MarketBui
 pub enum MarketBuilderError {
     #[error("binary-market economics error: {0}")]
     Economics(#[from] BinaryMarketError),
+    #[error("binary-market layout error: {0}")]
+    Layout(#[from] BinaryMarketLayoutError),
     #[error("recovery encoding error: {0}")]
     Recovery(#[from] RecoveryError),
     #[error("RT commitment error: {0}")]
@@ -1497,8 +1428,6 @@ pub enum MarketBuilderError {
     InvalidSiblingGroup,
     #[error("the live YES and NO RTs are on different A/B sides")]
     MismatchedRtSides,
-    #[error("unsupported state/action transition")]
-    UnsupportedTransition,
     #[error("resolution requires an oracle attestation")]
     MissingOracleAttestation,
     #[error("an oracle attestation was supplied for a non-resolution path")]

@@ -6,7 +6,8 @@
 mod support;
 
 use deadcat_contracts::binary_market::{
-    BinaryMarketSlot, CompiledBinaryMarket, derived_binary_market,
+    BinaryMarketCoordinatorAction, BinaryMarketCoordinatorRole, BinaryMarketLayout,
+    BinaryMarketOperation, BinaryMarketSlot, BinaryMarketWitness, CompiledBinaryMarket,
 };
 use deadcat_contracts::market_crypto::derive_issuance_assets;
 use deadcat_contracts::rt::{RtFactors, RtLeg, RtSide, factors};
@@ -18,8 +19,6 @@ use elements::secp256k1_zkp::{Generator, Keypair, PedersenCommitment, Secp256k1,
 use elements::{
     AssetId, ContractHash, LockTime, OutPoint, Script, Sequence, TxOut, TxOutWitness, Txid,
 };
-use simplex::program::WitnessTrait as _;
-
 use support::{asset, bare_op_return, explicit_txout, network, pset_input, pset_output};
 
 fn oracle_key() -> [u8; 32] {
@@ -151,17 +150,15 @@ fn execute_active_expiry_with_locktime(
         BinaryMarketSlot::UnresolvedNoRt,
         BinaryMarketSlot::UnresolvedCollateral,
     ];
+    let layout = BinaryMarketLayout::for_operation(
+        BinaryMarketCoordinatorRole::UnresolvedYesRt,
+        BinaryMarketOperation::Expire,
+        None,
+    )?;
+    let action = BinaryMarketCoordinatorAction::for_layout(layout, 0, None)?;
     let net = network(params.collateral_asset_id);
     for (input_index, slot) in slots.into_iter().enumerate() {
-        let witness = derived_binary_market::BinaryMarketWitness {
-            path: 6,
-            slot: slot as u8,
-            output_base: 0,
-            oracle_outcome_yes: false,
-            oracle_signature: [0; 64],
-            tokens_burned: 0,
-            redeem_yes: false,
-        };
+        let witness = BinaryMarketWitness::for_slot(layout, slot, action)?;
         compiled.execute(slot, &pset, &witness.build_witness(), input_index, &net)?;
     }
     Ok(())
@@ -261,6 +258,12 @@ fn execute_initial_issuance(
     )));
 
     let network = network(params.collateral_asset_id);
+    let layout = BinaryMarketLayout::for_operation(
+        BinaryMarketCoordinatorRole::DormantYesRt,
+        BinaryMarketOperation::Issue,
+        None,
+    )?;
+    let action = BinaryMarketCoordinatorAction::for_layout(layout, 0, None)?;
     for (input_index, slot) in [
         BinaryMarketSlot::DormantYesRt,
         BinaryMarketSlot::DormantNoRt,
@@ -268,15 +271,7 @@ fn execute_initial_issuance(
     .into_iter()
     .enumerate()
     {
-        let witness = derived_binary_market::BinaryMarketWitness {
-            path: 0,
-            slot: slot as u8,
-            output_base: 0,
-            oracle_outcome_yes: false,
-            oracle_signature: [0; 64],
-            tokens_burned: 0,
-            redeem_yes: false,
-        };
+        let witness = BinaryMarketWitness::for_slot(layout, slot, action)?;
         compiled.execute(slot, &pset, &witness.build_witness(), input_index, &network)?;
     }
     Ok(())

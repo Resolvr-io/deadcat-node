@@ -2,51 +2,21 @@ use deadcat_types::{BinaryMarketParams, BinaryMarketState};
 use elements::confidential::{Asset, Value};
 use elements::secp256k1_zkp::{Message, Secp256k1, Tweak, XOnlyPublicKey, schnorr::Signature};
 use elements::{AssetId, OutPoint, Transaction, TxOut};
+use simplex::simplicityhl::simplicity::types::Final;
+use simplex::simplicityhl::simplicity::{Value as SimplicityValue, ValueRef};
 
 use super::{
     DecodedSimplicityWitness, InterpretError, TrackedContractOutput, decode_simplicity_witness,
     locate_input, output_at,
 };
 use crate::binary_market::{
-    AppliedBinaryMarketTransition, BinaryMarketAction, BinaryMarketEconomics, BinaryMarketSlot,
-    CompiledBinaryMarket,
+    AppliedBinaryMarketTransition, BinaryMarketAction, BinaryMarketCoordinatorAction,
+    BinaryMarketCoordinatorRole, BinaryMarketEconomics, BinaryMarketLayout, BinaryMarketPath,
+    BinaryMarketResolution, BinaryMarketSlot, CompiledBinaryMarket,
 };
 use crate::binary_market::{BinaryMarketTransition, BinaryOutcome};
 use crate::market_crypto::{BinaryOutcome as OracleOutcome, oracle_message};
 use crate::rt::{RtFactors, RtLeg, RtSide, commitments, factors, infer_side};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum BinaryMarketPath {
-    InitialIssuance = 0,
-    SubsequentIssuance = 1,
-    PartialCancellation = 2,
-    FullCancellation = 3,
-    ActiveResolution = 4,
-    DormantResolution = 5,
-    ActiveExpiry = 6,
-    DormantExpiry = 7,
-    ResolvedRedemption = 8,
-    ExpiryRedemption = 9,
-}
-
-impl BinaryMarketPath {
-    fn from_tag(tag: u8) -> Option<Self> {
-        Some(match tag {
-            0 => Self::InitialIssuance,
-            1 => Self::SubsequentIssuance,
-            2 => Self::PartialCancellation,
-            3 => Self::FullCancellation,
-            4 => Self::ActiveResolution,
-            5 => Self::DormantResolution,
-            6 => Self::ActiveExpiry,
-            7 => Self::DormantExpiry,
-            8 => Self::ResolvedRedemption,
-            9 => Self::ExpiryRedemption,
-            _ => return None,
-        })
-    }
-}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BinaryMarketLiveOutputs {
@@ -131,86 +101,59 @@ pub fn interpret_binary_market_spend_with_compiled(
     if decoded.cmr() != compiled.cmr() {
         return Err(InterpretError::CmrMismatch);
     }
-    let expected_slot = primary_slot(before);
+    let coordinator = BinaryMarketCoordinatorRole::for_state(before);
+    let expected_slot = coordinator.slot();
     if decoded.control_block() != compiled.slot(expected_slot).control_block() {
         return Err(InterpretError::Inconsistent(
             "market control block mismatch",
         ));
     }
-    if !decoded.u8_values().contains(&(expected_slot as u8)) {
-        return Err(InterpretError::MissingWitness("SLOT"));
-    }
+    let operation = decode_market_witness(&decoded, expected_slot)?;
+    let output_base = operation.output_base();
     let live_rt_sides = infer_live_rt_sides(params, before, live)?;
-
-    let u8_values = decoded.u8_values();
-    let paths: Vec<BinaryMarketPath> = u8_values
-        .iter()
-        .copied()
-        .filter_map(BinaryMarketPath::from_tag)
-        .filter(|path| path_allowed(*path, before))
-        .filter(|path| {
-            u8_values
-                .iter()
-                .all(|value| *value == expected_slot as u8 || *value == *path as u8)
-        })
-        .collect();
-    if paths.is_empty() {
-        return Err(InterpretError::MissingWitness("PATH"));
-    }
-    let output_bases = decoded.u32_values();
-    match output_bases.len() {
-        0 => return Err(InterpretError::MissingWitness("OUTPUT_BASE")),
-        1 => {}
-        _ => return Err(InterpretError::AmbiguousInterpretation),
-    }
-
-    let economics = BinaryMarketEconomics::new(params.base_payout)?;
-    let mut interpretations = Vec::new();
-    for path in paths {
-        let outcomes = candidate_outcomes(path, params, &decoded, transaction)?;
-        let token_amounts = if matches!(
-            path,
-            BinaryMarketPath::ResolvedRedemption | BinaryMarketPath::ExpiryRedemption
-        ) {
-            decoded.u64_values()
-        } else {
-            vec![0]
-        };
-        for output_base in output_bases.iter().copied() {
-            for outcome_yes in outcomes.iter().copied() {
-                for tokens in token_amounts.iter().copied() {
-                    if let Ok(interpretation) = interpret_candidate(
-                        params,
-                        economics,
-                        compiled,
-                        before,
-                        live,
-                        live_rt_sides,
-                        transaction,
-                        path,
-                        input_base,
-                        output_base,
-                        outcome_yes,
-                        tokens,
-                    ) && !interpretations.contains(&interpretation)
-                    {
-                        interpretations.push(interpretation);
-                    }
-                }
-            }
+    let full_cancellation = match operation {
+        BinaryMarketCoordinatorAction::Cancel { .. } => {
+            Some(cancellation_is_full(params, transaction, output_base)?)
         }
-    }
-    match interpretations.len() {
-        0 => Err(InterpretError::Inconsistent(
-            "no decoded market path matches the transaction",
-        )),
-        1 => Ok(interpretations.pop().expect("one interpretation")),
-        _ => Err(InterpretError::AmbiguousInterpretation),
-    }
+        _ => None,
+    };
+    let layout = BinaryMarketLayout::for_operation(
+        BinaryMarketCoordinatorRole::try_from(expected_slot)?,
+        operation.operation(),
+        full_cancellation,
+    )?;
+    let (outcome_yes, tokens) = match operation {
+        BinaryMarketCoordinatorAction::Resolve { resolution, .. } => {
+            let outcome_yes = resolution.outcome() == BinaryOutcome::Yes;
+            if !verify_oracle_signature(params, outcome_yes, &resolution.signature()) {
+                return Err(InterpretError::Inconsistent("invalid oracle signature"));
+            }
+            (outcome_yes, 0)
+        }
+        BinaryMarketCoordinatorAction::Redeem { .. } => {
+            redemption_details(params, before, transaction, output_base)?
+        }
+        _ => (false, 0),
+    };
+    let economics = BinaryMarketEconomics::new(params.base_payout)?;
+    interpret_decoded_action(
+        params,
+        economics,
+        compiled,
+        before,
+        live,
+        live_rt_sides,
+        transaction,
+        layout,
+        input_base,
+        output_base,
+        outcome_yes,
+        tokens,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn interpret_candidate(
+fn interpret_decoded_action(
     params: BinaryMarketParams,
     economics: BinaryMarketEconomics,
     compiled: &CompiledBinaryMarket,
@@ -218,13 +161,14 @@ fn interpret_candidate(
     live: &BinaryMarketLiveOutputs,
     live_rt_sides: BinaryMarketRtSides,
     transaction: &Transaction,
-    path: BinaryMarketPath,
+    layout: BinaryMarketLayout,
     input_base: u32,
     output_base: u32,
     outcome_yes: bool,
     tokens: u64,
 ) -> Result<BinaryMarketInterpretation, InterpretError> {
-    let spent = verify_input_group(path, before, live, transaction, input_base)?;
+    let path = layout.path();
+    let spent = verify_input_group(layout, before, live, transaction, input_base)?;
     let action = match path {
         BinaryMarketPath::InitialIssuance | BinaryMarketPath::SubsequentIssuance => {
             let yes_side = live_rt_sides
@@ -319,7 +263,7 @@ fn interpret_candidate(
         params,
         compiled,
         transaction,
-        path,
+        layout,
         before,
         live,
         live_rt_sides,
@@ -345,7 +289,7 @@ fn verify_outputs(
     params: BinaryMarketParams,
     compiled: &CompiledBinaryMarket,
     transaction: &Transaction,
-    path: BinaryMarketPath,
+    layout: BinaryMarketLayout,
     before: BinaryMarketState,
     live: &BinaryMarketLiveOutputs,
     live_rt_sides: BinaryMarketRtSides,
@@ -353,6 +297,7 @@ fn verify_outputs(
     output_base: u32,
     tokens: u64,
 ) -> Result<Vec<BinaryMarketContinuation>, InterpretError> {
+    let path = layout.path();
     let mut output = Vec::new();
     let yes_continuation =
         opposite_side_factors(RtLeg::Yes, live.yes_rt.as_ref(), live_rt_sides.yes)?;
@@ -591,16 +536,39 @@ fn verify_outputs(
 }
 
 fn verify_input_group(
-    path: BinaryMarketPath,
+    layout: BinaryMarketLayout,
     before: BinaryMarketState,
     live: &BinaryMarketLiveOutputs,
     transaction: &Transaction,
     input_base: u32,
 ) -> Result<Vec<OutPoint>, InterpretError> {
-    match path {
-        BinaryMarketPath::InitialIssuance
-        | BinaryMarketPath::DormantResolution
-        | BinaryMarketPath::DormantExpiry => {
+    let path = layout.path();
+    let mut spent = Vec::with_capacity(layout.input_roles().len());
+    for (offset, role) in layout.input_roles().iter().copied().enumerate() {
+        let tracked = match role.slot() {
+            BinaryMarketSlot::DormantYesRt | BinaryMarketSlot::UnresolvedYesRt => {
+                live.yes_rt.as_ref()
+            }
+            BinaryMarketSlot::DormantNoRt | BinaryMarketSlot::UnresolvedNoRt => live.no_rt.as_ref(),
+            BinaryMarketSlot::UnresolvedCollateral
+            | BinaryMarketSlot::ResolvedYesCollateral
+            | BinaryMarketSlot::ResolvedNoCollateral
+            | BinaryMarketSlot::ExpiredCollateral => live.collateral.as_ref(),
+        }
+        .ok_or(InterpretError::InvalidTrackedOutput(
+            "missing input role output",
+        ))?;
+        let offset = u32::try_from(offset).map_err(|_| InterpretError::IndexOverflow)?;
+        check_input(
+            transaction,
+            add_index(input_base, offset)?,
+            tracked.outpoint,
+        )?;
+        spent.push(tracked.outpoint);
+    }
+
+    match layout.coordinator_role() {
+        BinaryMarketCoordinatorRole::DormantYesRt => {
             if before
                 != (BinaryMarketState::Trading {
                     outstanding_pairs: 0,
@@ -616,8 +584,6 @@ fn verify_input_group(
                 .no_rt
                 .as_ref()
                 .ok_or(InterpretError::InvalidTrackedOutput("missing NO RT"))?;
-            check_input(transaction, input_base, yes.outpoint)?;
-            check_input(transaction, add_index(input_base, 1)?, no.outpoint)?;
             if yes.outpoint.txid != no.outpoint.txid {
                 return Err(InterpretError::Inconsistent(
                     "dormant siblings have different txids",
@@ -631,13 +597,9 @@ fn verify_input_group(
                     "issuance on dormant terminal path",
                 ));
             }
-            Ok(vec![yes.outpoint, no.outpoint])
+            Ok(spent)
         }
-        BinaryMarketPath::SubsequentIssuance
-        | BinaryMarketPath::PartialCancellation
-        | BinaryMarketPath::FullCancellation
-        | BinaryMarketPath::ActiveResolution
-        | BinaryMarketPath::ActiveExpiry => {
+        BinaryMarketCoordinatorRole::UnresolvedYesRt => {
             if !matches!(before, BinaryMarketState::Trading { outstanding_pairs } if outstanding_pairs > 0)
             {
                 return Err(InterpretError::Inconsistent("active input state"));
@@ -654,9 +616,6 @@ fn verify_input_group(
                 .collateral
                 .as_ref()
                 .ok_or(InterpretError::InvalidTrackedOutput("missing collateral"))?;
-            check_input(transaction, input_base, yes.outpoint)?;
-            check_input(transaction, add_index(input_base, 1)?, no.outpoint)?;
-            check_input(transaction, add_index(input_base, 2)?, collateral.outpoint)?;
             if no.outpoint.txid != yes.outpoint.txid
                 || collateral.outpoint.txid != yes.outpoint.txid
                 || no.outpoint.vout
@@ -696,18 +655,15 @@ fn verify_input_group(
                     "collateral input carries issuance",
                 ));
             }
-            Ok(vec![yes.outpoint, no.outpoint, collateral.outpoint])
+            Ok(spent)
         }
-        BinaryMarketPath::ResolvedRedemption | BinaryMarketPath::ExpiryRedemption => {
-            let collateral = live
-                .collateral
-                .as_ref()
-                .ok_or(InterpretError::InvalidTrackedOutput("missing collateral"))?;
-            check_input(transaction, input_base, collateral.outpoint)?;
+        BinaryMarketCoordinatorRole::ResolvedYesCollateral
+        | BinaryMarketCoordinatorRole::ResolvedNoCollateral
+        | BinaryMarketCoordinatorRole::ExpiredCollateral => {
             if transaction.input[input_base as usize].has_issuance() {
                 return Err(InterpretError::Inconsistent("issuance on redemption"));
             }
-            Ok(vec![collateral.outpoint])
+            Ok(spent)
         }
     }
 }
@@ -885,36 +841,249 @@ fn opposite_side_factors(
     }
 }
 
-fn candidate_outcomes(
-    path: BinaryMarketPath,
-    params: BinaryMarketParams,
+fn decode_market_witness(
     decoded: &DecodedSimplicityWitness,
-    transaction: &Transaction,
-) -> Result<Vec<bool>, InterpretError> {
-    match path {
-        BinaryMarketPath::ActiveResolution | BinaryMarketPath::DormantResolution => {
-            let mut output = Vec::new();
-            for outcome in decoded.bool_values() {
-                if decoded
-                    .bytes_values(64)
-                    .iter()
-                    .any(|signature| verify_oracle_signature(params, outcome, signature))
-                {
-                    output.push(outcome);
-                }
+    expected_slot: BinaryMarketSlot,
+) -> Result<BinaryMarketCoordinatorAction, InterpretError> {
+    decode_market_witness_values(decoded.values(), expected_slot)
+}
+
+fn decode_market_witness_values(
+    values: &[SimplicityValue],
+    expected_slot: BinaryMarketSlot,
+) -> Result<BinaryMarketCoordinatorAction, InterpretError> {
+    let slot_type = Final::u8();
+    let action_types = market_action_types();
+    let mut slot = None;
+    let mut action = None;
+
+    for value in values {
+        if value.ty() == slot_type.as_ref() {
+            if slot.replace(decode_u8(value.as_ref())?).is_some() {
+                return Err(InterpretError::Inconsistent("duplicate SLOT witness"));
             }
-            Ok(output)
-        }
-        BinaryMarketPath::ExpiryRedemption => Ok(decoded.bool_values()),
-        BinaryMarketPath::ActiveExpiry | BinaryMarketPath::DormantExpiry => {
-            if transaction.lock_time.to_consensus_u32() < params.expiry_height {
-                Ok(Vec::new())
-            } else {
-                Ok(vec![false])
+        } else if action_types
+            .iter()
+            .any(|action_type| value.ty() == action_type.as_ref())
+        {
+            if action.replace(decode_market_action(value)?).is_some() {
+                return Err(InterpretError::Inconsistent("duplicate ACTION witness"));
             }
+        } else {
+            return Err(InterpretError::Inconsistent(
+                "unexpected binary-market witness value type",
+            ));
         }
-        _ => Ok(vec![false]),
     }
+
+    let slot = slot.ok_or(InterpretError::MissingWitness("SLOT"))?;
+    if slot != expected_slot as u8 {
+        return Err(InterpretError::Inconsistent(
+            "SLOT does not match authenticated market slot",
+        ));
+    }
+    action.ok_or(InterpretError::MissingWitness("ACTION"))
+}
+
+fn resolve_action_payload_type() -> std::sync::Arc<Final> {
+    Final::product(Final::u32(), Final::product(Final::u1(), Final::u512()))
+}
+
+fn market_action_types() -> [std::sync::Arc<Final>; 5] {
+    [
+        Final::sum(Final::sum(Final::u32(), Final::unit()), Final::unit()),
+        Final::sum(Final::sum(Final::unit(), Final::u32()), Final::unit()),
+        Final::sum(
+            Final::unit(),
+            Final::sum(resolve_action_payload_type(), Final::unit()),
+        ),
+        Final::sum(
+            Final::unit(),
+            Final::sum(Final::unit(), Final::sum(Final::u32(), Final::unit())),
+        ),
+        Final::sum(
+            Final::unit(),
+            Final::sum(Final::unit(), Final::sum(Final::unit(), Final::u32())),
+        ),
+    ]
+}
+
+fn decode_market_action(
+    value: &SimplicityValue,
+) -> Result<BinaryMarketCoordinatorAction, InterpretError> {
+    if !market_action_types()
+        .iter()
+        .any(|action_type| value.ty() == action_type.as_ref())
+    {
+        return Err(InterpretError::Inconsistent(
+            "ACTION has the wrong structural type",
+        ));
+    }
+
+    let root = value.as_ref();
+    if let Some(issue_or_cancel) = root.as_left() {
+        if let Some(issue) = issue_or_cancel.as_left() {
+            return Ok(BinaryMarketCoordinatorAction::Issue {
+                output_base: decode_u32(issue)?,
+            });
+        }
+        let cancel = issue_or_cancel
+            .as_right()
+            .ok_or(InterpretError::Inconsistent("malformed ACTION sum branch"))?;
+        return Ok(BinaryMarketCoordinatorAction::Cancel {
+            output_base: decode_u32(cancel)?,
+        });
+    }
+
+    let resolve_or_terminal = root
+        .as_right()
+        .ok_or(InterpretError::Inconsistent("malformed ACTION sum branch"))?;
+    if let Some(resolve) = resolve_or_terminal.as_left() {
+        let (output_base, outcome_and_signature) = resolve.as_product().ok_or(
+            InterpretError::Inconsistent("malformed Resolve ACTION payload"),
+        )?;
+        let (outcome_yes, signature) =
+            outcome_and_signature
+                .as_product()
+                .ok_or(InterpretError::Inconsistent(
+                    "malformed Resolve ACTION payload",
+                ))?;
+        let outcome = if decode_bool(outcome_yes)? {
+            BinaryOutcome::Yes
+        } else {
+            BinaryOutcome::No
+        };
+        return Ok(BinaryMarketCoordinatorAction::Resolve {
+            output_base: decode_u32(output_base)?,
+            resolution: BinaryMarketResolution::new(outcome, decode_signature(signature)?),
+        });
+    }
+
+    let expire_or_redeem = resolve_or_terminal
+        .as_right()
+        .ok_or(InterpretError::Inconsistent("malformed ACTION sum branch"))?;
+    if let Some(expire) = expire_or_redeem.as_left() {
+        return Ok(BinaryMarketCoordinatorAction::Expire {
+            output_base: decode_u32(expire)?,
+        });
+    }
+    let redeem = expire_or_redeem
+        .as_right()
+        .ok_or(InterpretError::Inconsistent("malformed ACTION sum branch"))?;
+    Ok(BinaryMarketCoordinatorAction::Redeem {
+        output_base: decode_u32(redeem)?,
+    })
+}
+
+fn decode_u8(value: ValueRef<'_>) -> Result<u8, InterpretError> {
+    word_bytes(value)
+        .map(u8::from_be_bytes)
+        .ok_or(InterpretError::Inconsistent("malformed u8 witness value"))
+}
+
+fn decode_u32(value: ValueRef<'_>) -> Result<u32, InterpretError> {
+    word_bytes(value)
+        .map(u32::from_be_bytes)
+        .ok_or(InterpretError::Inconsistent("malformed u32 witness value"))
+}
+
+fn decode_bool(value: ValueRef<'_>) -> Result<bool, InterpretError> {
+    let word = value
+        .to_word()
+        .filter(|word| word.n() == 0)
+        .ok_or(InterpretError::Inconsistent("malformed bool witness value"))?;
+    word.iter()
+        .next()
+        .ok_or(InterpretError::Inconsistent("malformed bool witness value"))
+}
+
+fn decode_signature(value: ValueRef<'_>) -> Result<[u8; 64], InterpretError> {
+    word_bytes(value).ok_or(InterpretError::Inconsistent(
+        "malformed Signature witness value",
+    ))
+}
+
+fn word_bytes<const N: usize>(value: ValueRef<'_>) -> Option<[u8; N]> {
+    let word = value.to_word()?;
+    if word.len() != N.checked_mul(8)? {
+        return None;
+    }
+    let mut output = [0_u8; N];
+    for (index, bit) in word.iter().enumerate() {
+        if bit {
+            output[index / 8] |= 1 << (7 - index % 8);
+        }
+    }
+    Some(output)
+}
+
+fn cancellation_is_full(
+    params: BinaryMarketParams,
+    transaction: &Transaction,
+    output_base: u32,
+) -> Result<bool, InterpretError> {
+    let discriminator_index = add_index(output_base, 2)?;
+    let discriminator = output_at(transaction, discriminator_index)?;
+    let Some((asset, _)) = explicit_asset_value(discriminator) else {
+        return Err(InterpretError::Inconsistent(
+            "cancellation discriminator output not explicit",
+        ));
+    };
+    if asset == params.collateral_asset_id {
+        Ok(false)
+    } else {
+        token_burn_amount(transaction, discriminator_index, params.yes_token_asset_id)?;
+        Ok(true)
+    }
+}
+
+fn redemption_details(
+    params: BinaryMarketParams,
+    before: BinaryMarketState,
+    transaction: &Transaction,
+    output_base: u32,
+) -> Result<(bool, u64), InterpretError> {
+    let first_output = output_at(transaction, output_base)?;
+    let Some((first_asset, _)) = explicit_asset_value(first_output) else {
+        return Err(InterpretError::Inconsistent(
+            "redemption discriminator output not explicit",
+        ));
+    };
+    let burn_index = if first_asset == params.collateral_asset_id {
+        add_index(output_base, 1)?
+    } else {
+        output_base
+    };
+
+    let outcome_yes = match before {
+        BinaryMarketState::ResolvedYes { .. } => true,
+        BinaryMarketState::ResolvedNo { .. } => false,
+        BinaryMarketState::Expired { .. } => {
+            let burn = output_at(transaction, burn_index)?;
+            let Some((asset, _)) = explicit_asset_value(burn) else {
+                return Err(InterpretError::Inconsistent("redemption burn not explicit"));
+            };
+            if asset == params.yes_token_asset_id {
+                true
+            } else if asset == params.no_token_asset_id {
+                false
+            } else {
+                return Err(InterpretError::Inconsistent(
+                    "redemption burn has unknown token asset",
+                ));
+            }
+        }
+        BinaryMarketState::Trading { .. } => {
+            return Err(InterpretError::Inconsistent("redemption phase"));
+        }
+    };
+    let burn_asset = if outcome_yes {
+        params.yes_token_asset_id
+    } else {
+        params.no_token_asset_id
+    };
+    let tokens = token_burn_amount(transaction, burn_index, burn_asset)?;
+    Ok((outcome_yes, tokens))
 }
 
 fn verify_oracle_signature(params: BinaryMarketParams, outcome_yes: bool, bytes: &[u8]) -> bool {
@@ -937,43 +1106,6 @@ fn verify_oracle_signature(params: BinaryMarketParams, outcome_yes: bool, bytes:
     Secp256k1::verification_only()
         .verify_schnorr(&signature, &message, &key)
         .is_ok()
-}
-
-fn path_allowed(path: BinaryMarketPath, state: BinaryMarketState) -> bool {
-    match state {
-        BinaryMarketState::Trading {
-            outstanding_pairs: 0,
-        } => matches!(
-            path,
-            BinaryMarketPath::InitialIssuance
-                | BinaryMarketPath::DormantResolution
-                | BinaryMarketPath::DormantExpiry
-        ),
-        BinaryMarketState::Trading { .. } => matches!(
-            path,
-            BinaryMarketPath::SubsequentIssuance
-                | BinaryMarketPath::PartialCancellation
-                | BinaryMarketPath::FullCancellation
-                | BinaryMarketPath::ActiveResolution
-                | BinaryMarketPath::ActiveExpiry
-        ),
-        BinaryMarketState::ResolvedYes { .. } | BinaryMarketState::ResolvedNo { .. } => {
-            path == BinaryMarketPath::ResolvedRedemption
-        }
-        BinaryMarketState::Expired { .. } => path == BinaryMarketPath::ExpiryRedemption,
-    }
-}
-
-fn primary_slot(state: BinaryMarketState) -> BinaryMarketSlot {
-    match state {
-        BinaryMarketState::Trading {
-            outstanding_pairs: 0,
-        } => BinaryMarketSlot::DormantYesRt,
-        BinaryMarketState::Trading { .. } => BinaryMarketSlot::UnresolvedYesRt,
-        BinaryMarketState::ResolvedYes { .. } => BinaryMarketSlot::ResolvedYesCollateral,
-        BinaryMarketState::ResolvedNo { .. } => BinaryMarketSlot::ResolvedNoCollateral,
-        BinaryMarketState::Expired { .. } => BinaryMarketSlot::ExpiredCollateral,
-    }
 }
 
 fn issuance_amount(
@@ -1233,4 +1365,161 @@ fn add_index(index: u32, offset: u32) -> Result<u32, InterpretError> {
     index
         .checked_add(offset)
         .ok_or(InterpretError::IndexOverflow)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode_action(action: BinaryMarketCoordinatorAction) -> SimplicityValue {
+        match action {
+            BinaryMarketCoordinatorAction::Issue { output_base } => SimplicityValue::left(
+                SimplicityValue::left(SimplicityValue::u32(output_base), Final::unit()),
+                Final::unit(),
+            ),
+            BinaryMarketCoordinatorAction::Cancel { output_base } => SimplicityValue::left(
+                SimplicityValue::right(Final::unit(), SimplicityValue::u32(output_base)),
+                Final::unit(),
+            ),
+            BinaryMarketCoordinatorAction::Resolve {
+                output_base,
+                resolution,
+            } => {
+                let outcome = u8::from(resolution.outcome() == BinaryOutcome::Yes);
+                let payload = SimplicityValue::product(
+                    SimplicityValue::u32(output_base),
+                    SimplicityValue::product(
+                        SimplicityValue::u1(outcome),
+                        SimplicityValue::u512(resolution.signature()),
+                    ),
+                );
+                SimplicityValue::right(Final::unit(), SimplicityValue::left(payload, Final::unit()))
+            }
+            BinaryMarketCoordinatorAction::Expire { output_base } => SimplicityValue::right(
+                Final::unit(),
+                SimplicityValue::right(
+                    Final::unit(),
+                    SimplicityValue::left(SimplicityValue::u32(output_base), Final::unit()),
+                ),
+            ),
+            BinaryMarketCoordinatorAction::Redeem { output_base } => SimplicityValue::right(
+                Final::unit(),
+                SimplicityValue::right(
+                    Final::unit(),
+                    SimplicityValue::right(Final::unit(), SimplicityValue::u32(output_base)),
+                ),
+            ),
+        }
+    }
+
+    #[test]
+    fn exact_action_decoder_accepts_all_five_finalized_sum_branches() {
+        let signature = [0xa5; 64];
+        let actions = [
+            BinaryMarketCoordinatorAction::Issue { output_base: 11 },
+            BinaryMarketCoordinatorAction::Cancel { output_base: 12 },
+            BinaryMarketCoordinatorAction::Resolve {
+                output_base: 13,
+                resolution: BinaryMarketResolution::new(BinaryOutcome::Yes, signature),
+            },
+            BinaryMarketCoordinatorAction::Expire { output_base: 14 },
+            BinaryMarketCoordinatorAction::Redeem { output_base: 15 },
+        ];
+
+        for action in actions {
+            assert_eq!(
+                decode_market_action(&encode_action(action)).unwrap(),
+                action
+            );
+        }
+    }
+
+    #[test]
+    fn exact_witness_decoder_requires_one_slot_and_one_action() {
+        let action = BinaryMarketCoordinatorAction::Expire { output_base: 7 };
+        let valid = [
+            SimplicityValue::u8(BinaryMarketSlot::DormantYesRt.tag()),
+            encode_action(action),
+        ];
+        assert_eq!(
+            decode_market_witness_values(&valid, BinaryMarketSlot::DormantYesRt).unwrap(),
+            action
+        );
+
+        assert!(matches!(
+            decode_market_witness_values(&valid[..1], BinaryMarketSlot::DormantYesRt),
+            Err(InterpretError::MissingWitness("ACTION"))
+        ));
+        assert!(matches!(
+            decode_market_witness_values(&valid[1..], BinaryMarketSlot::DormantYesRt),
+            Err(InterpretError::MissingWitness("SLOT"))
+        ));
+        assert!(matches!(
+            decode_market_witness_values(&valid, BinaryMarketSlot::UnresolvedYesRt),
+            Err(InterpretError::Inconsistent(_))
+        ));
+
+        let duplicate_slot = [
+            SimplicityValue::u8(BinaryMarketSlot::DormantYesRt.tag()),
+            SimplicityValue::u8(BinaryMarketSlot::DormantYesRt.tag()),
+            encode_action(action),
+        ];
+        assert!(matches!(
+            decode_market_witness_values(&duplicate_slot, BinaryMarketSlot::DormantYesRt),
+            Err(InterpretError::Inconsistent("duplicate SLOT witness"))
+        ));
+
+        let duplicate_action = [
+            SimplicityValue::u8(BinaryMarketSlot::DormantYesRt.tag()),
+            encode_action(action),
+            encode_action(action),
+        ];
+        assert!(matches!(
+            decode_market_witness_values(&duplicate_action, BinaryMarketSlot::DormantYesRt),
+            Err(InterpretError::Inconsistent("duplicate ACTION witness"))
+        ));
+    }
+
+    #[test]
+    fn exact_action_decoder_rejects_near_miss_structural_types() {
+        let left_associated_resolve = SimplicityValue::product(
+            SimplicityValue::product(SimplicityValue::u32(3), SimplicityValue::u1(1)),
+            SimplicityValue::u512([0x42; 64]),
+        );
+        let malformed = SimplicityValue::right(
+            Final::unit(),
+            SimplicityValue::left(left_associated_resolve, Final::unit()),
+        );
+        assert!(matches!(
+            decode_market_action(&malformed),
+            Err(InterpretError::Inconsistent(
+                "ACTION has the wrong structural type"
+            ))
+        ));
+
+        let unpruned_source_action = SimplicityValue::left(
+            SimplicityValue::left(SimplicityValue::u32(3), Final::u32()),
+            Final::sum(
+                resolve_action_payload_type(),
+                Final::sum(Final::u32(), Final::u32()),
+            ),
+        );
+        assert!(matches!(
+            decode_market_action(&unpruned_source_action),
+            Err(InterpretError::Inconsistent(
+                "ACTION has the wrong structural type"
+            ))
+        ));
+
+        let unexpected_leaf = [
+            SimplicityValue::u8(BinaryMarketSlot::DormantYesRt.tag()),
+            SimplicityValue::u32(3),
+        ];
+        assert!(matches!(
+            decode_market_witness_values(&unexpected_leaf, BinaryMarketSlot::DormantYesRt),
+            Err(InterpretError::Inconsistent(
+                "unexpected binary-market witness value type"
+            ))
+        ));
+    }
 }

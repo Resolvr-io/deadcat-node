@@ -13,7 +13,7 @@ mod binary_market;
 
 pub use binary_market::{
     BinaryMarketContinuation, BinaryMarketInterpretation, BinaryMarketLiveOutputs,
-    BinaryMarketPath, interpret_binary_market_spend, interpret_binary_market_spend_with_compiled,
+    interpret_binary_market_spend, interpret_binary_market_spend_with_compiled,
 };
 
 /// A tracked covenant output with the previous output data needed to interpret
@@ -39,12 +39,12 @@ pub enum InterpretError {
     CmrMismatch,
     #[error("required decoded witness value is missing: {0}")]
     MissingWitness(&'static str),
-    #[error("decoded witness admits more than one transaction interpretation")]
-    AmbiguousInterpretation,
     #[error("transaction contradicts its decoded covenant witness: {0}")]
     Inconsistent(&'static str),
     #[error("binary-market economics rejected the spend: {0}")]
     BinaryEconomics(#[from] crate::binary_market::BinaryMarketError),
+    #[error("binary-market layout rejected the spend: {0}")]
+    BinaryLayout(#[from] crate::binary_market::BinaryMarketLayoutError),
     #[error("binary-market compilation failed: {0}")]
     BinaryCompilation(#[from] crate::binary_market::CompiledBinaryMarketError),
     #[error("transaction index does not fit the v1 u32 witness domain")]
@@ -54,10 +54,9 @@ pub enum InterpretError {
 /// A decoded finalized Simplicity script-path witness.
 ///
 /// `values` contains witness values in deterministic post-order; source-level
-/// names are not present in the serialized Simplicity program. Optimizer
-/// sharing may merge equal same-typed values, so contract-specific
-/// interpreters use typed membership plus transaction validation rather than
-/// assuming a fixed positional ABI.
+/// names are not present in the serialized Simplicity program. Contract-specific
+/// interpreters must therefore identify values by their complete structural
+/// types and decode the source-level witness ABI exactly.
 #[derive(Clone)]
 pub struct DecodedSimplicityWitness {
     finalized_spend: FinalizedSimplicitySpend,
@@ -84,47 +83,6 @@ impl DecodedSimplicityWitness {
     pub fn values(&self) -> &[Value] {
         &self.values
     }
-
-    #[must_use]
-    pub fn u8_values(&self) -> Vec<u8> {
-        unique_words(&self.values, 1)
-            .into_iter()
-            .map(|bytes| bytes[0])
-            .collect()
-    }
-
-    #[must_use]
-    pub fn u32_values(&self) -> Vec<u32> {
-        unique_words(&self.values, 4)
-            .into_iter()
-            .map(|bytes| u32::from_be_bytes(bytes.try_into().expect("four bytes")))
-            .collect()
-    }
-
-    #[must_use]
-    pub fn u64_values(&self) -> Vec<u64> {
-        unique_words(&self.values, 8)
-            .into_iter()
-            .map(|bytes| u64::from_be_bytes(bytes.try_into().expect("eight bytes")))
-            .collect()
-    }
-
-    #[must_use]
-    pub fn bool_values(&self) -> Vec<bool> {
-        let mut output = Vec::new();
-        for value in &self.values {
-            let bits: Vec<bool> = value.iter_compact().collect();
-            if bits.len() == 1 && !output.contains(&bits[0]) {
-                output.push(bits[0]);
-            }
-        }
-        output
-    }
-
-    #[must_use]
-    pub fn bytes_values(&self, length: usize) -> Vec<Vec<u8>> {
-        unique_words(&self.values, length)
-    }
 }
 
 /// Decode the four-element smplx script-path stack
@@ -149,30 +107,6 @@ pub fn decode_simplicity_witness(
         finalized_spend,
         values,
     })
-}
-
-fn value_bytes(value: &Value, length: usize) -> Option<Vec<u8>> {
-    let bits: Vec<bool> = value.iter_compact().collect();
-    if bits.len() != length.checked_mul(8)? {
-        return None;
-    }
-    let mut output = vec![0_u8; length];
-    for (index, bit) in bits.into_iter().enumerate() {
-        if bit {
-            output[index / 8] |= 1 << (7 - index % 8);
-        }
-    }
-    Some(output)
-}
-
-fn unique_words(values: &[Value], length: usize) -> Vec<Vec<u8>> {
-    let mut output = Vec::new();
-    for bytes in values.iter().filter_map(|value| value_bytes(value, length)) {
-        if !output.contains(&bytes) {
-            output.push(bytes);
-        }
-    }
-    output
 }
 
 fn locate_input(

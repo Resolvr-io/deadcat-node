@@ -8,10 +8,11 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use deadcat_contracts::binary_market::{BinaryMarketSlot, BinaryMarketTransition, BinaryOutcome};
+use deadcat_contracts::binary_market::{
+    BinaryMarketPath, BinaryMarketSlot, BinaryMarketTransition, BinaryOutcome,
+};
 use deadcat_contracts::interpret::{
-    BinaryMarketLiveOutputs, BinaryMarketPath, InterpretError, TrackedContractOutput,
-    interpret_binary_market_spend,
+    BinaryMarketLiveOutputs, InterpretError, TrackedContractOutput, interpret_binary_market_spend,
 };
 use deadcat_rpc::RecoveryFamily;
 use deadcat_types::{ContractDescriptor, ContractId, ContractSyncState, LiquidNetwork};
