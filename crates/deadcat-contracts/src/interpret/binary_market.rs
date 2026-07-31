@@ -5,7 +5,7 @@ use elements::{AssetId, OutPoint, Transaction, TxOut};
 
 use super::{
     DecodedSimplicityWitness, InterpretError, TrackedContractOutput, decode_simplicity_witness,
-    locate_input, output_at, strip_taproot_annex,
+    locate_input, output_at,
 };
 use crate::binary_market::{
     AppliedBinaryMarketTransition, BinaryMarketAction, BinaryMarketEconomics, BinaryMarketSlot,
@@ -114,8 +114,17 @@ pub fn interpret_binary_market_spend_with_compiled(
     let head_index = locate_input(transaction, head.outpoint)?;
     let input_base = u32::try_from(head_index).map_err(|_| InterpretError::IndexOverflow)?;
     let stack = &transaction.input[head_index].witness.script_witness;
-    let (core_stack, _) = strip_taproot_annex(stack);
-    if core_stack.len() == 1 {
+    let key_path_items = if stack.len() == 2
+        && stack
+            .last()
+            .and_then(|item| item.first())
+            .is_some_and(|byte| *byte == 0x50)
+    {
+        1
+    } else {
+        stack.len()
+    };
+    if key_path_items == 1 {
         return Err(InterpretError::UnexpectedKeySpend);
     }
     let decoded = decode_simplicity_witness(stack)?;
@@ -123,7 +132,7 @@ pub fn interpret_binary_market_spend_with_compiled(
         return Err(InterpretError::CmrMismatch);
     }
     let expected_slot = primary_slot(before);
-    if decoded.control_block() != compiled.slot(expected_slot).control_block().serialize() {
+    if decoded.control_block() != compiled.slot(expected_slot).control_block() {
         return Err(InterpretError::Inconsistent(
             "market control block mismatch",
         ));

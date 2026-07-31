@@ -5,6 +5,7 @@ mod support;
 use deadcat_contracts::binary_market::{
     BinaryMarketAction, BinaryMarketSlot, CompiledBinaryMarket, derived_binary_market,
 };
+use deadcat_contracts::finalized_spend::FinalizedSimplicitySpendError;
 use deadcat_contracts::interpret::{
     BinaryMarketLiveOutputs, BinaryMarketPath, InterpretError, TrackedContractOutput,
     interpret_binary_market_spend,
@@ -16,7 +17,7 @@ use elements::hashes::Hash as _;
 use elements::pset::PartiallySignedTransaction;
 use elements::secp256k1_zkp::{Generator, Keypair, PedersenCommitment, Secp256k1, Tweak};
 use elements::{LockTime, OutPoint, Script, Sequence, Transaction, TxOut, TxOutWitness};
-use simplex::program::{ProgramTrait as _, WitnessTrait as _};
+use simplex::program::WitnessTrait as _;
 
 use support::{asset, bare_op_return, explicit_txout, network, pset_input, pset_output, script};
 
@@ -45,10 +46,11 @@ struct BinaryScenario {
     params: BinaryMarketParams,
     before: BinaryMarketState,
     live: BinaryMarketLiveOutputs,
+    pset: PartiallySignedTransaction,
     transaction: Transaction,
 }
 
-fn resolved_redemption_scenario(full: bool, decoy: bool, annex: bool) -> BinaryScenario {
+fn resolved_redemption_scenario(full: bool, decoy: bool) -> BinaryScenario {
     let params = binary_params();
     let compiled = CompiledBinaryMarket::new(params).expect("compile market");
     let before = BinaryMarketState::ResolvedYes {
@@ -136,16 +138,18 @@ fn resolved_redemption_scenario(full: bool, decoy: bool, annex: bool) -> BinaryS
         redeem_yes: false,
     };
     let net = network(params.collateral_asset_id);
-    let mut stack = compiled
-        .program(BinaryMarketSlot::ResolvedYesCollateral)
-        .as_ref()
-        .finalize(&pset, &witness.build_witness(), 0, &net)
-        .expect("finalize redemption");
-    if annex {
-        stack.push(vec![0x50, 0x01]);
-    }
-    let mut transaction = pset.extract_tx().expect("extract market tx");
-    transaction.input[0].witness.script_witness = stack;
+    let stack = compiled
+        .finalize(
+            BinaryMarketSlot::ResolvedYesCollateral,
+            &pset,
+            &witness.build_witness(),
+            0,
+            &net,
+        )
+        .expect("finalize redemption")
+        .into_witness_stack();
+    pset.inputs_mut()[0].final_script_witness = Some(stack);
+    let transaction = pset.extract_tx().expect("extract market tx");
     BinaryScenario {
         params,
         before,
@@ -157,13 +161,14 @@ fn resolved_redemption_scenario(full: bool, decoy: bool, annex: bool) -> BinaryS
                 txout: live_txout,
             }),
         },
+        pset,
         transaction,
     }
 }
 
 #[test]
 fn interprets_partial_and_full_market_redemptions() {
-    let partial = resolved_redemption_scenario(false, false, true);
+    let partial = resolved_redemption_scenario(false, false);
     let interpreted = interpret_binary_market_spend(
         partial.params,
         partial.before,
@@ -187,7 +192,7 @@ fn interprets_partial_and_full_market_redemptions() {
     );
     assert_eq!(interpreted.continuations[0].output.outpoint.vout, 0);
 
-    let full = resolved_redemption_scenario(true, false, false);
+    let full = resolved_redemption_scenario(true, false);
     let interpreted =
         interpret_binary_market_spend(full.params, full.before, &full.live, &full.transaction)
             .expect("interpret full redemption");
@@ -201,8 +206,53 @@ fn interprets_partial_and_full_market_redemptions() {
 }
 
 #[test]
+fn market_interpreter_rejects_a_noncanonical_annex() {
+    let mut scenario = resolved_redemption_scenario(false, false);
+    let stack = &mut scenario.transaction.input[0].witness.script_witness;
+    if stack.len() == 5 {
+        stack.pop().expect("canonical annex");
+    }
+    stack.push(vec![0x50, 0x01]);
+
+    let error = interpret_binary_market_spend(
+        scenario.params,
+        scenario.before,
+        &scenario.live,
+        &scenario.transaction,
+    )
+    .expect_err("noncanonical annex must fail closed");
+    assert!(matches!(
+        error,
+        InterpretError::FinalizedSpend(FinalizedSimplicitySpendError::NonCanonicalAnnex {
+            actual_len: Some(2),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn installed_finalized_market_witness_reexecutes() {
+    let scenario = resolved_redemption_scenario(false, false);
+    let compiled = CompiledBinaryMarket::new(scenario.params).expect("compile market");
+    let net = network(scenario.params.collateral_asset_id);
+
+    compiled
+        .execute_finalized(
+            BinaryMarketSlot::ResolvedYesCollateral,
+            &scenario.pset,
+            0,
+            &net,
+        )
+        .expect("re-execute installed finalized witness");
+    assert_eq!(
+        scenario.pset.extract_tx().expect("extract finalized PSET"),
+        scenario.transaction
+    );
+}
+
+#[test]
 fn market_interpreter_uses_witness_output_base_not_first_matching_script() {
-    let scenario = resolved_redemption_scenario(false, true, false);
+    let scenario = resolved_redemption_scenario(false, true);
     let interpreted = interpret_binary_market_spend(
         scenario.params,
         scenario.before,
@@ -216,7 +266,7 @@ fn market_interpreter_uses_witness_output_base_not_first_matching_script() {
 
 #[test]
 fn market_interpreter_rejects_tampered_control_blocks() {
-    let mut market = resolved_redemption_scenario(false, false, false);
+    let mut market = resolved_redemption_scenario(false, false);
     let compiled = CompiledBinaryMarket::new(market.params).expect("compile market");
     market.transaction.input[0].witness.script_witness[3] = compiled
         .slot(BinaryMarketSlot::ResolvedNoCollateral)
@@ -356,12 +406,17 @@ fn finalized_active_expiry(side: RtSide, sequences: [Sequence; 3]) -> BinaryScen
     };
     let net = network(params.collateral_asset_id);
     let stack = compiled
-        .program(BinaryMarketSlot::UnresolvedYesRt)
-        .as_ref()
-        .finalize(&pset, &witness.build_witness(), 0, &net)
-        .expect("finalize active expiry");
-    let mut transaction = pset.extract_tx().expect("extract expiry");
-    transaction.input[0].witness.script_witness = stack;
+        .finalize(
+            BinaryMarketSlot::UnresolvedYesRt,
+            &pset,
+            &witness.build_witness(),
+            0,
+            &net,
+        )
+        .expect("finalize active expiry")
+        .into_witness_stack();
+    pset.inputs_mut()[0].final_script_witness = Some(stack);
+    let transaction = pset.extract_tx().expect("extract expiry");
     BinaryScenario {
         params,
         before,
@@ -379,6 +434,7 @@ fn finalized_active_expiry(side: RtSide, sequences: [Sequence; 3]) -> BinaryScen
                 txout: collateral_txout,
             }),
         },
+        pset,
         transaction,
     }
 }
@@ -586,10 +642,15 @@ fn interprets_partial_cancellation_when_path_equals_slot_and_bases_are_shared() 
     };
     let net = network(params.collateral_asset_id);
     let stack = compiled
-        .program(BinaryMarketSlot::UnresolvedYesRt)
-        .as_ref()
-        .finalize(&pset, &witness.build_witness(), 0, &net)
-        .expect("finalize partial cancellation");
+        .finalize(
+            BinaryMarketSlot::UnresolvedYesRt,
+            &pset,
+            &witness.build_witness(),
+            0,
+            &net,
+        )
+        .expect("finalize partial cancellation")
+        .into_witness_stack();
     let mut transaction = pset.extract_tx().expect("extract cancellation");
     transaction.input[0].witness.script_witness = stack;
     let live = BinaryMarketLiveOutputs {

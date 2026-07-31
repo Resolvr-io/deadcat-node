@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use deadcat_contracts::SimplicityNetwork;
 use deadcat_contracts::binary_market::{
     BinaryMarketEconomics, BinaryMarketSlot, BinaryMarketTransition, BinaryOutcome,
-    CompiledBinaryMarket,
+    CompiledBinaryMarket, CompiledBinaryMarketError,
 };
 use deadcat_contracts::interpret::{
     BinaryMarketLiveOutputs, BinaryMarketPath, TrackedContractOutput, interpret_binary_market_spend,
@@ -92,8 +92,7 @@ pub fn validate_contract_view(
 
     let ContractParametersView::BinaryMarket { params } = &view.parameters;
     let ContractStateView::BinaryMarket { state } = view.state;
-    CompiledBinaryMarket::new(*params)
-        .map_err(|error| ValidationError::Compilation(error.to_string()))?;
+    CompiledBinaryMarket::new(*params)?;
     BinaryMarketEconomics::new(params.base_payout)
         .and_then(|economics| economics.validate_state(state))
         .map_err(|error| ValidationError::Economics(error.to_string()))?;
@@ -223,8 +222,7 @@ fn replay_market(
     creation: &TransactionEvidence,
     transitions: &[TransactionEvidence],
 ) -> Result<(), ValidationError> {
-    let compiled = CompiledBinaryMarket::new(params)
-        .map_err(|error| ValidationError::Compilation(error.to_string()))?;
+    let compiled = CompiledBinaryMarket::new(params)?;
     let yes_input = unique_defining_input(
         &creation.transaction,
         params.yes_token_asset_id,
@@ -675,7 +673,7 @@ pub enum ValidationError {
     #[error("invalid contract shape: {0}")]
     ContractShape(&'static str),
     #[error("contract compilation failed: {0}")]
-    Compilation(String),
+    Compilation(#[from] CompiledBinaryMarketError),
     #[error("invalid contract economics: {0}")]
     Economics(String),
     #[error("duplicate live role or invalid live-output shape: {0}")]

@@ -62,7 +62,7 @@ use elements::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
-use simplex::program::{ProgramTrait as _, WitnessTrait as _};
+use simplex::program::WitnessTrait as _;
 use simplex::provider::ElementsRpc;
 use simplex::signer::{Signer, SignerTrait as _};
 use simplex::transaction::{FinalTransaction, PartialOutput};
@@ -1174,21 +1174,11 @@ fn rebuild_pruned_market_followers_from_divergent_witnesses(
             tokens_burned,
             redeem_yes,
         };
-        compiled
-            .program(slot)
-            .as_ref()
-            .execute(pset, &witness.build_witness(), input_index, network)
-            .unwrap_or_else(|error| panic!("divergent {slot:?} follower: {error}"));
-        let mut rebuilt = compiled
-            .program(slot)
-            .as_ref()
-            .finalize(pset, &witness.build_witness(), input_index, network)
-            .expect("finalize divergent follower witness");
-        match canonical.len() {
-            4 => {}
-            5 => rebuilt.push(canonical[4].clone()),
-            length => panic!("unexpected canonical follower stack length {length}"),
-        }
+        let rebuilt = compiled
+            .finalize(slot, pset, &witness.build_witness(), input_index, network)
+            .unwrap_or_else(|error| panic!("finalize divergent {slot:?} follower: {error}"))
+            .into_witness_stack();
+        assert!((4..=5).contains(&canonical.len()));
         pset.inputs_mut()[input_index].final_script_witness = Some(rebuilt);
     }
     assert_eq!(

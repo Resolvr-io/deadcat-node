@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::str::FromStr as _;
 use std::sync::Arc;
 
-use deadcat_contracts::binary_market::{BinaryMarketSlot, CompiledBinaryMarket};
+use deadcat_contracts::binary_market::{
+    BinaryMarketSlot, CompiledBinaryMarket, CompiledBinaryMarketError,
+};
 use deadcat_contracts::market_crypto::derive_issuance_assets;
 use deadcat_contracts::recovery::{
     MARKET_V1_TAG, MarketCollateral, MarketRecoveryHint, validate_recovery_txout,
@@ -398,8 +400,7 @@ pub(crate) fn verify_binary_market_creation_shared(
         }
     };
 
-    let compiled = CompiledBinaryMarket::new(params)
-        .map_err(|error| RegistrationError::Compilation(error.to_string()))?;
+    let compiled = CompiledBinaryMarket::new(params)?;
     // Canonical lineage always starts with both RT legs on side A.
     let yes_commitments = commitments(
         params.yes_reissuance_token_id,
@@ -644,7 +645,7 @@ pub enum RegistrationError {
     #[error("invalid contract package: {0}")]
     InvalidPackage(String),
     #[error("contract compilation failed: {0}")]
-    Compilation(String),
+    Compilation(#[from] CompiledBinaryMarketError),
     #[error("invalid contract creation: {0}")]
     InvalidCreation(String),
 }

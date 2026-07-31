@@ -10,8 +10,10 @@ use deadcat_contracts::SimplicityNetwork;
 use deadcat_contracts::binary_market::{
     AppliedBinaryMarketTransition, BinaryMarketAction, BinaryMarketEconomics, BinaryMarketError,
     BinaryMarketSlot, BinaryMarketTransition, BinaryOutcome, CompiledBinaryMarket,
-    derived_binary_market,
+    CompiledBinaryMarketError, CompiledBinaryMarketExecutionError, derived_binary_market,
 };
+#[cfg(test)]
+use deadcat_contracts::finalized_spend::FinalizedSimplicitySpend;
 use deadcat_contracts::interpret::BinaryMarketPath;
 use deadcat_contracts::market_crypto::{
     BinaryOutcome as OracleOutcome, derive_issuance_assets, oracle_message,
@@ -565,12 +567,13 @@ impl BinaryMarketTransitionPlan {
         output_base: usize,
         network: &SimplicityNetwork,
     ) -> Result<(), MarketBuilderError> {
-        if pset
+        if let Some((input_index, _)) = pset
             .inputs()
             .iter()
-            .any(|input| input.witness_utxo.is_none())
+            .enumerate()
+            .find(|(_, input)| input.witness_utxo.is_none())
         {
-            return Err(MarketBuilderError::MissingWitnessUtxo);
+            return Err(MarketBuilderError::MissingWitnessUtxo { input_index });
         }
         self.verify_inputs(compiled, pset, input_base)?;
         self.verify_expiry(pset, input_base)?;
@@ -654,15 +657,16 @@ impl BinaryMarketTransitionPlan {
                 tokens_burned: self.tokens_burned,
                 redeem_yes: self.redeem_yes,
             };
-            let stack = compiled
-                .finalize(slot, pset, &witness.build_witness(), input_index, network)
-                .map_err(|error| MarketBuilderError::Covenant(error.to_string()))?;
-            let stack =
-                crate::simplicity::ensure_budget(stack).map_err(MarketBuilderError::Covenant)?;
-            finalized.push((input_index, stack));
+            let spend =
+                compiled.finalize(slot, pset, &witness.build_witness(), input_index, network)?;
+            finalized.push((input_index, spend.into_witness_stack()));
         }
         for (input_index, stack) in finalized {
             pset.inputs_mut()[input_index].final_script_witness = Some(stack);
+        }
+        for (offset, slot) in input_slots.iter().copied().enumerate() {
+            let input_index = add_index(input_base, offset)?;
+            compiled.execute_finalized(slot, pset, input_index, network)?;
         }
         Ok(())
     }
@@ -706,7 +710,7 @@ impl BinaryMarketTransitionPlan {
             let utxo = input
                 .witness_utxo
                 .as_ref()
-                .ok_or(MarketBuilderError::MissingWitnessUtxo)?;
+                .ok_or(MarketBuilderError::MissingWitnessUtxo { input_index: index })?;
             if utxo.script_pubkey != *compiled.slot(slot).script_pubkey() {
                 return Err(MarketBuilderError::WrongContractInput);
             }
@@ -1460,8 +1464,7 @@ fn add_index(base: usize, offset: usize) -> Result<usize, MarketBuilderError> {
 }
 
 fn compile(params: BinaryMarketParams) -> Result<CompiledBinaryMarket, MarketBuilderError> {
-    CompiledBinaryMarket::new(params)
-        .map_err(|error| MarketBuilderError::Compilation(error.to_string()))
+    Ok(CompiledBinaryMarket::new(params)?)
 }
 
 #[derive(Debug, Error)]
@@ -1473,7 +1476,7 @@ pub enum MarketBuilderError {
     #[error("RT commitment error: {0}")]
     RtCommitment(#[from] RtCommitmentError),
     #[error("contract compilation failed: {0}")]
-    Compilation(String),
+    Compilation(#[from] CompiledBinaryMarketError),
     #[error("compiled binary-market parameters do not match the transition plan")]
     CompiledParamsMismatch,
     #[error("market recovery hint disagrees with the supplied parameters")]
@@ -1524,8 +1527,8 @@ pub enum MarketBuilderError {
     InputIndexOutOfBounds,
     #[error("PSET output index is out of bounds")]
     OutputIndexOutOfBounds,
-    #[error("PSET is missing witness_utxo evidence")]
-    MissingWitnessUtxo,
+    #[error("PSET input {input_index} is missing witness_utxo evidence")]
+    MissingWitnessUtxo { input_index: usize },
     #[error("PSET contract input does not match the plan")]
     WrongContractInput,
     #[error("PSET reissuance fields do not match the plan")]
@@ -1543,7 +1546,7 @@ pub enum MarketBuilderError {
     #[error("mandatory covenant output at index {index} does not match the plan")]
     MandatoryOutputMismatch { index: usize },
     #[error("Simplicity covenant finalization failed: {0}")]
-    Covenant(String),
+    Covenant(#[from] CompiledBinaryMarketExecutionError),
 }
 
 #[cfg(test)]
@@ -2004,10 +2007,12 @@ mod tests {
                     .final_script_witness
                     .as_ref()
                     .expect("final witness");
-                let (core, annex) = deadcat_contracts::interpret::strip_taproot_annex(stack);
-                assert_eq!(core.len(), 4);
+                let finalized = FinalizedSimplicitySpend::parse_witness_stack(stack)
+                    .expect("typed finalized Simplicity witness");
                 assert!(
-                    annex.is_none_or(|padding| padding.first() == Some(&0x50)),
+                    finalized
+                        .annex()
+                        .is_none_or(|padding| padding.first() == Some(&0x50)),
                     "budget padding must be a Taproot annex"
                 );
             }
@@ -2072,6 +2077,15 @@ mod tests {
             policy_asset: params.collateral_asset_id,
         };
         let mut pset = pset_for_plan(&expiry, 0, 0);
+        let mut missing_utxo = pset.clone();
+        missing_utxo.inputs_mut()[1].witness_utxo = None;
+        let missing_untouched = missing_utxo.clone();
+        assert!(matches!(
+            expiry.finalize(&mut missing_utxo, 0, 0, &network),
+            Err(MarketBuilderError::MissingWitnessUtxo { input_index: 1 })
+        ));
+        assert_eq!(missing_utxo, missing_untouched);
+
         let untouched = pset.clone();
         assert!(matches!(
             expiry.finalize(&mut pset, 0, 0, &network),

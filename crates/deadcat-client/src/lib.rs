@@ -2,5 +2,3 @@
 
 pub mod market_builder;
 pub mod validation;
-
-mod simplicity;
