@@ -344,22 +344,46 @@ fn create_market(
             pset_input(no_funding.outpoint, no_funding.txout.clone()),
         )
         .expect("creation PSET");
-    pset.add_output(PsetOutput::from_txout(explicit_txout(
-        policy_asset,
-        FUNDING_VALUE * 2 - FEE,
-        signer.get_address().script_pubkey(),
-    )));
+    let has_confidential_funding =
+        yes_funding.txout.value.is_confidential() || no_funding.txout.value.is_confidential();
+    let change_value = FUNDING_VALUE * 2 - FEE;
+    let change = if has_confidential_funding {
+        balanced_change(
+            signer,
+            change_value,
+            policy_asset,
+            &[
+                yes_funding.secrets,
+                explicit_secrets(params.yes_reissuance_token_id, 1),
+                no_funding.secrets,
+                explicit_secrets(params.no_reissuance_token_id, 1),
+            ],
+            &[
+                rt_secrets(params.yes_reissuance_token_id, RtLeg::Yes, RtSide::A),
+                rt_secrets(params.no_reissuance_token_id, RtLeg::No, RtSide::A),
+                explicit_secrets(policy_asset, 0),
+            ],
+        )
+    } else {
+        explicit_txout(
+            policy_asset,
+            change_value,
+            signer.get_address().script_pubkey(),
+        )
+    };
+    pset.add_output(PsetOutput::from_txout(change));
     pset.add_output(PsetOutput::from_txout(TxOut::new_fee(FEE, policy_asset)));
     plan.finalize_rt_proofs(&mut pset)
         .expect("creation RT proofs");
     sign_input(signer, &mut pset, 0);
     sign_input(signer, &mut pset, 1);
     let transaction = pset.extract_tx().expect("creation transaction");
-    assert_eq!(transaction.output[3].asset, Asset::Explicit(policy_asset));
-    assert_eq!(
-        transaction.output[3].value,
-        Value::Explicit(FUNDING_VALUE * 2 - FEE)
-    );
+    if has_confidential_funding {
+        assert!(transaction.output[3].value.is_confidential());
+    } else {
+        assert_eq!(transaction.output[3].asset, Asset::Explicit(policy_asset));
+        assert_eq!(transaction.output[3].value, Value::Explicit(change_value));
+    }
     assert_rt_pair(&transaction, params, RtSide::A, false);
     let accepted = accept_broadcast_mine(rpc, miner, &transaction);
     CreatedMarket {

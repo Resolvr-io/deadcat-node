@@ -151,7 +151,7 @@ pub fn decode_simplicity_witness(
     if stack.len() != 4 {
         return Err(InterpretError::BadWitnessStack { len: stack.len() });
     }
-    let redeem = RedeemNode::<Elements>::decode(
+    let redeem = RedeemNode::decode::<_, _, Elements>(
         BitIter::from(stack[1].iter().copied()),
         BitIter::from(stack[0].iter().copied()),
     )

@@ -1644,7 +1644,7 @@ dependencies = [
  "ipnet",
  "jni 0.22.4",
  "rand 0.10.2",
- "rustls 0.23.41",
+ "rustls",
  "thiserror 2.0.18",
  "tinyvec",
  "tokio",
@@ -1692,7 +1692,7 @@ dependencies = [
  "parking_lot",
  "rand 0.10.2",
  "resolv-conf",
- "rustls 0.23.41",
+ "rustls",
  "smallvec",
  "system-configuration",
  "thiserror 2.0.18",
@@ -1804,7 +1804,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
- "rustls 0.23.41",
+ "rustls",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -2086,7 +2086,7 @@ dependencies = [
  "rand 0.10.2",
  "reqwest",
  "rustc-hash",
- "rustls 0.23.41",
+ "rustls",
  "rustls-pki-types",
  "serde",
  "smallvec",
@@ -2135,7 +2135,7 @@ dependencies = [
  "ndk-context",
  "portable-atomic",
  "rand 0.10.2",
- "rustls 0.23.41",
+ "rustls",
  "simple-dns",
  "strum",
  "tokio",
@@ -2200,7 +2200,7 @@ dependencies = [
  "postcard",
  "rand 0.10.2",
  "reqwest",
- "rustls 0.23.41",
+ "rustls",
  "rustls-pki-types",
  "serde",
  "serde_bytes",
@@ -2212,7 +2212,7 @@ dependencies = [
  "tracing",
  "url",
  "vergen-gitcl",
- "webpki-roots 1.0.8",
+ "webpki-roots",
  "ws_stream_wasm",
 ]
 
@@ -2339,7 +2339,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3662a38d341d77efecb73caf01420cfa5aa63c0253fd7bc05289ef9f6616e1bf"
 dependencies = [
  "base64 0.13.1",
- "minreq",
+ "minreq 2.14.1",
  "serde",
  "serde_json",
 ]
@@ -2469,11 +2469,21 @@ version = "2.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05015102dad0f7d61691ca347e9d9d9006685a64aefb3d79eecf62665de2153d"
 dependencies = [
- "rustls 0.21.12",
- "rustls-webpki 0.101.7",
  "serde",
  "serde_json",
- "webpki-roots 0.25.4",
+]
+
+[[package]]
+name = "minreq"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "659579df697b372ef9e36f02fcbb41f6d6f157dcec7db9c9618fa0f23cf0fc20"
+dependencies = [
+ "rustls",
+ "rustls-webpki",
+ "serde",
+ "serde_json",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -2702,7 +2712,7 @@ dependencies = [
  "noq-udp",
  "pin-project-lite",
  "rustc-hash",
- "rustls 0.23.41",
+ "rustls",
  "socket2",
  "thiserror 2.0.18",
  "tokio",
@@ -2728,7 +2738,7 @@ dependencies = [
  "rand_pcg",
  "ring",
  "rustc-hash",
- "rustls 0.23.41",
+ "rustls",
  "rustls-pki-types",
  "slab",
  "sorted-index-buffer",
@@ -3238,7 +3248,7 @@ dependencies = [
  "quinn-proto",
  "quinn-udp",
  "rustc-hash",
- "rustls 0.23.41",
+ "rustls",
  "socket2",
  "thiserror 2.0.18",
  "tokio",
@@ -3260,7 +3270,7 @@ dependencies = [
  "rand_pcg",
  "ring",
  "rustc-hash",
- "rustls 0.23.41",
+ "rustls",
  "rustls-pki-types",
  "slab",
  "thiserror 2.0.18",
@@ -3373,18 +3383,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "regex"
-version = "1.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a0e75113e14dc5acb068cd0786884f214f1312650a3d36d269f5c4f3cdee8a2"
-dependencies = [
- "aho-corasick",
- "memchr",
- "regex-automata 0.4.15",
- "regex-syntax 0.8.11",
-]
-
-[[package]]
 name = "regex-automata"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3441,7 +3439,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "quinn",
- "rustls 0.23.41",
+ "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
  "serde",
@@ -3523,18 +3521,6 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.21.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f56a14d1f48b391359b22f731fd4bd7e43c97f3c50eee276f3aa09c94784d3e"
-dependencies = [
- "log",
- "ring",
- "rustls-webpki 0.101.7",
- "sct",
-]
-
-[[package]]
-name = "rustls"
 version = "0.23.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
@@ -3544,7 +3530,7 @@ dependencies = [
  "once_cell",
  "ring",
  "rustls-pki-types",
- "rustls-webpki 0.103.13",
+ "rustls-webpki",
  "subtle",
  "zeroize",
 ]
@@ -3582,10 +3568,10 @@ dependencies = [
  "jni 0.22.4",
  "log",
  "once_cell",
- "rustls 0.23.41",
+ "rustls",
  "rustls-native-certs",
  "rustls-platform-verifier-android",
- "rustls-webpki 0.103.13",
+ "rustls-webpki",
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
@@ -3597,16 +3583,6 @@ name = "rustls-platform-verifier-android"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
-
-[[package]]
-name = "rustls-webpki"
-version = "0.101.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b6275d1ee7a1cd780b64aca7726599a1dbc893b1e64144529e55c3c2f745765"
-dependencies = [
- "ring",
- "untrusted",
-]
 
 [[package]]
 name = "rustls-webpki"
@@ -3642,15 +3618,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "santiago"
-version = "1.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de36022292bc2086eb8f55bffa460fef3475e4459b478820711f4c421feb87ec"
-dependencies = [
- "regex",
-]
-
-[[package]]
 name = "schannel"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3670,16 +3637,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "sct"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da046153aa2352493d6cb7da4b6e5c0c057d8a1d0a9aa8560baffdd945acd414"
-dependencies = [
- "ring",
- "untrusted",
-]
 
 [[package]]
 name = "secp256k1"
@@ -3928,9 +3885,9 @@ dependencies = [
 
 [[package]]
 name = "simplicity-lang"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70e57bd4d84853974a212eab24ed89da54f49fbccf5e33e93bcd29f0a6591cd5"
+checksum = "13ed081e3046d66c146d7201bcbf3b655ca3436cb83f6efc26d7895bd2b79d06"
 dependencies = [
  "bitcoin",
  "bitcoin_hashes",
@@ -3940,15 +3897,14 @@ dependencies = [
  "ghost-cell",
  "hex-conservative 0.2.2",
  "miniscript",
- "santiago",
  "simplicity-sys",
 ]
 
 [[package]]
 name = "simplicity-sys"
-version = "0.6.2"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3401ee7331f183a5458c0f5a4b3d5d00bde0fd12e2e03728c537df34efae289"
+checksum = "96d1ec5477c7650b8ef511aa56dccb28f2e8cdb6e87f260ecffdaf0ebfef2d3b"
 dependencies = [
  "bitcoin_hashes",
  "cc",
@@ -3956,9 +3912,9 @@ dependencies = [
 
 [[package]]
 name = "simplicityhl"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25de8990174fe3e1a843df138cacc4265d05839ebd2550c18b9196f567d55e81"
+checksum = "361316795ec753230c421d964ab60940d20d5252c2d39272452528832c9e0ec5"
 dependencies = [
  "base64 0.21.7",
  "chumsky",
@@ -3986,9 +3942,9 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "smplx-build"
-version = "0.0.6"
+version = "0.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb75724fd0329de24895b58a4010efeeca9773092294845a324aee141ec3c864"
+checksum = "f9f3e2235cc1bb20a5dda4bd32c9be665f39c95f1bcc62d7aa2a9adfc8fb670f"
 dependencies = [
  "glob",
  "globwalk",
@@ -4001,13 +3957,14 @@ dependencies = [
  "syn",
  "thiserror 2.0.18",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]
 name = "smplx-macros"
-version = "0.0.6"
+version = "0.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4777f6ff9a27faf98396181d67f04f720e0c472c2a3f1db76c5475b45da8963f"
+checksum = "03e1a764666ba1aada361499286710a0d5d7f1a0251d882a0843bb67ae5b7973"
 dependencies = [
  "smplx-build",
  "smplx-test",
@@ -4016,9 +3973,9 @@ dependencies = [
 
 [[package]]
 name = "smplx-regtest"
-version = "0.0.6"
+version = "0.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf3711284f8ad7859ae0605841e90316bdf41be5b09011639e765667f07feb5d"
+checksum = "f60a5ca5ccc0b531f4915f1d044c68b7ba3bc344e84ac019f539b2e488c8c8d7"
 dependencies = [
  "electrsd",
  "hex",
@@ -4032,17 +3989,17 @@ dependencies = [
 
 [[package]]
 name = "smplx-sdk"
-version = "0.0.6"
+version = "0.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c96c7de4f86f4a74dc4c910d6d0541d63cd661e3f616566054a36e589ffcda2c"
+checksum = "940acb2e942bda24f3f27c3a387aabcf866dc16299746e79a58b47d091162f5d"
 dependencies = [
  "bip39",
  "bitcoin_hashes",
+ "bitcoincore-rpc",
  "dyn-clone",
- "electrsd",
  "elements-miniscript",
  "hex",
- "minreq",
+ "minreq 3.0.0",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4052,9 +4009,9 @@ dependencies = [
 
 [[package]]
 name = "smplx-std"
-version = "0.0.6"
+version = "0.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38cef91f2523cfb6e8937bb1c8004869d539e0dcd8c62fef68c93cc3a6233117"
+checksum = "bcfa462d2e480d1fa6baa382d578501991fd19c3fb15ae5cdd44be362ef5e9ef"
 dependencies = [
  "either",
  "serde",
@@ -4066,9 +4023,9 @@ dependencies = [
 
 [[package]]
 name = "smplx-test"
-version = "0.0.6"
+version = "0.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9c8878fae6868b9fbf7ed7cb3e261dc308b55ea418bb4421685dad99f98fc1f"
+checksum = "d76eab48bbf610aea049644b6aacffebbb194e59c663cd450b1f30a29ead19c1"
 dependencies = [
  "electrsd",
  "proc-macro2",
@@ -4388,7 +4345,7 @@ version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
- "rustls 0.23.41",
+ "rustls",
  "tokio",
 ]
 
@@ -4483,6 +4440,7 @@ dependencies = [
  "indexmap",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.3",
 ]
 
@@ -4882,12 +4840,6 @@ checksum = "0d46a5a140e6f7afeccd8eae97eff335163939eac8b929834875168b29b3d267"
 dependencies = [
  "rustls-pki-types",
 ]
-
-[[package]]
-name = "webpki-roots"
-version = "0.25.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f20c57d8d7db6d3b86154206ae5d8fba62dd39573114de97c2cb0578251f8e1"
 
 [[package]]
 name = "webpki-roots"

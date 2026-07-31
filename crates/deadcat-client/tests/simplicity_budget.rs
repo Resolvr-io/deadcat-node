@@ -95,7 +95,7 @@ fn record_budget(
         4,
         "finalized Simplicity stack must have four core elements"
     );
-    let redeem = RedeemNode::<Elements>::decode(
+    let redeem = RedeemNode::decode::<_, _, Elements>(
         BitIter::from(core_stack[1].iter().copied()),
         BitIter::from(core_stack[0].iter().copied()),
     )
