@@ -905,6 +905,7 @@ dependencies = [
  "rand 0.8.7",
  "serde",
  "serde_json",
+ "simplicity-lang",
  "smplx-regtest",
  "smplx-std",
  "tempfile",
@@ -3897,6 +3898,7 @@ dependencies = [
  "ghost-cell",
  "hex-conservative 0.2.2",
  "miniscript",
+ "serde",
  "simplicity-sys",
 ]
 
