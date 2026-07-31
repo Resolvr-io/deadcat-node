@@ -1,12 +1,19 @@
 # Simplicity Contract Audit — 2026-07-24
 
+> **Historical alpha record.** The maker-order contract audited here was
+> removed before any testnet or mainnet deployment. Its final pre-removal
+> implementation is preserved at
+> [`d7be35b27a020a61333e471b2ded5f59e3a0a039`](https://github.com/Resolvr-io/deadcat-node/tree/d7be35b27a020a61333e471b2ded5f59e3a0a039).
+> Maker findings and source links below describe that revision, not the current
+> market-only codebase.
+
 ## Status and scope
 
 This document records an internal source-level audit of the two SimplicityHL
 contracts in this repository:
 
-- [`binary_market.simf`](../crates/deadcat-contracts/simplicityhl/binary_market.simf)
-- [`maker_order.simf`](../crates/deadcat-contracts/simplicityhl/maker_order.simf)
+- [`binary_market.simf`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-contracts/simplicityhl/binary_market.simf)
+- [`maker_order.simf`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-contracts/simplicityhl/maker_order.simf)
 
 The audited revision was `3efcc11` on branch
 `codex/canonical-maker-orders`.
@@ -30,11 +37,15 @@ environment, and the daemon-free test suites listed under
 
 ### Document lifecycle
 
-**Status:** Active audit record.
+**Status:** Historical audit record; not yet superseded.
 
 This report describes revision `3efcc11`; it is a historical security record,
 not the normative protocol specification. Findings should be updated with links
 to their fix, accepted-risk decision, or other disposition.
+
+H-1 was resolved by merged PR #11. H-2, M-1, M-2, L-1 through L-4, and L-6
+were retired with the maker-order subsystem before deployment; they remain here
+as design evidence. L-5 still applies to the market-only build.
 
 Mark this report **Superseded** when:
 
@@ -93,18 +104,17 @@ outputs if the creation-time reissuance-token supply checks ever regressed.
 
 **Severity:** High
 
-**Disposition:** Remediation is proposed in
-[PR #11](https://github.com/Resolvr-io/deadcat-node/pull/11). It makes the
+**Disposition:** Resolved by merged
+[PR #11](https://github.com/Resolvr-io/deadcat-node/pull/11), which makes the
 shared interpreter reproduce the transaction-global `check_lock_height`
 predicate and retains covenant/interpreter regressions for a non-final
-follower, all-final inputs, and a time-typed lock. Mark this finding resolved
-when that PR merges.
+follower, all-final inputs, and a time-typed lock.
 
 **Affected components:**
 
-- [`binary_market.simf`](../crates/deadcat-contracts/simplicityhl/binary_market.simf#L574-L616)
-- [`interpret/binary_market.rs`](../crates/deadcat-contracts/src/interpret/binary_market.rs#L984-L996)
-- [`sync.rs`](../crates/deadcat-node/src/sync.rs#L473-L476)
+- [`binary_market.simf`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-contracts/simplicityhl/binary_market.simf#L574-L616)
+- [`interpret/binary_market.rs`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-contracts/src/interpret/binary_market.rs#L984-L996)
+- [`sync.rs`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-node/src/sync.rs#L473-L476)
 - Independent client history replay, which uses the same interpreter
 
 #### Contract behavior
@@ -175,9 +185,9 @@ This is an inexpensive contract-specific indexing and availability failure,
 not a direct collateral theft.
 
 The official builder does not expose the issue because
-[`prepare_expiry`](../crates/deadcat-client/src/market_builder.rs#L484-L508)
+[`prepare_expiry`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-client/src/market_builder.rs#L484-L508)
 sets every contract input to a non-final sequence, and
-[`verify_expiry`](../crates/deadcat-client/src/market_builder.rs#L769-L799)
+[`verify_expiry`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-client/src/market_builder.rs#L769-L799)
 requires all contract inputs to remain non-final. A custom transaction is not
 bound by that stricter builder policy.
 
@@ -204,7 +214,7 @@ covenant-valid arrangement.
 #### Recommended regression
 
 The narrowest red-to-green regression belongs beside the active-expiry tests in
-[`tests/interpret.rs`](../crates/deadcat-contracts/tests/interpret.rs#L478-L645):
+[`tests/interpret.rs`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-contracts/tests/interpret.rs#L478-L645):
 
 1. Refactor `finalized_active_expiry` to accept three input sequences.
 2. Build the mixed sequence array
@@ -228,8 +238,8 @@ and require both covenant execution and interpretation to reject the expiry.
 
 **Affected components:**
 
-- [`validation.rs::replay_contract_history`](../crates/deadcat-client/src/validation.rs#L398-L480)
-- [`validation.rs::replay_maker`](../crates/deadcat-client/src/validation.rs#L517-L616)
+- [`validation.rs::replay_contract_history`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-client/src/validation.rs#L398-L480)
+- [`validation.rs::replay_maker`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-client/src/validation.rs#L517-L616)
 
 #### Current behavior
 
@@ -250,17 +260,17 @@ It does not:
 - enforce the network activation checkpoint used by registration.
 
 `replay_contract_history` accepts `Option<&ContractView>` for the parent.
-[`validate_order_against_parent`](../crates/deadcat-client/src/validation.rs#L155-L201)
+[`validate_order_against_parent`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-client/src/validation.rs#L155-L201)
 checks structural and economic consistency, but a raw `ContractView` is not
 evidence that the parent was canonically created or replayed.
 
 Node registration correctly rederives the instance identity at
-[`registration.rs`](../crates/deadcat-node/src/registration.rs#L662-L673) and
+[`registration.rs`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-node/src/registration.rs#L662-L673) and
 checks the parent and recovery hint at
-[`registration.rs`](../crates/deadcat-node/src/registration.rs#L674-L778).
+[`registration.rs`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-node/src/registration.rs#L674-L778).
 
 The existing test
-[`maker_creation_replay_uses_the_exact_nominated_output`](../crates/deadcat-client/src/validation.rs#L1791-L1865)
+[`maker_creation_replay_uses_the_exact_nominated_output`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-client/src/validation.rs#L1791-L1865)
 constructs a zero-input transaction containing two identical order outputs and
 expects either vout to replay independently. Canonical instance derivation
 explicitly rejects an empty creation-input set.
@@ -296,11 +306,11 @@ registration rejects it.
 
 **Affected components:**
 
-- [`maker_order/compiled.rs`](../crates/deadcat-contracts/src/maker_order/compiled.rs#L30-L50)
-- [`maker_order.simf`](../crates/deadcat-contracts/simplicityhl/maker_order.simf#L67-L84)
-- [`interpreter.rs::validate_atomic_claims`](../crates/deadcat-node/src/interpreter.rs#L378-L408)
+- [`maker_order/compiled.rs`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-contracts/src/maker_order/compiled.rs#L30-L50)
+- [`maker_order.simf`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-contracts/simplicityhl/maker_order.simf#L67-L84)
+- [`interpreter.rs::validate_atomic_claims`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-node/src/interpreter.rs#L378-L408)
 - The uniqueness claim in
-  [`protocol-v1.md`](protocol-v1.md#fill-layout)
+  [`protocol-v1.md`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/docs/protocol-v1.md#fill-layout)
 
 #### Current derivation
 
@@ -366,8 +376,8 @@ Use one or more of:
 
 **Affected components:**
 
-- [`deadcat-client/src/keys.rs`](../crates/deadcat-client/src/keys.rs#L109-L164)
-- [`maker_order/compiled.rs`](../crates/deadcat-contracts/src/maker_order/compiled.rs#L30-L50)
+- [`deadcat-client/src/keys.rs`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-client/src/keys.rs#L109-L164)
+- [`maker_order/compiled.rs`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-contracts/src/maker_order/compiled.rs#L30-L50)
 
 Both private keys have the form:
 
@@ -404,11 +414,11 @@ remainder_quote >= min_active_base * price
 ```
 
 See
-[`maker_order.simf`](../crates/deadcat-contracts/simplicityhl/maker_order.simf#L121-L152).
+[`maker_order.simf`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-contracts/simplicityhl/maker_order.simf#L121-L152).
 It does not require `remainder_quote % price == 0`.
 
 The Rust economics/interpreter rejects a non-integral remainder at
-[`maker_order.rs`](../crates/deadcat-contracts/src/maker_order.rs#L204-L227).
+[`maker_order.rs`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-contracts/src/maker_order.rs#L204-L227).
 
 For example:
 
@@ -471,7 +481,7 @@ creation validation should prove that a full or partial fill exists.
 
 **Severity:** Low to medium API footgun
 
-[`maker_order_creation_outputs`](../crates/deadcat-client/src/maker_builder.rs#L22-L59)
+[`maker_order_creation_outputs`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-client/src/maker_builder.rs#L22-L59)
 is described as constructing canonical creation outputs, but it receives no
 verified parent market. It cannot validate:
 
@@ -492,12 +502,12 @@ not registerable/canonical, outputs.
 
 **Severity:** Low
 
-[`ADR 0002`](adr/0002-v1-contract-scope.md#compatibility-policy) says recovery
+[`ADR 0002`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/docs/adr/0002-v1-contract-scope.md#compatibility-policy) says recovery
 hints are advisory and that manual registration can track an otherwise
 canonical contract without one.
 
 Maker registration unconditionally requires an adjacent matching hint at
-[`registration.rs`](../crates/deadcat-node/src/registration.rs#L750-L778).
+[`registration.rs`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-node/src/registration.rs#L750-L778).
 Independent client replay checks no hint at all.
 
 As a result, the sets of:
@@ -512,7 +522,7 @@ are different in a way the documented policy does not describe.
 
 **Severity:** Low
 
-[`build.rs`](../crates/deadcat-contracts/build.rs#L3-L21) accepts a compiler
+[`build.rs`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-contracts/build.rs#L3-L21) accepts a compiler
 version when:
 
 ```rust
@@ -530,10 +540,10 @@ out-of-environment builds safer and more reproducible.
 
 **Affected components:**
 
-- [`maker_order.simf`](../crates/deadcat-contracts/simplicityhl/maker_order.simf#L67-L181)
-- [`interpreter.rs`](../crates/deadcat-node/src/interpreter.rs#L445-L481)
+- [`maker_order.simf`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-contracts/simplicityhl/maker_order.simf#L67-L181)
+- [`interpreter.rs`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-node/src/interpreter.rs#L445-L481)
 - The fill-layout uniqueness discussion in
-  [`protocol-v1.md`](protocol-v1.md#fill-layout)
+  [`protocol-v1.md`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/docs/protocol-v1.md#fill-layout)
 
 Each maker execution reads its held amount from the current input but selects
 its maker-payment and optional continuation outputs by witness indices. If a
@@ -763,7 +773,7 @@ independent live vulnerabilities.
 The Simplicity source itself validates payout and expiry parameters. The Rust
 compiler additionally validates the oracle x-only key and requires collateral,
 outcome-token, and RT asset IDs to be distinct at
-[`binary_market/compiled.rs`](../crates/deadcat-contracts/src/binary_market/compiled.rs#L170-L195).
+[`binary_market/compiled.rs`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-contracts/src/binary_market/compiled.rs#L170-L195).
 Bypassing that wrapper creates an unsupported foreign program.
 
 ### Maker order
@@ -958,8 +968,8 @@ routing stops after observing a terminal parent, but that is policy rather than
 consensus protection.
 
 This is explicitly documented in
-[`protocol-v1.md`](protocol-v1.md#parent-market-terminal-state) and
-[`ADR 0002`](adr/0002-v1-contract-scope.md#order-responsibility).
+[`protocol-v1.md`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/docs/protocol-v1.md#parent-market-terminal-state) and
+[`ADR 0002`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/docs/adr/0002-v1-contract-scope.md#order-responsibility).
 
 ### Expiry opens a path; it does not force termination
 

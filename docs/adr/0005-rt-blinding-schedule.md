@@ -266,8 +266,7 @@ that do not depend on accepting the A/B candidate:
   too small for Elements' Simplicity cost-budget rule. Client finalization now
   appends the padding annex returned by the Simplicity cost bound when needed.
   An exhaustive regression covers every market lifecycle path, every sibling
-  input, both resolution outcomes, both redemption shapes, and all maker fill
-  shapes.
+  input, both resolution outcomes, and both redemption shapes.
 
 The first hardening commit preserved the rolling covenant, CMR, and
 source-level witness ABI. It established a stronger baseline before the
@@ -334,9 +333,9 @@ Concrete-block sync tests start with no registered contract and exercise
 OP_RETURN recovery through `SyncCoordinator + DeadcatInterpreter`, redb reopen,
 idempotent replay, and coordinator-driven one-/two-block branch replacement.
 Deterministic fixtures prove two-market atomic interpreter/store orchestration;
-the mandatory [multi-contract live gate](../acceptance/multi-contract-v1.md)
-adds a real composed covenant transaction accepted by Elements and processed
-as one atomic interpreter/store batch. Exact full-market and live
+the mandatory `multi_market_transaction_is_accepted_and_indexed_by_elementsd`
+gate adds a real transaction advancing two independent markets, accepted by
+Elements and processed as one atomic interpreter/store batch. Exact full-market and live
 measurements are preserved in
 [`../measurements/binary-market-ab-v1.json`](../measurements/binary-market-ab-v1.json)
 and the acceptance packet.
@@ -408,10 +407,10 @@ full checklist and evidence locations live in
    direct and coordinator-driven one-/two-block reorg replay, live wallet
    composition, and deterministic two-market atomic indexing pass the
    candidate corpus.
-6. **Complete — live composed orchestration:** one real transaction advances a
-   market and two maker orders through Elements acceptance,
+6. **Complete — live composed orchestration:** one real transaction advances
+   two independent markets through Elements acceptance,
    transaction-atomic indexing, restart, reorg replay, and independent client
-   validation in the mandatory multi-contract gate.
+   validation in the mandatory multi-market gate.
 7. **Partially complete — review and approval:** Tommy Volk approved the
    protocol-owner checklist on 2026-07-14 against
    `7ed20b8b81306eaf81ee49b80b4ea65b49804871`. The constants, scalar byte

@@ -1,7 +1,14 @@
 # ADR 0002: V1 contract scope and lifecycle
 
-- Status: Superseded by [ADR 0006](0006-rfq-first-liquidity-scope.md)
+- Status: Release scope superseded by
+  [ADR 0006](0006-rfq-first-liquidity-scope.md); binary-market decisions retained
 - Date: 2026-07-12
+
+> **Historical alpha scope.** This ADR records the original two-contract
+> decision. ADR 0006 removed the maker order and LMSR reservation before
+> deployment while retaining the binary-market lifecycle decisions below. The
+> final pre-removal implementation is preserved at
+> [`d7be35b27a020a61333e471b2ded5f59e3a0a039`](https://github.com/Resolvr-io/deadcat-node/tree/d7be35b27a020a61333e471b2ded5f59e3a0a039).
 
 ## Decision
 

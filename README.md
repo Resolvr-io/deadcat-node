@@ -1,125 +1,78 @@
 # deadcat-node
 
-`deadcat-node` is the authoritative implementation of the Deadcat protocol on
-Liquid. It owns the canonical SimplicityHL contracts, interprets their confirmed
-chain state, indexes that state in redb, and serves evidence over Iroh.
+`deadcat-node` is the authoritative implementation of Deadcat's binary
+prediction-market protocol on Liquid. It owns the canonical SimplicityHL
+contract, interprets confirmed chain state, indexes that state in redb, and
+serves independently verifiable evidence over Iroh.
 
-The node is deliberately not a wallet. Keys, wallet discovery, route selection,
-PSET construction, confidential-transaction blinding, intent validation, and
-signing stay on the client.
+The node is deliberately not a wallet or trading venue. Keys, wallet discovery,
+PSET construction, confidential-transaction blinding, intent validation, venue
+selection, and signing stay on the client.
 
-## Current alpha scope
+## Current scope
 
-The current alpha includes:
+The clean-slate alpha includes:
 
-- a binary prediction-market covenant that enforces collateral solvency;
-- a persistent maker limit-order covenant;
-- confirmed chain indexing through either Elements Core RPC or Esplora;
-- transaction-atomic, reorg-aware redb persistence; and
-- an evidence-first Iroh RPC for hosted and self-hosted nodes.
+- one collateral-solvent binary-market covenant;
+- wallet-agnostic market creation and transition builders;
+- confirmed-chain indexing through Elements Core RPC or Esplora;
+- transaction-atomic, reorg-aware redb persistence;
+- package registration and historical backfill for one or more markets; and
+- an evidence-first, bounded Iroh RPC for hosted and self-hosted nodes.
 
-This is not the selected production scope.
-[ADR 0006](docs/adr/0006-rfq-first-liquidity-scope.md) accepts a market-only
-first public release with a separate noncustodial RFQ service and client-owned
-routing. `MakerOrderV1`, node-side advisory routing, and the unused LMSR
-reservation remain in the alpha tree only until the accepted removal work
-lands. Future AMM and DLOB designs are intentionally undecided.
+The earlier on-chain maker-order experiment was removed before any contract
+reached testnet or mainnet. Its audit, economics ADR, and live acceptance
+packets remain in `docs/` as explicitly marked historical records.
 
-## Status
+[ADR 0006](docs/adr/0006-rfq-first-liquidity-scope.md) records the RFQ-first
+direction: the planned initial venue is a separate noncustodial liquidity
+service, with a client-side router responsible for quote validation and
+transaction construction. A future AMM or decentralized limit-order book can
+implement the same venue boundary. The RFQ service remains separate from
+`deadcat-node`; future AMM and DLOB protocols are not implemented by this
+repository today.
 
-The clean-slate v1 alpha is implemented for binary markets and maker limit
-orders. It includes the canonical `.simf` covenants, wallet-agnostic PSET
-builders, mnemonic-derived order-recovery primitives, confirmed-transaction
-interpreters, atomic redb state/history, two-block reorg undo,
-late-registration backfill, Elements RPC and Esplora chain sources, evidence
-queries, advisory routing, durable subscriptions, and bounded Iroh transport.
-Finalized Simplicity execution tests cover every market lifecycle path and both
-order directions.
-The binary-market candidate now uses fixed A/B reissuance-token commitments,
-with side inferred from each raw chain output and an exact input-side
-reissuance nonce. [ADR 0005](docs/adr/0005-rt-blinding-schedule.md) remains
-Proposed while its [acceptance packet](docs/acceptance/binary-market-ab-v1.md)
-awaits focused external review; protocol-owner approval was recorded on
-2026-07-14. Its exhaustive
-dual-side corpus, full-market measurements, live Elements lifecycle, recovery,
-restart, and one-/two-block reorg gates are complete.
-The maker-order candidate now has the same live Elements boundary: both order
-directions execute partial and full covenant fills, mnemonic-derived Taproot
-key cancellation, package registration and historical backfill, independent
-client replay, restart, and real alternate-hash one-/two-block reorgs. The gate
-also proves the intentional post-resolution split: Elements still accepts a
-custom fill while official node routing refuses it.
-The mandatory multi-contract liquidregtest gate extends protocol assurance from
-isolated covenant lifecycles to composed chain ingestion. One real consensus
-transaction advances a market and two maker orders, then is interpreted,
-indexed, restarted, reorganized, and independently replayed as one atomic
-transaction. That gate also drives a real three-block fork through
-`RescanRequired`, stale-read refusal, an activation-checkpoint reset, process
-reopen, retained-declaration replay, and return to `Ready` on the replacement
-branch.
-The mandatory backend-equivalence gate feeds one canonical chain and a real
-alternate-hash replacement through both production chain sources. Elements RPC
-and Esplora must produce identical synchronized market state, history, and raw
-evidence; the gate also exercises live Esplora broadcast, transaction status,
-outspend, issuance, script-history, and fee endpoints.
-The redb assurance suite independently drives the store against a deterministic
-seeded in-memory model across apply, retry, reopen, shallow/deep rollback, and
-rebuild paths. Test-only failpoints abort every named pre-commit mutation
-boundary and require an exact pre-state after reopen followed by an exact
-post-state after retry; no failpoint code is present in production builds.
-The mandatory process-boundary gate then spawns the production daemon and CLI
-as separate processes over direct Iroh. It proves live synchronization,
-registration, evidence queries, durable cursor replay, signed-transaction
-relay, stable node identity across restart, deep-reorg fail-closed behavior,
-the operator rebuild command, and stale-cursor rejection after rebuild.
+## Assurance
+
+Generated and direct Simplicity execution tests cover every binary-market
+lifecycle path. The mandatory live-chain gates prove:
+
+- the complete binary-market lifecycle on liquidregtest;
+- one transaction advancing two independent markets with atomic indexing,
+  replay, reorg, reset, and retained-declaration rebuild behavior;
+- equivalent state and evidence from the production Elements RPC and Esplora
+  backends; and
+- the daemon, Iroh transport, and CLI across real process boundaries.
+
+The redb assurance suite additionally drives apply, retry, reopen, rollback,
+deep-reorg, and rebuild paths against a deterministic model. Test-only
+failpoints require exact pre-state recovery after an aborted mutation and exact
+post-state after retry.
 
 V1 activation is immutable per production network. Liquid mainnet begins after
 block `3974391` (`705d699f…890c35`) and Liquid testnet begins after block
-`2529866` (`78fe3d5c…2f510e`). The exact checkpoint is verified against the
-backend and bound atomically with chain identity and the initial redb tip.
-The native policy asset is equally immutable: Liquid uses
-`6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d`
-and Liquid testnet uses
-`144c654344aa716d6f3abcc1ca90e5641e4e2a7f633bc09fe3baf64585819a49`.
-The daemon derives these values from `--network`; an explicit matching
-`--policy-asset` is accepted, while a conflicting value is rejected before
-backend access or database creation. Elements regtest remains dynamic and
-requires `--policy-asset`.
+`2529866` (`78fe3d5c…2f510e`). The daemon derives each production network's
+activation checkpoint and policy asset from `--network`; Elements regtest
+remains dynamic and requires `--policy-asset`.
 
-This is not yet a production release. Public Liquid testnet shakedowns,
-operational backup/restore tooling, Nostr announcement ingestion, browser
-packaging of the full validator, and an external security review remain. Public
-operators should currently protect package
-registration with `--registration-bearer-token` or an edge rate limiter: the
-alpha bounds package size and concurrent verification, but per-peer admission,
-a process-wide weighted evidence budget, and a stored-evidence fast path for
-identical retries are still deployment hardening work. The Iroh transport
-itself passes a `wasm32-unknown-unknown`
-compile gate; the pinned smplx 0.0.6 runtime currently pulls native regtest
-dependencies into `deadcat-client`, so that larger WASM target remains an
-upstream-integration task rather than a reason to add HTTP. LMSR is
-intentionally deferred. Generated smplx Rust bindings under
-`crates/deadcat-contracts/src/artifacts/` are build outputs and are never
-committed.
+This is still an alpha. Public Liquid testnet shakedowns, operational
+backup/restore tooling, announcement ingestion, full browser packaging, and an
+external security review remain before production use.
 
 ## Development
 
-All builds and CI checks run through the pinned Nix environment:
+All builds and checks run through the pinned Nix environment:
 
 ```sh
 nix develop .#default
 just ci
 ```
 
-Before the repository has an initial commit, use `nix develop path:.#default`
-so Nix includes the untracked workspace files.
-
-The focused live-chain gates can be run independently:
+Focused live-chain gates:
 
 ```sh
 just regtest-market-ab
-just regtest-maker-orders
-just regtest-multi-contract
+just regtest-multi-market
 just regtest-backend-equivalence
 just regtest-process-boundary
 ```
@@ -133,7 +86,7 @@ just node run \
   elements --url http://127.0.0.1:7041 --cookie-file <cookie-path>
 ```
 
-Or use a lightweight Esplora source:
+Or use an Esplora source:
 
 ```sh
 just node run \
@@ -141,19 +94,8 @@ just node run \
   esplora --url https://<liquid-esplora>/api/
 ```
 
-The daemon prints its serialized Iroh endpoint address on startup and persists
-a stable endpoint secret beside the database. Production networks always use
-their compiled activation checkpoint and policy asset. A dynamically-created
-Elements regtest chain defaults to genesis; `--baseline-height` is available
-only on regtest when a later explicit test checkpoint is useful. Scanning and
-valid v1 creation begin strictly after that checkpoint. Elements-backed nodes
-report full public market hint coverage only when their persisted indexed tip
-is `Ready` at the current source tip; Esplora-backed nodes support
-chain-validated contract-package registration and report advisory discovery
-coverage.
-
-After a fork exceeds the two-block undo window, stop the daemon and run the
-local maintenance command with a backend for the same chain:
+After a fork exceeds the two-block undo window, stop the daemon and rebuild
+against a backend for the same chain:
 
 ```sh
 just node rebuild \
@@ -161,47 +103,47 @@ just node rebuild \
   elements --url http://127.0.0.1:7041 --cookie-file <cookie-path>
 ```
 
-The command verifies the stored network policy asset, genesis, and activation
-hash before any destructive write, clears chain materialization, history,
-index, and undo tables, preserves normalized declarations and the durable event
-journal, and replays in complete-block commits. It is safe to rerun after
-interruption.
-Until reset, `RescanRequired` is sticky and chain-derived RPCs fail closed;
-`GetInfo`, subscriptions, fee estimation, and signed-transaction relay remain
-available.
+The rebuild verifies stored chain identity before clearing derived chain state,
+preserves normalized market declarations and the durable event journal, and
+replays complete blocks. Until reset, `RescanRequired` is sticky and
+chain-derived RPCs fail closed.
 
-Contract identity and ingestion are deliberately separate. A compact
-`ContractId` is the exact creation-anchor outpoint: the initial dormant YES RT
-output for a market, or the initial covenant output for a maker order. A
-portable `ContractPackage` carries complete untrusted declarations, their
-dependency relationships, and the target network/genesis. The receiving node
-fetches canonical chain evidence, recompiles and validates every declaration,
-and registers the package atomically; the package publisher is never an
+## Contract packages
+
+A `ContractId` is the exact initial dormant YES reissuance-token output of a
+market. A portable `ContractPackage` carries one or more complete, untrusted
+market declarations plus the target network and genesis hash. The receiving
+node fetches canonical chain evidence, recompiles and validates every
+declaration, and registers the package atomically; the publisher is never an
 authority for contract validity.
 
-Register a package over Iroh with the package object itself (not an RPC
-envelope):
+Register the nested package object over Iroh:
 
 ```sh
 deadcat --endpoint-id <node-endpoint-id> register --file ./package.json
 ```
 
 The committed
-[`register_contract_package` wire fixture](fixtures/wire-v1/register-contract-package-request.json)
-shows the exact strict JSON shape; `package.json` is its nested `package` value.
-The CLI also accepts compact `TXID:VOUT` syntax for individual `ContractId`
-arguments, while RPC JSON always uses `{"txid":"...","vout":n}`.
+[`register_contract_package` fixture](fixtures/wire-v1/register-contract-package-request.json)
+shows the strict JSON shape. The CLI also accepts compact `TXID:VOUT` syntax
+for individual `ContractId` arguments.
 
-Start with:
+## Documentation
 
 - [Architecture](docs/architecture.md)
 - [V1 protocol](docs/protocol-v1.md)
 - [Storage, synchronization, and RPC](docs/storage-sync-rpc.md)
-- [Implementation plan](docs/implementation-plan.md)
-- [Proposed liquidity roadmap](docs/liquidity-roadmap.md)
+- [Liquidity roadmap](docs/liquidity-roadmap.md)
 - [Architecture decisions](docs/adr/README.md)
 - [Binary-market A/B acceptance packet](docs/acceptance/binary-market-ab-v1.md)
-- [Maker-order live acceptance packet](docs/acceptance/maker-orders-v1.md)
-- [Multi-contract live acceptance packet](docs/acceptance/multi-contract-v1.md)
+- [Multi-market assurance test](crates/deadcat-client/tests/market_regtest.rs)
 - [Elements RPC and Esplora backend-equivalence packet](docs/acceptance/backend-equivalence-v1.md)
 - [Daemon/Iroh/CLI process-boundary packet](docs/acceptance/process-boundary-v1.md)
+- [Completed v1 alpha implementation record](docs/implementation-plan.md)
+
+Historical maker-order records:
+
+- [Simplicity contract audit](docs/simplicity-contract-audit-2026-07-24.md)
+- [Maker-order acceptance packet](docs/acceptance/maker-orders-v1.md)
+- [Heterogeneous multi-contract acceptance packet](docs/acceptance/multi-contract-v1.md)
+- [ADR 0003: retired order economics](docs/adr/0003-order-economics.md)

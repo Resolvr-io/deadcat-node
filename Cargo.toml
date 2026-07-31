@@ -18,11 +18,9 @@ publish = false
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"
-bip39 = "2"
 clap = { version = "4", features = ["derive"] }
 elements = { version = "0.25", features = ["serde"] }
 hex = { version = "0.4", features = ["serde"] }
-hmac = "0.12"
 iroh = "1"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 rand = "0.8"

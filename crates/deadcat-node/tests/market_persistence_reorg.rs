@@ -295,9 +295,7 @@ fn assert_markets_issued(
             .output(OutPoint::new(issuance.txid(), output_base + 1))
             .expect("read NO output")
             .expect("stored NO output");
-        let deadcat_node::store::ContractParameters::BinaryMarket(params) = record.params else {
-            unreachable!();
-        };
+        let deadcat_node::store::ContractParameters::BinaryMarket(params) = record.params;
         assert_eq!(
             infer_side(
                 RtLeg::Yes,

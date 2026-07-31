@@ -12,6 +12,7 @@ pub(crate) fn network(policy_asset: AssetId) -> SimplicityNetwork {
     SimplicityNetwork::ElementsRegtest { policy_asset }
 }
 
+#[allow(dead_code)]
 pub(crate) fn script(byte: u8) -> Script {
     Script::from(vec![0x6a, 0x01, byte])
 }

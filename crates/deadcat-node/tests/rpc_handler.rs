@@ -2,16 +2,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use deadcat_contracts::maker_order::{CompiledMakerOrder, derive_instance_id};
-use deadcat_contracts::recovery::{OrderRecoveryHint, recovery_txout};
 use deadcat_iroh::{RequestHandler as _, SubscriptionItem};
 use deadcat_node::chain::{ChainSource, ChainSourceError, Outspend, TransactionStatus};
 use deadcat_node::rpc_handler::{NodeRpcHandler, RpcHandlerConfig};
 use deadcat_node::store::{
     AssetBinding, AssetRelationKind as StoreAssetRelationKind, BlockDelta,
     ChainIdentity as StoreChainIdentity, ChainTxDelta, ContractParameters, ContractRecord,
-    ContractState, OrderBookEntry, RecoveryHintDelta, RegistrationEvidence, ScriptBinding,
-    StateUpdate, Store, TrackedOutpoint, TransitionRecord,
+    ContractState, RecoveryHintDelta, ScriptBinding, Store, TrackedOutpoint,
 };
 use deadcat_rpc::{
     AssetRelationKind, BackendKind, Capability, Event, EventFilter, PageRequest, RecoveryFamily,
@@ -21,14 +18,11 @@ use deadcat_types::{
     BinaryMarketParams, BinaryMarketState, CONTRACT_PACKAGE_FORMAT_VERSION, ChainAnchor,
     ChainIdentity, ChainPosition, ContractDeclaration, ContractDescriptor, ContractId,
     ContractKind, ContractPackage, ContractSyncState, DiscoveryCoverage, DiscoveryMode,
-    LiquidNetwork, MakerOrderParams, MakerOrderState, OrderDirection, OrderSide,
-    RecoveryHintLocation,
+    LiquidNetwork, RecoveryHintLocation,
 };
-use elements::confidential::{Asset, Nonce, Value};
 use elements::hashes::Hash as _;
 use elements::{
-    AssetId, Block, BlockHash, LockTime, OutPoint, Script, Transaction, TxIn, TxOut, TxOutWitness,
-    Txid,
+    AssetId, Block, BlockHash, LockTime, OutPoint, Script, Transaction, TxIn, TxOut, Txid,
 };
 
 #[derive(Clone, Copy)]
@@ -84,66 +78,6 @@ impl ChainSource for MockSource {
     }
 }
 
-#[derive(Clone)]
-struct RegistrationSource {
-    transaction: Transaction,
-    status: TransactionStatus,
-}
-
-#[async_trait]
-impl ChainSource for RegistrationSource {
-    async fn tip(&self) -> Result<ChainAnchor, ChainSourceError> {
-        Ok(anchor(1))
-    }
-
-    async fn block_hash(&self, _height: u32) -> Result<BlockHash, ChainSourceError> {
-        Err(unused_backend_call())
-    }
-
-    async fn block(&self, _hash: BlockHash) -> Result<Block, ChainSourceError> {
-        Err(unused_backend_call())
-    }
-
-    async fn transaction(&self, txid: Txid) -> Result<Transaction, ChainSourceError> {
-        if txid == self.transaction.txid() {
-            Ok(self.transaction.clone())
-        } else {
-            Err(ChainSourceError::NotFound(txid.to_string()))
-        }
-    }
-
-    async fn transaction_status(&self, txid: Txid) -> Result<TransactionStatus, ChainSourceError> {
-        if txid == self.transaction.txid() {
-            Ok(self.status)
-        } else {
-            Err(ChainSourceError::NotFound(txid.to_string()))
-        }
-    }
-
-    async fn outspend(&self, _outpoint: OutPoint) -> Result<Option<Outspend>, ChainSourceError> {
-        Err(unused_backend_call())
-    }
-
-    async fn script_history(&self, _script: &Script) -> Result<Vec<Txid>, ChainSourceError> {
-        Err(unused_backend_call())
-    }
-
-    async fn issuance_transaction(
-        &self,
-        _asset_id: AssetId,
-    ) -> Result<Option<Txid>, ChainSourceError> {
-        Err(unused_backend_call())
-    }
-
-    async fn estimate_fee_rate(&self, _target_blocks: u16) -> Result<f64, ChainSourceError> {
-        Err(unused_backend_call())
-    }
-
-    async fn broadcast(&self, _transaction: &Transaction) -> Result<Txid, ChainSourceError> {
-        Err(unused_backend_call())
-    }
-}
-
 fn unused_backend_call() -> ChainSourceError {
     ChainSourceError::Unavailable("unexpected mock backend call".to_owned())
 }
@@ -154,7 +88,6 @@ struct Fixture {
     handler: NodeRpcHandler<MockSource>,
     market: ContractRecord,
     other_market: ContractRecord,
-    orders: Vec<ContractRecord>,
     transactions: Vec<Transaction>,
     collateral: AssetId,
 }
@@ -210,8 +143,6 @@ fn market_record(marker: u8, transaction: &Transaction, tx_index: u32) -> Contra
         sync_state: ContractSyncState::Ready {
             synced_through: anchor(1),
         },
-        parent_market: None,
-        outcome_side: None,
         scripts: vec![ScriptBinding {
             role: 0,
             script_pubkey: vec![0x51, marker],
@@ -232,89 +163,6 @@ fn market_record(marker: u8, transaction: &Transaction, tx_index: u32) -> Contra
             role: 0,
             outpoint: OutPoint::new(transaction.txid(), 0),
         }],
-        order_book: None,
-    }
-}
-
-#[derive(Clone, Copy)]
-struct OrderSpec {
-    marker: u8,
-    price: u32,
-    minimum: u32,
-    remaining: u64,
-    direction: OrderDirection,
-    side: OrderSide,
-}
-
-fn order_record(
-    spec: OrderSpec,
-    transaction: &Transaction,
-    tx_index: u32,
-    market: &ContractRecord,
-) -> ContractRecord {
-    let ContractParameters::BinaryMarket(market_params) = market.params else {
-        unreachable!("market fixture")
-    };
-    let base_asset_id = match spec.side {
-        OrderSide::Yes => market_params.yes_token_asset_id,
-        OrderSide::No => market_params.no_token_asset_id,
-    };
-    let params = MakerOrderParams {
-        base_asset_id,
-        quote_asset_id: market_params.collateral_asset_id,
-        price: spec.price,
-        min_active_base: spec.minimum,
-        direction: spec.direction,
-        instance_id: [spec.marker.wrapping_add(1); 32],
-        maker_pubkey: [spec.marker.wrapping_add(2); 32],
-    };
-    let creation_position = ChainPosition {
-        block_height: 1,
-        tx_index,
-    };
-    let contract_id = ContractId::new(OutPoint::new(transaction.txid(), 0));
-    ContractRecord {
-        contract_id,
-        kind: ContractKind::MakerOrderV1,
-        params: ContractParameters::MakerOrder(params),
-        creation_position,
-        state: ContractState::MakerOrder(MakerOrderState::Active {
-            remaining_base: spec.remaining,
-            total_filled_base: 0,
-        }),
-        sync_state: ContractSyncState::Ready {
-            synced_through: anchor(1),
-        },
-        parent_market: Some(market.contract_id),
-        outcome_side: Some(spec.side),
-        scripts: vec![ScriptBinding {
-            role: 0,
-            script_pubkey: vec![0x52, spec.marker],
-        }],
-        assets: vec![
-            AssetBinding {
-                asset_id: params.base_asset_id,
-                relation: StoreAssetRelationKind::OrderBase,
-                role: 0,
-            },
-            AssetBinding {
-                asset_id: params.quote_asset_id,
-                relation: StoreAssetRelationKind::OrderQuote,
-                role: 1,
-            },
-        ],
-        outpoints: vec![TrackedOutpoint {
-            role: 0,
-            outpoint: OutPoint::new(transaction.txid(), 0),
-        }],
-        order_book: Some(OrderBookEntry {
-            market_id: market.contract_id,
-            side: spec.side,
-            direction: spec.direction,
-            price: spec.price,
-            creation_position,
-            remaining_base: spec.remaining,
-        }),
     }
 }
 
@@ -350,64 +198,10 @@ fn new_store() -> (tempfile::TempDir, Arc<Store>) {
 
 fn fixture() -> Fixture {
     let (directory, store) = new_store();
-    let transactions = (1..=6).map(transaction).collect::<Vec<_>>();
+    let transactions = (1..=2).map(transaction).collect::<Vec<_>>();
     let market = market_record(0x31, &transactions[0], 0);
     let other_market = market_record(0x32, &transactions[1], 1);
-    let orders = vec![
-        order_record(
-            OrderSpec {
-                marker: 0x41,
-                price: 7,
-                minimum: 3,
-                remaining: 6,
-                direction: OrderDirection::SellBase,
-                side: OrderSide::Yes,
-            },
-            &transactions[2],
-            2,
-            &market,
-        ),
-        order_record(
-            OrderSpec {
-                marker: 0x42,
-                price: 3,
-                minimum: 3,
-                remaining: 10,
-                direction: OrderDirection::SellBase,
-                side: OrderSide::Yes,
-            },
-            &transactions[3],
-            3,
-            &market,
-        ),
-        order_record(
-            OrderSpec {
-                marker: 0x43,
-                price: 4,
-                minimum: 2,
-                remaining: 5,
-                direction: OrderDirection::SellQuote,
-                side: OrderSide::Yes,
-            },
-            &transactions[4],
-            4,
-            &market,
-        ),
-        order_record(
-            OrderSpec {
-                marker: 0x44,
-                price: 8,
-                minimum: 2,
-                remaining: 7,
-                direction: OrderDirection::SellQuote,
-                side: OrderSide::Yes,
-            },
-            &transactions[5],
-            5,
-            &market,
-        ),
-    ];
-    let records = [vec![market.clone(), other_market.clone()], orders.clone()].concat();
+    let records = vec![market.clone(), other_market.clone()];
     let relevant_transactions = transactions
         .iter()
         .zip(records)
@@ -430,34 +224,19 @@ fn fixture() -> Fixture {
             prev_block_hash: anchor(0).hash,
             ordered_txids: transactions.iter().map(Transaction::txid).collect(),
             relevant_transactions,
-            recovery_hints: vec![
-                RecoveryHintDelta {
-                    location: RecoveryHintLocation {
-                        position: ChainPosition {
-                            block_height: 1,
-                            tx_index: 0,
-                        },
-                        output_index: 0,
+            recovery_hints: vec![RecoveryHintDelta {
+                location: RecoveryHintLocation {
+                    position: ChainPosition {
+                        block_height: 1,
+                        tx_index: 0,
                     },
-                    creation_txid: transactions[0].txid(),
-                    family: RecoveryFamily::BinaryMarketV1,
-                    payload: vec![0xdc, 1],
-                    associated_contract: Some(market.contract_id),
+                    output_index: 0,
                 },
-                RecoveryHintDelta {
-                    location: RecoveryHintLocation {
-                        position: ChainPosition {
-                            block_height: 1,
-                            tx_index: 2,
-                        },
-                        output_index: 0,
-                    },
-                    creation_txid: transactions[2].txid(),
-                    family: RecoveryFamily::MakerOrderV1,
-                    payload: vec![0xdc, 2],
-                    associated_contract: None,
-                },
-            ],
+                creation_txid: transactions[0].txid(),
+                family: RecoveryFamily::BinaryMarketV1,
+                payload: vec![0xdc, 1],
+                associated_contract: Some(market.contract_id),
+            }],
         })
         .expect("apply fixture block");
 
@@ -482,7 +261,6 @@ fn fixture() -> Fixture {
         handler,
         market,
         other_market,
-        orders,
         transactions,
         collateral: asset(0x20),
     }
@@ -563,113 +341,15 @@ async fn market_pages_are_atomic_and_invalidate_after_snapshot_changes() {
 }
 
 #[tokio::test]
-async fn materialized_list_book_hint_and_asset_queries_match_the_canonical_store() {
+async fn materialized_hint_and_asset_queries_match_the_canonical_store() {
     let fixture = fixture();
-    let Response::Orders { page } = request(
-        &fixture.handler,
-        Request::ListOrders {
-            market_id: fixture.market.contract_id,
-            side: Some(OrderSide::Yes),
-            direction: Some(OrderDirection::SellBase),
-            page: PageRequest {
-                cursor: None,
-                limit: 10,
-            },
-        },
-    )
-    .await
-    .expect("orders") else {
-        panic!("unexpected response")
-    };
-    assert_eq!(page.contracts.len(), 2);
-    assert!(page.contracts.iter().all(|order| {
-        order.parent_market == Some(fixture.market.contract_id)
-            && order.outcome_side == Some(OrderSide::Yes)
-    }));
-
-    let Response::Orders { page: first } = request(
-        &fixture.handler,
-        Request::ListOrders {
-            market_id: fixture.market.contract_id,
-            side: Some(OrderSide::Yes),
-            direction: Some(OrderDirection::SellBase),
-            page: PageRequest {
-                cursor: None,
-                limit: 1,
-            },
-        },
-    )
-    .await
-    .expect("first order page") else {
-        panic!("unexpected response")
-    };
-    let next = first.next.expect("second order cursor");
-    let error = request(
-        &fixture.handler,
-        Request::ListOrders {
-            market_id: fixture.market.contract_id,
-            side: Some(OrderSide::Yes),
-            direction: Some(OrderDirection::SellQuote),
-            page: PageRequest {
-                cursor: Some(next.clone()),
-                limit: 1,
-            },
-        },
-    )
-    .await
-    .expect_err("changing a cursor's order filter");
-    assert_eq!(error.code, RpcErrorCode::SnapshotInvalidated);
-    let Response::Orders { page: second } = request(
-        &fixture.handler,
-        Request::ListOrders {
-            market_id: fixture.market.contract_id,
-            side: Some(OrderSide::Yes),
-            direction: Some(OrderDirection::SellBase),
-            page: PageRequest {
-                cursor: Some(next),
-                limit: 1,
-            },
-        },
-    )
-    .await
-    .expect("second order page") else {
-        panic!("unexpected response")
-    };
-    assert_eq!(second.contracts.len(), 1);
-    assert!(second.next.is_none());
-
-    let Response::OrderBook { book } = request(
-        &fixture.handler,
-        Request::GetOrderBook {
-            market_id: fixture.market.contract_id,
-        },
-    )
-    .await
-    .expect("order book") else {
-        panic!("unexpected response")
-    };
-    assert_eq!(
-        book.asks
-            .iter()
-            .map(|level| level.price)
-            .collect::<Vec<_>>(),
-        vec![3, 7]
-    );
-    assert_eq!(
-        book.bids
-            .iter()
-            .map(|level| level.price)
-            .collect::<Vec<_>>(),
-        vec![8, 4]
-    );
-
     let Response::RecoveryHints { page: hints } = request(
         &fixture.handler,
         Request::ListRecoveryHints {
             family: None,
             page: PageRequest {
                 cursor: None,
-                limit: 1,
+                limit: 10,
             },
         },
     )
@@ -679,38 +359,12 @@ async fn materialized_list_book_hint_and_asset_queries_match_the_canonical_store
     };
     assert_eq!(hints.snapshot.as_of, anchor(1));
     assert_eq!(hints.hints.len(), 1);
-    let next = hints.next.expect("second hint cursor");
-    let error = request(
-        &fixture.handler,
-        Request::ListRecoveryHints {
-            family: Some(RecoveryFamily::MakerOrderV1),
-            page: PageRequest {
-                cursor: Some(next.clone()),
-                limit: 10,
-            },
-        },
-    )
-    .await
-    .expect_err("changing a cursor's recovery-hint filter");
-    assert_eq!(error.code, RpcErrorCode::SnapshotInvalidated);
-
-    let Response::RecoveryHints { page: hints } = request(
-        &fixture.handler,
-        Request::ListRecoveryHints {
-            family: None,
-            page: PageRequest {
-                cursor: Some(next),
-                limit: 10,
-            },
-        },
-    )
-    .await
-    .expect("continued recovery hints") else {
-        panic!("unexpected response")
-    };
-    assert_eq!(hints.hints.len(), 1);
-    assert_eq!(hints.hints[0].family, RecoveryFamily::MakerOrderV1);
-    assert_eq!(hints.hints[0].associated_contract, None);
+    assert!(hints.next.is_none());
+    assert_eq!(hints.hints[0].family, RecoveryFamily::BinaryMarketV1);
+    assert_eq!(
+        hints.hints[0].associated_contract,
+        Some(fixture.market.contract_id)
+    );
 
     let Response::Asset { lookup } = request(
         &fixture.handler,
@@ -726,155 +380,11 @@ async fn materialized_list_book_hint_and_asset_queries_match_the_canonical_store
         relation.contract_id == fixture.market.contract_id
             && relation.kind == AssetRelationKind::Collateral
     }));
-    assert_eq!(
-        lookup
-            .relations
-            .iter()
-            .filter(|relation| relation.kind == AssetRelationKind::OrderQuote)
-            .count(),
-        fixture.orders.len()
-    );
-}
-
-#[tokio::test]
-async fn advisory_routes_use_best_prices_respect_minimums_and_stop_after_resolution() {
-    let fixture = fixture();
-    let best_ask = fixture.orders[1].contract_id;
-    let worse_ask = fixture.orders[0].contract_id;
-    let Response::Route { route } = request(
-        &fixture.handler,
-        Request::SuggestRoute {
-            market_id: fixture.market.contract_id,
-            side: OrderSide::Yes,
-            direction: OrderDirection::SellBase,
-            base_amount: 13,
-            max_orders: 10,
-        },
-    )
-    .await
-    .expect("route") else {
-        panic!("unexpected response")
-    };
-    assert_eq!(
-        route
-            .legs
-            .iter()
-            .map(|leg| (leg.order_id, leg.base_amount, leg.quote_amount))
-            .collect::<Vec<_>>(),
-        vec![(best_ask, 10, 30), (worse_ask, 3, 21)]
-    );
-    assert_eq!(route.total_base, 13);
-    assert_eq!(route.total_quote, 51);
-
-    let Response::Route { route } = request(
-        &fixture.handler,
-        Request::SuggestRoute {
-            market_id: fixture.market.contract_id,
-            side: OrderSide::Yes,
-            direction: OrderDirection::SellQuote,
-            base_amount: 9,
-            max_orders: 10,
-        },
-    )
-    .await
-    .expect("best-bid route") else {
-        panic!("unexpected response")
-    };
-    assert_eq!(
-        route
-            .legs
-            .iter()
-            .map(|leg| (leg.order_id, leg.base_amount, leg.quote_amount))
-            .collect::<Vec<_>>(),
-        vec![
-            (fixture.orders[3].contract_id, 7, 56),
-            (fixture.orders[2].contract_id, 2, 8),
-        ]
-    );
-    assert_eq!(route.total_base, 9);
-    assert_eq!(route.total_quote, 64);
-
-    let Response::Route { route } = request(
-        &fixture.handler,
-        Request::SuggestRoute {
-            market_id: fixture.market.contract_id,
-            side: OrderSide::Yes,
-            direction: OrderDirection::SellBase,
-            base_amount: 8,
-            max_orders: 1,
-        },
-    )
-    .await
-    .expect("minimum-aware route") else {
-        panic!("unexpected response")
-    };
-    assert_eq!(route.legs[0].base_amount, 7);
-    assert_eq!(route.total_base, 7);
-
-    resolve_market(&fixture);
-    let error = request(
-        &fixture.handler,
-        Request::SuggestRoute {
-            market_id: fixture.market.contract_id,
-            side: OrderSide::Yes,
-            direction: OrderDirection::SellBase,
-            base_amount: 3,
-            max_orders: 1,
-        },
-    )
-    .await
-    .expect_err("resolved market must not be officially routed");
-    assert_eq!(error.code, RpcErrorCode::CovenantInvariantViolation);
-}
-
-fn resolve_market(fixture: &Fixture) {
-    let mut resolution = transaction(100);
-    resolution.input = vec![TxIn {
-        previous_output: fixture.market.outpoints[0].outpoint,
-        ..TxIn::default()
-    }];
-    let position = ChainPosition {
-        block_height: 2,
-        tx_index: 0,
-    };
-    fixture
-        .store
-        .apply_block(&BlockDelta {
-            anchor: anchor(2),
-            prev_block_hash: anchor(1).hash,
-            ordered_txids: vec![resolution.txid()],
-            relevant_transactions: vec![ChainTxDelta {
-                position,
-                block_hash: anchor(2).hash,
-                txid: resolution.txid(),
-                raw_tx: resolution.clone(),
-                created_contracts: Vec::new(),
-                state_updates: vec![StateUpdate {
-                    contract_id: fixture.market.contract_id,
-                    old_state: fixture.market.state,
-                    new_state: ContractState::BinaryMarket(BinaryMarketState::ResolvedYes {
-                        collateral_unredeemed: 2_000,
-                    }),
-                    spent_outpoints: fixture
-                        .market
-                        .outpoints
-                        .iter()
-                        .map(|tracked| tracked.outpoint)
-                        .collect(),
-                    new_outpoints: vec![TrackedOutpoint {
-                        role: 0,
-                        outpoint: OutPoint::new(resolution.txid(), 0),
-                    }],
-                    order_remaining_base: None,
-                    transition: TransitionRecord {
-                        kind: 9,
-                        payload: vec![1],
-                    },
-                }],
-            }],
-            recovery_hints: Vec::new(),
-        })
-        .expect("resolve market");
+    assert!(lookup.relations.iter().all(|relation| {
+        relation.kind == AssetRelationKind::Collateral
+            && [fixture.market.contract_id, fixture.other_market.contract_id]
+                .contains(&relation.contract_id)
+    }));
 }
 
 #[tokio::test]
@@ -970,9 +480,7 @@ async fn rescan_required_blocks_every_chain_derived_rpc_before_dispatch() {
         .invalidate_for_rebuild()
         .expect("invalidate store");
 
-    let ContractParameters::BinaryMarket(params) = fixture.market.params else {
-        panic!("fixture market parameters")
-    };
+    let ContractParameters::BinaryMarket(params) = fixture.market.params;
     let package = ContractPackage {
         format_version: CONTRACT_PACKAGE_FORMAT_VERSION,
         chain: ChainIdentity {
@@ -1001,15 +509,6 @@ async fn rescan_required_blocks_every_chain_derived_rpc_before_dispatch() {
         Request::GetMarketSnapshot {
             market_id: fixture.market.contract_id,
         },
-        Request::ListOrders {
-            market_id: fixture.market.contract_id,
-            side: None,
-            direction: None,
-            page: page.clone(),
-        },
-        Request::GetOrderBook {
-            market_id: fixture.market.contract_id,
-        },
         Request::ListRecoveryHints {
             family: None,
             page: page.clone(),
@@ -1027,13 +526,6 @@ async fn rescan_required_blocks_every_chain_derived_rpc_before_dispatch() {
         },
         Request::LookupAsset {
             asset_id: fixture.collateral,
-        },
-        Request::SuggestRoute {
-            market_id: fixture.market.contract_id,
-            side: OrderSide::Yes,
-            direction: OrderDirection::SellBase,
-            base_amount: 1,
-            max_orders: 1,
         },
     ];
     for request_value in blocked {
@@ -1123,168 +615,11 @@ async fn registration_auth_is_checked_before_touching_the_backend() {
 }
 
 #[tokio::test]
-async fn registration_package_rpc_returns_ordered_idempotent_receipts() {
-    const VALID_XONLY: [u8; 32] = [
-        0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a,
-        0x5e, 0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80,
-        0x3a, 0xc0,
-    ];
-
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let store = Arc::new(
-        Store::open(directory.path().join("registration.redb")).expect("open registration store"),
-    );
-    // Seed an already verified parent market without an interpreted creation
-    // row so the RPC test can focus on the package boundary and exact maker anchor.
-    let parent_transaction = transaction(90);
-    store
-        .initialize_chain(
-            StoreChainIdentity {
-                network: LiquidNetwork::ElementsRegtest,
-                genesis_hash: block_hash(0),
-                policy_asset: asset(0x20),
-            },
-            anchor(0),
-        )
-        .expect("initialize chain");
-    let mut parent = market_record(0x31, &parent_transaction, 0);
-    parent.sync_state = ContractSyncState::CatchingUp {
-        synced_through: anchor(1),
-    };
-    let ContractParameters::BinaryMarket(parent_params) = parent.params else {
-        panic!("parent market params")
-    };
-
-    let creation_input = TxIn::default();
-    let params = MakerOrderParams {
-        base_asset_id: parent_params.yes_token_asset_id,
-        quote_asset_id: parent_params.collateral_asset_id,
-        price: 5,
-        min_active_base: 3,
-        direction: OrderDirection::SellBase,
-        instance_id: derive_instance_id(&[creation_input.previous_output], 0).expect("instance"),
-        maker_pubkey: VALID_XONLY,
-    };
-    let compiled = CompiledMakerOrder::new(params).expect("compile maker order");
-    let hint = OrderRecoveryHint {
-        side: OrderSide::Yes,
-        direction: params.direction,
-        masked_order_index: 0x1234,
-        parent_market: parent.contract_id.into(),
-        price: params.price,
-        min_active_base: params.min_active_base,
-        maker_pubkey: params.maker_pubkey,
-    };
-    let creation = Transaction {
-        version: 2,
-        lock_time: LockTime::ZERO,
-        input: vec![creation_input],
-        output: vec![
-            TxOut {
-                asset: Asset::Explicit(params.base_asset_id),
-                value: Value::Explicit(10),
-                nonce: Nonce::Null,
-                script_pubkey: compiled.script_pubkey().clone(),
-                witness: TxOutWitness::default(),
-            },
-            recovery_txout(asset(0x20), &hint.encode()).expect("order hint"),
-        ],
-    };
-    store
-        .apply_block(&BlockDelta {
-            anchor: anchor(1),
-            prev_block_hash: anchor(0).hash,
-            ordered_txids: vec![parent_transaction.txid(), creation.txid()],
-            relevant_transactions: Vec::new(),
-            recovery_hints: Vec::new(),
-        })
-        .expect("index shared creation block");
-    store
-        .register_contract(
-            &parent,
-            &RegistrationEvidence {
-                anchor: anchor(1),
-                transaction: Arc::new(parent_transaction),
-                associated_hint: None,
-            },
-        )
-        .expect("register parent fixture");
-    let contract_id = ContractId::new(OutPoint::new(creation.txid(), 0));
-    let package = ContractPackage {
-        format_version: CONTRACT_PACKAGE_FORMAT_VERSION,
-        chain: ChainIdentity {
-            network: LiquidNetwork::ElementsRegtest,
-            genesis_hash: block_hash(0),
-        },
-        roots: vec![contract_id],
-        declarations: vec![ContractDeclaration {
-            contract_id,
-            descriptor: ContractDescriptor::MakerOrderV1 {
-                parent_market: parent.contract_id,
-                side: OrderSide::Yes,
-                params,
-            },
-        }],
-    };
-    let source = RegistrationSource {
-        transaction: creation,
-        status: TransactionStatus::Confirmed {
-            anchor: anchor(1),
-            tx_index: 1,
-        },
-    };
-    let discovery = DiscoveryCoverage {
-        mode: DiscoveryMode::AdvisoryOnly,
-        from: anchor(1),
-        scanned_through: anchor(1),
-        target_tip: anchor(1),
-        canonical_market_complete: false,
-    };
-    let handler = NodeRpcHandler::new(Arc::new(source), Arc::clone(&store), rpc_config(discovery))
-        .expect("registration handler");
-
-    for already_registered in [false, true] {
-        let response = handler
-            .handle(
-                [0x55; 32],
-                Request::RegisterContractPackage {
-                    package: package.clone(),
-                    bearer_token: Some("registration-secret".to_owned()),
-                },
-            )
-            .await
-            .expect("package registration RPC");
-        let Response::RegistrationAccepted { registration } = response else {
-            panic!("unexpected registration response")
-        };
-        assert_eq!(registration.roots, vec![contract_id]);
-        assert_eq!(registration.contracts.len(), 1);
-        assert_eq!(registration.contracts[0].contract_id, contract_id);
-        assert_eq!(
-            registration.contracts[0].sync_state,
-            ContractSyncState::CatchingUp {
-                synced_through: anchor(1),
-            }
-        );
-        assert_eq!(
-            registration.contracts[0].already_registered,
-            already_registered
-        );
-    }
-    assert!(
-        store
-            .contract(contract_id)
-            .expect("registered order lookup")
-            .is_some()
-    );
-}
-
-#[tokio::test]
 async fn transaction_evidence_consensus_decodes_the_persisted_transaction() {
     let fixture = fixture();
     let position = ChainPosition {
         block_height: 1,
-        tx_index: 3,
+        tx_index: 1,
     };
     let Response::Transaction {
         evidence: Some(evidence),
@@ -1295,11 +630,11 @@ async fn transaction_evidence_consensus_decodes_the_persisted_transaction() {
         panic!("unexpected response")
     };
     assert_eq!(evidence.position, position);
-    assert_eq!(evidence.transaction, fixture.transactions[3]);
-    assert_eq!(evidence.txid, fixture.transactions[3].txid());
+    assert_eq!(evidence.transaction, fixture.transactions[1]);
+    assert_eq!(evidence.txid, fixture.transactions[1].txid());
     assert_eq!(
         evidence.affected_contract_ids,
-        vec![fixture.orders[1].contract_id]
+        vec![fixture.other_market.contract_id]
     );
 }
 

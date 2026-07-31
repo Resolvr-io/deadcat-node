@@ -1,6 +1,6 @@
 [build]
 src_dir = "./simplicityhl"
-simf_files = ["binary_market.simf", "maker_order.simf"]
+simf_files = ["binary_market.simf"]
 out_dir = "./src/artifacts"
 
 [regtest]

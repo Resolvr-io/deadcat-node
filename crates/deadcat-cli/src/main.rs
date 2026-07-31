@@ -10,9 +10,7 @@ use deadcat_rpc::{
     EventFilter, PageRequest, RecoveryFamily, Request, RequestEnvelope, RequestId, SCHEMA_VERSION,
     SnapshotCursor,
 };
-use deadcat_types::{
-    ChainPosition, ContractId, ContractPackage, EventCursor, OrderDirection, OrderSide,
-};
+use deadcat_types::{ChainPosition, ContractId, ContractPackage, EventCursor};
 use elements::encode::deserialize;
 use elements::{AssetId, Transaction};
 use serde::Serialize;
@@ -62,22 +60,6 @@ enum Command {
         #[arg(value_parser = parse_contract_id)]
         market_id: ContractId,
     },
-    /// List maker orders for a market.
-    ListOrders {
-        #[arg(value_parser = parse_contract_id)]
-        market_id: ContractId,
-        #[arg(long)]
-        side: Option<SideArg>,
-        #[arg(long)]
-        direction: Option<DirectionArg>,
-        #[command(flatten)]
-        page: PageArgs,
-    },
-    /// Fetch a market's aggregated maker order book.
-    OrderBook {
-        #[arg(value_parser = parse_contract_id)]
-        market_id: ContractId,
-    },
     /// List public chain-recovery hints.
     ListHints {
         #[arg(long)]
@@ -106,19 +88,6 @@ enum Command {
     Fee {
         #[arg(long, default_value_t = 2, value_parser = nonzero_u16)]
         target_blocks: u16,
-    },
-    /// Ask the node for an advisory order route. The client must still verify it.
-    Route {
-        #[arg(value_parser = parse_contract_id)]
-        market_id: ContractId,
-        #[arg(long)]
-        side: SideArg,
-        #[arg(long)]
-        direction: DirectionArg,
-        #[arg(long, value_parser = nonzero_u64)]
-        base_amount: u64,
-        #[arg(long, default_value_t = 100, value_parser = nonzero_u16)]
-        max_orders: u16,
     },
     /// Broadcast a fully signed Elements transaction encoded as consensus hex.
     Broadcast {
@@ -211,46 +180,14 @@ impl HexSource {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum SideArg {
-    Yes,
-    No,
-}
-
-impl From<SideArg> for OrderSide {
-    fn from(value: SideArg) -> Self {
-        match value {
-            SideArg::Yes => Self::Yes,
-            SideArg::No => Self::No,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum DirectionArg {
-    SellBase,
-    SellQuote,
-}
-
-impl From<DirectionArg> for OrderDirection {
-    fn from(value: DirectionArg) -> Self {
-        match value {
-            DirectionArg::SellBase => Self::SellBase,
-            DirectionArg::SellQuote => Self::SellQuote,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
 enum FamilyArg {
     BinaryMarketV1,
-    MakerOrderV1,
 }
 
 impl From<FamilyArg> for RecoveryFamily {
     fn from(value: FamilyArg) -> Self {
         match value {
             FamilyArg::BinaryMarketV1 => Self::BinaryMarketV1,
-            FamilyArg::MakerOrderV1 => Self::MakerOrderV1,
         }
     }
 }
@@ -320,20 +257,6 @@ fn command_request(command: &Command) -> Result<Request> {
         Command::MarketSnapshot { market_id } => Request::GetMarketSnapshot {
             market_id: *market_id,
         },
-        Command::ListOrders {
-            market_id,
-            side,
-            direction,
-            page,
-        } => Request::ListOrders {
-            market_id: *market_id,
-            side: side.map(Into::into),
-            direction: direction.map(Into::into),
-            page: page.clone().into_request(),
-        },
-        Command::OrderBook { market_id } => Request::GetOrderBook {
-            market_id: *market_id,
-        },
         Command::ListHints { family, page } => Request::ListRecoveryHints {
             family: family.map(Into::into),
             page: page.clone().into_request(),
@@ -355,19 +278,6 @@ fn command_request(command: &Command) -> Result<Request> {
         },
         Command::Fee { target_blocks } => Request::EstimateFeerate {
             target_blocks: *target_blocks,
-        },
-        Command::Route {
-            market_id,
-            side,
-            direction,
-            base_amount,
-            max_orders,
-        } => Request::SuggestRoute {
-            market_id: *market_id,
-            side: (*side).into(),
-            direction: (*direction).into(),
-            base_amount: *base_amount,
-            max_orders: *max_orders,
         },
         Command::Broadcast { transaction } => Request::BroadcastSignedTransaction {
             transaction: transaction.transaction()?,
@@ -500,17 +410,6 @@ fn nonzero_u16(value: &str) -> std::result::Result<u16, String> {
     }
 }
 
-fn nonzero_u64(value: &str) -> std::result::Result<u64, String> {
-    let value: u64 = value
-        .parse()
-        .map_err(|error| format!("invalid integer: {error}"))?;
-    if value == 0 {
-        Err("value must be nonzero".to_owned())
-    } else {
-        Ok(value)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::str::FromStr as _;
@@ -571,24 +470,12 @@ mod tests {
             "deadcat",
             "--endpoint-id",
             ENDPOINT_ID,
-            "route",
+            "market-snapshot",
             &format!("{TXID}:2"),
-            "--side",
-            "yes",
-            "--direction",
-            "sell-base",
-            "--base-amount",
-            "25",
         ]);
         assert!(matches!(
             command_request(&cli.command).expect("request"),
-            Request::SuggestRoute {
-                side: OrderSide::Yes,
-                direction: OrderDirection::SellBase,
-                base_amount: 25,
-                max_orders: 100,
-                ..
-            }
+            Request::GetMarketSnapshot { .. }
         ));
 
         let cli = parse(&[
@@ -615,16 +502,16 @@ mod tests {
             ENDPOINT_ID,
             "list-hints",
             "--family",
-            "maker-order-v1",
+            "binary-market-v1",
             "--cursor-json",
-            r#"{"as_of":{"height":42,"hash":"1111111111111111111111111111111111111111111111111111111111111111"},"event_high_watermark":{"epoch":"000102030405060708090a0b0c0d0e0f","sequence":"9"},"scope":{"recovery_hints":{"family":"maker_order_v1"}},"after_key":"0000002a0000000300000004"}"#,
+            r#"{"as_of":{"height":42,"hash":"1111111111111111111111111111111111111111111111111111111111111111"},"event_high_watermark":{"epoch":"000102030405060708090a0b0c0d0e0f","sequence":"9"},"scope":{"recovery_hints":{"family":"binary_market_v1"}},"after_key":"0000002a0000000300000004"}"#,
             "--limit",
             "3",
         ]);
         assert!(matches!(
             command_request(&cli.command).expect("request"),
             Request::ListRecoveryHints {
-                family: Some(RecoveryFamily::MakerOrderV1),
+                family: Some(RecoveryFamily::BinaryMarketV1),
                 page: PageRequest {
                     cursor: Some(SnapshotCursor { after_key, .. }),
                     limit: 3,
@@ -751,7 +638,15 @@ mod tests {
     #[test]
     fn nonzero_validators_reject_zero() {
         assert!(nonzero_u16("0").is_err());
-        assert!(nonzero_u64("0").is_err());
         assert_eq!(nonzero_u16("7").expect("valid"), 7);
+    }
+
+    #[test]
+    fn removed_maker_commands_are_not_accepted() {
+        for command in ["list-orders", "order-book", "route"] {
+            let error = Cli::try_parse_from(["deadcat", "--endpoint-id", ENDPOINT_ID, command])
+                .expect_err("removed maker command");
+            assert_eq!(error.kind(), ErrorKind::InvalidSubcommand);
+        }
     }
 }

@@ -11,7 +11,6 @@ workspace = true
 [dependencies]
 deadcat-types.workspace = true
 elements.workspace = true
-hmac.workspace = true
 sha2.workspace = true
 smplx-std.workspace = true
 thiserror.workspace = true

@@ -32,26 +32,12 @@ regtest-market-ab: generate
         binary_market_ab_lifecycle_is_accepted_by_elementsd \
         -- --ignored --nocapture --test-threads=1
 
-# Run the real maker-order lifecycle, package/backfill, restart, client replay,
-# and one-/two-block branch replacement gate against isolated liquidregtest.
-regtest-maker-orders: generate
-    cargo test --locked -p deadcat-client --test market_regtest \
-        maker_order_lifecycle_is_accepted_by_elementsd \
-        -- --ignored --nocapture --test-threads=1
-
 # Run one real transaction that advances two independent binary markets, then
 # prove transaction-atomic indexing, replay, reorg, and rebuild behavior without
-# relying on a maker-order fixture.
+# relying on a second contract family.
 regtest-multi-market: generate
     cargo test --locked -p deadcat-client --test market_regtest \
         multi_market_transaction_is_accepted_and_indexed_by_elementsd \
-        -- --ignored --nocapture --test-threads=1
-
-# Run one real transaction that advances multiple covenant instances, then
-# prove transaction-atomic indexing and canonical replay on liquidregtest.
-regtest-multi-contract: generate
-    cargo test --locked -p deadcat-client --test market_regtest \
-        multi_contract_transaction_is_accepted_and_indexed_by_elementsd \
         -- --ignored --nocapture --test-threads=1
 
 # Drive the production Elements RPC and Esplora sources against the same
@@ -70,7 +56,7 @@ regtest-process-boundary: generate
         -- --ignored --nocapture --test-threads=1
 
 # Every isolated live-chain protocol gate required before CI succeeds.
-regtest: regtest-market-ab regtest-maker-orders regtest-multi-market regtest-multi-contract regtest-backend-equivalence regtest-process-boundary
+regtest: regtest-market-ab regtest-multi-market regtest-backend-equivalence regtest-process-boundary
 
 wasm-check:
     NIX_HARDENING_ENABLE=pic cargo check --locked -p deadcat-iroh --lib --target wasm32-unknown-unknown

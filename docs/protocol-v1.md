@@ -58,27 +58,19 @@ convention above. Its strict human-readable wire encoding is the object
 `{"txid": "...", "vout": n}`; the ordinary `elements::OutPoint` string serde
 is not inherited.
 
-The family-specific creation anchor is:
-
-- binary market: the initial dormant YES RT output, whose exact side-A
-  commitment and compiled `DormantYesRt` script are verified along with the NO
-  leg and the complete creation invariant; and
-- maker order: the initial output holding the order at its compiled maker-order
-  script.
+The creation anchor is the binary market's initial dormant YES RT output. Its
+exact side-A commitment and compiled `DormantYesRt` script are verified along
+with the NO leg and the complete creation invariant.
 
 For the official standalone market layout the market anchor is vout 0. A
-validated custom composition may place it elsewhere. The maker anchor is the
-exact canonical order output index. One transaction can create multiple orders,
-but each canonical order has an instance-specific script; byte-identical
-noncanonical clones are deliberately outside the supported security envelope.
+validated custom composition may place it elsewhere, and one transaction may
+create multiple independently anchored markets.
 
 The ID remains stable as later transactions move or terminate the contract. It
 does not commit to the descriptor and does not certify that the output exists
 or is a valid Deadcat contract. That proof belongs to declaration ingestion and
 chain evidence. Simplicity CMRs are deterministically derived from the stored
-parameters. The maker CMR varies with its instance-derived receive-script hash,
-but the stable protocol identity is still the verified creation anchor rather
-than the CMR.
+parameters, while stable protocol identity is the verified creation anchor.
 
 Ordinary transaction inputs, outputs, and live contract state use
 `elements::OutPoint` directly. The protocol does not define a duplicate generic
@@ -100,11 +92,6 @@ pub enum ContractDescriptor {
     BinaryMarketV1 {
         params: BinaryMarketParams,
     },
-    MakerOrderV1 {
-        parent_market: ContractId,
-        side: OrderSide,
-        params: MakerOrderParams,
-    },
 }
 
 pub struct ContractDeclaration {
@@ -121,11 +108,9 @@ pub struct ContractPackage {
 ```
 
 A descriptor contains the complete public semantics required to compile one
-supported contract. A declaration is an untrusted claim that its descriptor is
-instantiated at its `ContractId`. A package is the portable registration unit:
-roots name what the sender wants ingested, while additional declarations may
-carry the roots' parent dependency closure. None of these objects attests to
-chain inclusion or validity.
+market. A declaration is an untrusted claim that its descriptor is instantiated
+at its `ContractId`. A package is the portable atomic registration unit. None
+of these objects attests to chain inclusion or validity.
 
 Package format v1 has these structural rules:
 
@@ -134,40 +119,28 @@ Package format v1 has these structural rules:
   node;
 - there are 1 through 16 unique roots and 1 through 64 unique declarations,
   with every root declared;
-- a declaration cannot depend on itself, and every included declaration must
-  be reachable from a root through included parent edges, so unrelated payload
-  padding is rejected; and
-- a referenced parent must either be included in the package or already be a
-  verified contract in the receiving node. An included maker parent must be a
-  binary market.
+- every included declaration is named as a root, so unrelated payload padding
+  is rejected.
 
 Declaration order has no authority over verification. The verifier resolves
-parents before children, fetches each shared creation transaction at most once,
-and checks that a child was not created before its parent. Registration receipts
-nevertheless preserve the sender's order: `roots` matches package root order and
-`contracts` matches declaration order. It retrieves confirmed creation
-transactions and status from its own configured chain source. The cumulative
-consensus-encoded size of unique creation transactions is limited to 16 MiB per
-package, matching the Iroh RPC frame ceiling and bounding server-side evidence
-work that is not present in the inbound request. The verifier recompiles the
-canonical family locally, checks the nominated anchor and all family-specific
-creation invariants, and registers verified contracts as catching up. The node
-then replays their lineage to its indexed tip. Supplied current outpoints or raw
-transactions, if supported later as acceleration hints, never replace that
-retrieval and verification.
+each shared creation transaction at most once. Registration receipts preserve
+sender order: `roots` matches package root order and `contracts` matches
+declaration order. The verifier retrieves confirmed creation transactions and
+status from its own chain source, recompiles each market, checks its nominated
+anchor and creation invariants, and registers all markets as catching up. The
+node then replays each lineage to its indexed tip.
 
 Only after every declaration succeeds does one redb write transaction register
-the complete package. One invalid declaration, dependency, chain identity, or
-conflicting existing record rejects the package without partial insertion. An
-identical retry is idempotent. The same transaction also retains a normalized
-copy of every verified declaration as explicit watch intent. Chain-derived
-state is still disposable: after a destructive rebuild, replay immediately
-after the immutable network activation checkpoint matches those declarations
-by creation transaction, verifies markets before maker children against the
-exact canonical transactions, and rematerializes only the claims that remain
-valid. Registration rejects v1 creation at or before that checkpoint, making
-the replay boundary complete. Missing or invalid claims stay dormant rather
-than blocking unrelated synchronization.
+the complete package. One invalid declaration, chain identity, or conflicting
+existing record rejects the package without partial insertion. An identical
+retry is idempotent. The same transaction also retains a normalized copy of
+every verified declaration as explicit watch intent. Chain-derived state is
+still disposable: after a destructive rebuild, replay immediately after the
+immutable network activation checkpoint matches those declarations by creation
+transaction and rematerializes only the claims that remain valid. Registration
+rejects v1 creation at or before that checkpoint, making the replay boundary
+complete. Missing or invalid claims stay dormant rather than
+blocking unrelated synchronization.
 
 ### Recovery outputs
 
@@ -604,318 +577,18 @@ still rediscover a market creation transaction it funded, while a token holder
 can locate the same transaction through first-issuance lookup for an unknown
 YES/NO asset.
 
-## 3. Maker limit order
-
-### Parameters
-
-```rust
-pub enum OrderDirection {
-    SellBase,
-    SellQuote,
-}
-
-pub struct MakerOrderParams {
-    pub base_asset_id: AssetId,
-    pub quote_asset_id: AssetId,
-    pub price: u32,
-    pub min_active_base: u32,
-    pub direction: OrderDirection,
-    pub instance_id: [u8; 32],
-    pub maker_pubkey: XOnlyPublicKey,
-}
-```
-
-BASE is one parent-market outcome token. QUOTE is exactly the parent collateral
-asset. Canonical validity is:
-
-```text
-1 <= price <= parent_market.cp
-1 <= min_active_base
-```
-
-The order input and every covenant-constrained output use explicit asset and
-value. Taker wallet outputs may be confidential.
-
-`maker_pubkey` is a per-wallet-index base key. `instance_id` derives independent
-cancellation and receive keys. The derived cancellation key is the Taproot
-internal key, and key-spend is the sole cancellation mechanism. The Simplicity
-leaf contains only the permissionless fill path; it has no cosigner and no
-script-cancel branch.
-
-### Creation
-
-The public builder accepts `offered_base_capacity: u64` for both directions and
-requires it be at least `min_active_base`.
-
-```text
-SellBase  locks offered_base_capacity BASE atoms
-SellQuote locks offered_base_capacity * price QUOTE atoms
-```
-
-The SellQuote rule makes every canonical live remainder an exact multiple of
-price. A non-multiple foreign creation is not a canonical v1 order.
-
-Canonical creation additionally requires:
-
-```text
-sorted_prevouts =
-    lexicographically sort each (txid_internal_bytes || vout_be_u32)
-
-inputs_commitment = tagged_hash(
-    "deadcat/order-inputs/v1",
-    input_count_be_u32 || concat(sorted_prevouts)
-)
-
-instance_id = tagged_hash(
-    "deadcat/order-instance/v1",
-    inputs_commitment || order_creation_vout_be_u32
-)
-```
-
-Every creation input prevout and the reserved order vout are known before the
-outputs are constructed, so this has no txid circularity. Input ordering does
-not affect identity. `instance_id` remains unchanged through partial fills even
-when the continuation moves to another vout.
-
-The covenant compiler accepts any 32-byte `instance_id`; that property keeps
-the contract primitive composable. Official builders, registration, and public
-discovery require the derivation above. A noncanonical creator can deliberately
-reuse an instance ID and produce byte-identical order scripts, reintroducing
-output aliasing for software that elects to treat those outputs as orders.
-Noncanonical orders are therefore unsupported and must be handled as unsafe
-foreign contracts.
-
-The canonical order output is immediately followed by its recovery/discovery
-hint. That adjacency lets a scanner determine the creation vout without placing
-`instance_id` in the hint.
-
-### Fill layout
-
-The script witness selects a maker-payment output `p`, an explicit
-`is_partial` branch, and a remainder output `r`. For an order input at any index:
-
-- the maker payment at `p` must use the instance-derived receive script;
-- `p != r` always, keeping the two witness fields unambiguous; a full fill does
-  not otherwise inspect `r`;
-- the remainder output must reproduce the exact covenant script; and
-- output indices and products are bounds/overflow checked.
-
-Neither output index is coupled to the order input index. Canonical instance
-uniqueness makes both the receive script and continuation script order-specific,
-so independently selected outputs cannot satisfy another canonical order.
-Client fill plans additionally bind the exact live input outpoint, preventing a
-composer from silently substituting a same-script foreign output.
-
-Let `I` be order input amount, `M` maker output amount, `R` nonzero remainder,
-`P` price, `A` minimum, and `F` filled BASE atoms.
-
-#### SellBase
-
-```text
-input asset = BASE
-maker asset = QUOTE
-
-full:
-    F = I
-    M = F * P
-    F >= A
-    no covenant continuation
-
-partial:
-    0 < R < I
-    remainder asset = BASE
-    F = I - R
-    M = F * P
-    F >= A
-    R >= A
-```
-
-#### SellQuote
-
-```text
-input asset = QUOTE
-maker asset = BASE
-F = M
-
-full:
-    I = F * P
-    F >= A
-    no covenant continuation
-
-partial:
-    R > 0
-    remainder asset = QUOTE
-    I = F * P + R
-    F >= A
-    R >= A * P
-```
-
-Every maker payment is exact. Overpayment does not substitute for an equality.
-
-### Cancellation and transition detection
-
-After stripping an optional Taproot annex:
-
-- key-spend of the tracked outpoint is cancellation, regardless of unrelated
-  outputs;
-- script-spend is a fill;
-- a partial fill adopts only the witness-selected remainder output; and
-- a full fill has no tracked continuation even if the transaction contains an
-  unrelated decoy output with the same script.
-
-The interpreter validates the exact direction-specific equation before updating
-state.
-
-Canonical state is:
-
-```rust
-pub enum MakerOrderState {
-    Active {
-        remaining_base: u64,
-        total_filled_base: u64,
-    },
-    Consumed,
-    Cancelled,
-}
-```
-
-For SellQuote, `remaining_base = explicit_quote_amount / price`; canonical
-creation and transitions make the division exact.
-
-### Parent-market terminal state
-
-The covenant does not inspect or co-spend the parent market. It remains
-consensus-fillable after resolution or expiry until consumed or cancelled.
-Official routing stops as soon as the parent is observed outside Trading, and
-every preflight carries a fresh parent snapshot. This does not prevent an
-adversarial custom fill.
-
-### Key derivation and recovery
-
-The mnemonic derives the Deadcat root:
-
-```text
-m/86'/1145258324'
-```
-
-Numeric hardened children are fixed as:
-
-```text
-m/86'/1145258324'/0'       deadcat_secret_key
-m/86'/1145258324'/1'/i'    maker key at u16 order index i
-m/86'/1145258324'/2'/i'    reserved future pool admin key
-```
-
-```text
-cancel_tweak = hash_to_scalar("deadcat/order-cancel/v1", instance_id)
-receive_tweak = hash_to_scalar("deadcat/order-receive/v1", instance_id)
-
-P_cancel = xonly_add_tweak(maker_pubkey, cancel_tweak)
-P_receive = xonly_add_tweak(maker_pubkey, receive_tweak)
-
-maker_receive_spk = OP_1 PUSH32 P_receive
-maker_receive_spk_hash = SHA256(maker_receive_spk)
-```
-
-`maker_pubkey` is the BIP-340 x-only serialization of the even-Y lift of the
-derived maker key. `xonly_add_tweak` uses the standard secp256k1 x-only tweak
-operation, records the resulting parity needed to derive the corresponding
-private spend key, and returns the result's 32-byte x-only serialization.
-`P_cancel` is the Taproot internal key for the covenant tree; `P_receive` is the
-internal key of the maker's key-path receive output. An infinity result makes
-that instance unusable rather than selecting a different unstated derivation.
-
-`direction_byte` is zero for SellBase and one for SellQuote, matching the order
-type-tag direction bit and mask context.
-
-Order-mask context is:
-
-```text
-parent_market_reference    36 bytes
-price                       4 bytes, BE
-side                        1 byte, YES=0, NO=1
-direction                   1 byte, SellBase=0, SellQuote=1
-min_active_base             4 bytes, BE
-maker_pubkey               32 bytes
-```
-
-```text
-mask_bytes = HMAC-SHA256(
-    deadcat_secret_key,
-    "deadcat/order_mask" || context
-)[0..2]
-
-mask_u16 = big_endian_u16(mask_bytes)
-masked_order_index = order_index XOR mask_u16
-```
-
-The masked index remains an owner mnemonic-recovery aid, but the rest of the
-hint is intentionally public. A node does not need to unmask the index:
-adjacency supplies the order vout, the creation inputs derive `instance_id`, and
-the hint plus verified parent supplies every remaining compile parameter.
-
-For chain-only owner recovery, the client scans order hints, unmasks a candidate
-index, derives the base/cancellation/receive keys using the chain-derived
-`instance_id`, and accepts ownership only if the base maker key and compiled
-script match the hint and adjacent creation output. XOR unmasking produces some
-`u16` for every foreign hint; the public-key and script matches are therefore
-the ownership test. The mnemonic or derived xprv is never sent to the node.
-
-Public registration supplies a `ContractPackage`. A maker-order descriptor
-contains the full parent `ContractId`, side, direction, price, minimum, maker
-base public key, and canonical instance ID; its declaration nominates the exact
-creation output. The node re-derives the instance ID, requires the adjacent
-matching hint, and verifies the explicit state, script, asset, amount, and
-economics. The node derives its current outpoint only by replaying that anchor's
-complete spend lineage.
-
-### Recovery hint
-
-V1 order tags are:
-
-```text
-0x40  YES / SellBase
-0x44  YES / SellQuote
-0x48  NO  / SellBase
-0x4c  NO  / SellQuote
-```
-
-Payload, 79 bytes:
-
-```text
-Byte 0       complete order type tag
-Bytes 1-2    masked_order_index, u16 big-endian
-Bytes 3-34   parent market txid, internal byte order
-Bytes 35-38  parent market vout, u32 big-endian
-Bytes 39-42  price, u32 big-endian
-Bytes 43-46  min_active_base, u32 big-endian
-Bytes 47-78  maker base x-only public key
-```
-
-The complete canonical script is `OP_RETURN OP_PUSHDATA1 0x4f <payload>` (82
-bytes). No trailing bytes are accepted. For an already-created parent, bytes
-3-38 are its complete `ContractId`. For a parent market created in the same
-transaction, an all-zero parent txid is the reserved “this transaction”
-sentinel and the vout remains explicit. This avoids a txid self-reference while
-retaining atomic market-plus-order creation.
-
-The node globally associates the hint only after it resolves the parent,
-derives the adjacent order's instance ID, compiles the covenant, and verifies
-the exact output. A copied or malformed hint is only a rejected candidate.
-
-## 4. Confidentiality matrix
+## 3. Confidentiality matrix
 
 | Output/input role | Asset/value visibility |
 |---|---|
 | Market collateral state | explicit |
-| Order input, maker payment, remainder | explicit |
 | YES/NO cancellation/redemption burns | explicit |
 | RT state and RT terminal burns | confidential, covenant verified |
 | User token destination | explicit or confidential |
 | User collateral payout/change | explicit or confidential |
 | Fee output | standard explicit policy-asset fee |
 
-## 5. Required golden vectors
+## 4. Required golden vectors
 
 Machine-readable fixtures are committed before a contract is considered stable:
 
@@ -932,32 +605,20 @@ Machine-readable fixtures are committed before a contract is considered stable:
 7. expiry lock-height boundary fixtures (`nLockTime = H - 1` rejected by the
    covenant, block `H` not final, block `H + 1` accepted) plus valid late oracle
    resolution races and the `500_000_000` type boundary;
-8. mnemonic to numeric paths, secret, base order key, canonical instance ID,
-   mask, cancellation/receive tweaks and parity, receive private key, and
-   receive script/hash;
-9. all four order hint tags;
-10. both directions' full/partial fills at minimum and overflow boundaries;
-11. decoy-output and shifted-window transactions proving witness-grounded
+8. decoy-output and shifted-window transactions proving witness-grounded
     interpretation;
-12. key-spend cancellation with and without annex;
-13. a custom composed market-plus-multiple-orders transaction and its atomic
-    transition batch;
-14. anchor-based ContractId/wire/redb key encodings, multi-contract same-tx
+9. a custom transaction advancing multiple independent markets and its atomic
+   transition batch;
+10. anchor-based ContractId/wire/redb key encodings, multi-market same-tx
     identity, package validation/atomicity, and apply/rollback fixtures; and
-15. `hash_to_scalar` modular-reduction cases generated from fixed artificial
+11. `hash_to_scalar` modular-reduction cases generated from fixed artificial
     inputs.
 
-## 6. Superseded historical choices
+## 5. Superseded historical choices
 
 V1 deliberately supersedes these older proposals:
 
 - rounded `expiry_time / 60` stored as u24;
-- u24/u64 canonical order price;
-- independent u8 fill/remainder minimums;
-- rational price with maker-favoring ceiling rounding;
-- maker fill cosigner;
-- Simplicity script cancellation;
-- fixed `current_index + 1` order remainder;
 - first-matching-script transition detection;
 - state models that store `outstanding_pairs` after asymmetric expiry
   redemption;

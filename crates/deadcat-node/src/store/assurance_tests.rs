@@ -6,7 +6,7 @@
 //! generated operation and after process-style reopen boundaries.
 //!
 //! The seeded generator is intentionally bounded to ready, live binary-market
-//! trading state in the canonical block path. Maker-order, terminal-state,
+//! trading state in the canonical block path. Terminal-state,
 //! retained-registration, and backfill semantics have targeted tests elsewhere;
 //! the failpoint fixtures below touch recovery, retained, and backfill rows only
 //! where needed to exercise a real mutation boundary.
@@ -138,8 +138,6 @@ fn market_record(
             outstanding_pairs: 0,
         }),
         sync_state: ContractSyncState::Ready { synced_through },
-        parent_market: None,
-        outcome_side: None,
         scripts: vec![ScriptBinding {
             role: 0,
             script_pubkey: vec![marker, 0x51],
@@ -153,7 +151,6 @@ fn market_record(
             role: 0,
             outpoint: OutPoint::new(txid, vout),
         }],
-        order_book: None,
     }
 }
 
@@ -197,8 +194,6 @@ struct DatabaseInventory {
     contract_outpoints: Vec<RawRow>,
     script_index: Vec<RawRow>,
     asset_relations: Vec<RawRow>,
-    market_children: Vec<RawRow>,
-    order_book: Vec<RawRow>,
     recovery_hints: Vec<RawRow>,
     contract_history: Vec<RawRow>,
     backfill_progress: Vec<RawRow>,
@@ -244,8 +239,6 @@ fn database_inventory(store: &Store) -> DatabaseInventory {
         contract_outpoints: byte_rows(&read, CONTRACT_OUTPOINTS),
         script_index: byte_rows(&read, SCRIPT_INDEX),
         asset_relations: byte_rows(&read, ASSET_RELATIONS),
-        market_children: byte_rows(&read, MARKET_CHILDREN),
-        order_book: byte_rows(&read, ORDER_BOOK),
         recovery_hints: byte_rows(&read, RECOVERY_HINTS),
         contract_history: byte_rows(&read, CONTRACT_HISTORY),
         backfill_progress: byte_rows(&read, BACKFILL_PROGRESS),
@@ -399,8 +392,7 @@ impl ReferenceModel {
                 anchor: delta.anchor,
                 txid: transaction.txid,
                 position: transaction.position,
-                affected_contract_ids: affected.clone(),
-                affected_market_ids: affected,
+                affected_contract_ids: affected,
             });
         }
         assert!(
@@ -463,8 +455,7 @@ impl ReferenceModel {
             old_tip,
             new_tip: self.tip,
             orphaned_positions,
-            affected_contract_ids: affected_contract_ids.clone(),
-            affected_market_ids: affected_contract_ids,
+            affected_contract_ids,
         });
         self.tip
     }
@@ -569,8 +560,6 @@ fn model_asset_relation_tag(relation: AssetRelationKind) -> u8 {
         AssetRelationKind::NoToken => 2,
         AssetRelationKind::YesReissuanceToken => 3,
         AssetRelationKind::NoReissuanceToken => 4,
-        AssetRelationKind::OrderBase => 5,
-        AssetRelationKind::OrderQuote => 6,
     }
 }
 
@@ -742,8 +731,6 @@ fn model_inventory(model: &ReferenceModel) -> DatabaseInventory {
         contract_outpoints: sorted(contract_outpoints),
         script_index: sorted(script_index),
         asset_relations: sorted(asset_relations),
-        market_children: Vec::new(),
-        order_book: Vec::new(),
         recovery_hints: Vec::new(),
         contract_history: sorted(contract_history),
         backfill_progress: Vec::new(),
@@ -957,7 +944,6 @@ fn generated_block(
                             u32::try_from(vout).expect("small generated vout"),
                         ),
                     }],
-                    order_remaining_base: None,
                     transition: TransitionRecord {
                         kind: 1,
                         payload: new_pairs.to_be_bytes().to_vec(),
@@ -1307,7 +1293,6 @@ fn composed_transition_block(previous: &BlockDelta) -> BlockDelta {
                 role: 0,
                 outpoint: OutPoint::new(txid, u32::try_from(vout).expect("small vout")),
             }],
-            order_remaining_base: None,
             transition: TransitionRecord {
                 kind: 1,
                 payload: vec![u8::try_from(vout).expect("small transition")],

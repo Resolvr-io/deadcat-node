@@ -5,13 +5,14 @@
 - Supersedes: ADR 0002's release-scope decision
 - Retires as historical: ADR 0003
 - Amends: ADR 0001's node-side advisory-routing responsibility
+- Implementation status updated: 2026-07-30
 
 ## Context
 
-The current clean-slate alpha implements both `BinaryMarketV1` and
-`MakerOrderV1`. The maker contract supplied a useful on-chain limit-order
-experiment and produced valuable contract-composition, recovery, indexing, and
-acceptance evidence.
+At the time of this decision, the clean-slate alpha implemented both
+`BinaryMarketV1` and `MakerOrderV1`. The maker contract supplied a useful
+on-chain limit-order experiment and produced valuable contract-composition,
+recovery, indexing, and acceptance evidence.
 
 It is not the desired first public trading experience. A standing limit order
 is an awkward primary interface for a binary prediction market, while carrying
@@ -98,10 +99,12 @@ links apply only to that revision.
 - ADR 0001's keyless shared-node trust boundary remains accepted, but the node
   no longer suggests trading routes. Venue discovery and routing are
   client-local responsibilities.
-- Maker-specific code and tests can be deleted rather than deprecated.
+- Maker-specific code and tests were deleted rather than deprecated in
+  [PR #16](https://github.com/Resolvr-io/deadcat-node/pull/16).
 - Generic atomic indexing, restart, reorg, rebuild, and composition guarantees
-  currently exercised by maker fixtures must receive market-only replacements
-  before those fixtures are removed.
+  received market-only replacements in
+  [PR #15](https://github.com/Resolvr-io/deadcat-node/pull/15) before the maker
+  fixtures were removed.
 - Removing maker code does not relax the requirement that binary-market replay
   exactly match the covenant's expiry semantics, including transaction-global
   locktime activation and height-versus-time classification.
@@ -110,10 +113,11 @@ links apply only to that revision.
 
 ## Follow-up
 
-1. Replace maker-dependent generic assurance fixtures with market-only
-   equivalents.
-2. Remove `MakerOrderV1` through every active code, storage, wire, CLI, fixture,
-   test, and normative-document surface without changing version constants.
+1. **Completed in PR #15:** replace maker-dependent generic assurance fixtures
+   with market-only equivalents.
+2. **Completed in PR #16:** remove `MakerOrderV1` through every active code,
+   storage, wire, CLI, fixture, test, and normative-document surface without
+   changing version constants.
 3. Prove a two-wallet confidential RFQ settlement on liquidregtest before
    freezing a remote RFQ protocol.
 4. Add the smallest client-local exact-in/exact-out venue adapter and

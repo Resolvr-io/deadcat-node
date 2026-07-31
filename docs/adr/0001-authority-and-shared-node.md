@@ -65,7 +65,7 @@ that a single server supplied a complete or current view of the chain.
 A hosted node can still:
 
 - serve an old but internally valid tip;
-- omit a resolution, cancellation, fill, order, or public liquidity source;
+- omit a market transition or public liquidity source;
 - provide an inflated fee estimate;
 - withhold transaction relay; or
 - learn which markets a client queries and when it broadcasts.
@@ -95,13 +95,14 @@ compliance suite.
 ## Discovery and transport
 
 Manual registration and read-only Nostr ingestion supply chain-bound
-`ContractPackage` values: requested roots plus complete public declarations and
-their parent dependencies. Neither source is authoritative. A `ContractId` is
-only the exact creation-anchor outpoint, while its declaration supplies the
-claimed contract semantics. The node fetches canonical creation data from its
-own chain source, compiles each canonical contract version, verifies the exact
-anchor and creation invariant, and registers the whole package atomically only
-after every declaration succeeds.
+`ContractPackage` values: requested roots plus complete public market
+declarations. In the market-only package shape, every declaration is a root.
+Neither source is authoritative. A `ContractId` is only the exact
+creation-anchor outpoint, while its declaration supplies the claimed contract
+semantics. The node fetches canonical creation data from its own chain source,
+compiles each supported contract version, verifies the exact anchor and
+creation invariant, and registers the whole package atomically only after every
+declaration succeeds.
 
 Iroh is the only v1 application transport. It uses a versioned ALPN, bounded
 length-delimited messages, a stable server identity, connection and stream

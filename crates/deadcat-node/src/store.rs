@@ -13,7 +13,7 @@ use deadcat_rpc::{RecoveryFamily, SnapshotScope, SyncStatus};
 use deadcat_types::{
     BinaryMarketParams, BinaryMarketState, ChainAnchor, ChainPosition, ContractDeclaration,
     ContractDescriptor, ContractId, ContractKind, ContractSyncState, EventCursor, LiquidNetwork,
-    MakerOrderParams, MakerOrderState, OrderDirection, OrderSide, RecoveryHintLocation,
+    RecoveryHintLocation,
 };
 use elements::hashes::Hash as _;
 use elements::{AssetId, BlockHash, OutPoint, Transaction, TxOut, Txid, encode};
@@ -49,8 +49,6 @@ const CONTRACT_OUTPOINTS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("contract_outpoints");
 const SCRIPT_INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("script_index");
 const ASSET_RELATIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("asset_relations");
-const MARKET_CHILDREN: TableDefinition<&[u8], &[u8]> = TableDefinition::new("market_children");
-const ORDER_BOOK: TableDefinition<&[u8], &[u8]> = TableDefinition::new("order_book");
 const RECOVERY_HINTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("recovery_hints");
 const CONTRACT_HISTORY: TableDefinition<&[u8], &[u8]> = TableDefinition::new("contract_history");
 const BACKFILL_PROGRESS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("backfill_progress");
@@ -161,13 +159,11 @@ pub struct ChainIdentity {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContractParameters {
     BinaryMarket(BinaryMarketParams),
-    MakerOrder(MakerOrderParams),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContractState {
     BinaryMarket(BinaryMarketState),
-    MakerOrder(MakerOrderState),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,8 +173,6 @@ pub enum AssetRelationKind {
     NoToken,
     YesReissuanceToken,
     NoReissuanceToken,
-    OrderBase,
-    OrderQuote,
 }
 
 impl AssetRelationKind {
@@ -189,8 +183,6 @@ impl AssetRelationKind {
             Self::NoToken => 2,
             Self::YesReissuanceToken => 3,
             Self::NoReissuanceToken => 4,
-            Self::OrderBase => 5,
-            Self::OrderQuote => 6,
         }
     }
 }
@@ -214,16 +206,6 @@ pub struct TrackedOutpoint {
     pub outpoint: OutPoint,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OrderBookEntry {
-    pub market_id: ContractId,
-    pub side: OrderSide,
-    pub direction: OrderDirection,
-    pub price: u32,
-    pub creation_position: ChainPosition,
-    pub remaining_base: u64,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContractRecord {
     pub contract_id: ContractId,
@@ -232,12 +214,9 @@ pub struct ContractRecord {
     pub creation_position: ChainPosition,
     pub state: ContractState,
     pub sync_state: ContractSyncState,
-    pub parent_market: Option<ContractId>,
-    pub outcome_side: Option<OrderSide>,
     pub scripts: Vec<ScriptBinding>,
     pub assets: Vec<AssetBinding>,
     pub outpoints: Vec<TrackedOutpoint>,
-    pub order_book: Option<OrderBookEntry>,
 }
 
 impl ContractRecord {
@@ -248,10 +227,6 @@ impl ContractRecord {
                 ContractParameters::BinaryMarket(_),
                 ContractState::BinaryMarket(_),
                 ContractKind::BinaryMarketV1
-            ) | (
-                ContractParameters::MakerOrder(_),
-                ContractState::MakerOrder(_),
-                ContractKind::MakerOrderV1
             )
         );
         if !shape_valid {
@@ -279,53 +254,6 @@ impl ContractRecord {
                 ));
             }
         }
-        match (
-            self.kind,
-            self.parent_market,
-            self.outcome_side,
-            self.order_book,
-            self.state,
-            &self.params,
-        ) {
-            (
-                ContractKind::BinaryMarketV1,
-                None,
-                None,
-                None,
-                ContractState::BinaryMarket(_),
-                ContractParameters::BinaryMarket(_),
-            ) => {}
-            (
-                ContractKind::MakerOrderV1,
-                Some(parent),
-                Some(side),
-                Some(book),
-                ContractState::MakerOrder(MakerOrderState::Active { remaining_base, .. }),
-                ContractParameters::MakerOrder(params),
-            ) if parent == book.market_id
-                && side == book.side
-                && remaining_base == book.remaining_base
-                && params.price == book.price
-                && params.direction == book.direction => {}
-            (
-                ContractKind::MakerOrderV1,
-                Some(_),
-                Some(_),
-                None,
-                ContractState::MakerOrder(MakerOrderState::Consumed | MakerOrderState::Cancelled),
-                ContractParameters::MakerOrder(_),
-            ) => {}
-            (ContractKind::LmsrV1Reserved, _, _, _, _, _) => {
-                return Err(StoreError::InvalidContract(
-                    "reserved LMSR contracts cannot be stored in v1".to_owned(),
-                ));
-            }
-            _ => {
-                return Err(StoreError::InvalidContract(
-                    "parent/order-book metadata disagrees with contract state".to_owned(),
-                ));
-            }
-        }
         Ok(())
     }
 }
@@ -345,8 +273,6 @@ pub struct StateUpdate {
     pub new_state: ContractState,
     pub spent_outpoints: Vec<OutPoint>,
     pub new_outpoints: Vec<TrackedOutpoint>,
-    /// Required for an active order, absent for markets and terminal orders.
-    pub order_remaining_base: Option<u64>,
     pub transition: TransitionRecord,
 }
 
@@ -515,12 +441,6 @@ pub struct MaterializedPage<T> {
     pub next: Option<StoreSnapshotCursor>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MaterializedOrder {
-    pub contract: ContractRecord,
-    pub entry: OrderBookEntry,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AssetRelationRecord {
     pub contract_id: ContractId,
@@ -543,7 +463,6 @@ pub enum StoredEvent {
         txid: Txid,
         position: ChainPosition,
         affected_contract_ids: Vec<ContractId>,
-        affected_market_ids: Vec<ContractId>,
     },
     BackfillApplied {
         contract_id: ContractId,
@@ -559,7 +478,6 @@ pub enum StoredEvent {
         new_tip: ChainAnchor,
         orphaned_positions: Vec<ChainPosition>,
         affected_contract_ids: Vec<ContractId>,
-        affected_market_ids: Vec<ContractId>,
     },
     SyncStatusChanged {
         status: SyncStatus,
@@ -1099,124 +1017,6 @@ impl Store {
             }
         }
         materialized_page(snapshot, scope, rows, limit)
-    }
-
-    /// Page active ready maker orders in exact order-book key order.
-    pub fn ready_orders(
-        &self,
-        market_id: ContractId,
-        side: Option<OrderSide>,
-        direction: Option<OrderDirection>,
-        cursor: Option<&StoreSnapshotCursor>,
-        limit: usize,
-    ) -> Result<MaterializedPage<MaterializedOrder>, StoreError> {
-        validate_query_limit(limit)?;
-        let read = self.database.begin_read()?;
-        let snapshot = snapshot_from_read(&read)?;
-        let scope = SnapshotScope::Orders {
-            market_id,
-            side,
-            direction,
-        };
-        validate_snapshot_cursor(cursor, snapshot, scope, 86)?;
-        let after = cursor.map(|cursor| cursor.after_key.as_slice());
-        let contracts = read.open_table(CONTRACTS)?;
-        let mut market = contracts
-            .get(market_id.to_fixed_key().as_slice())?
-            .map(|value| decode_record::<ContractRecord>(value.value()))
-            .transpose()?
-            .ok_or(StoreError::MaterializedMarketNotFound(market_id))?;
-        if market.kind != ContractKind::BinaryMarketV1 {
-            return Err(StoreError::MaterializedContractIsNotMarket(market_id));
-        }
-        if !matches!(market.sync_state, ContractSyncState::Ready { .. }) {
-            return Err(StoreError::MaterializedMarketNotReady(market_id));
-        }
-        normalize_ready_anchor(&mut market, snapshot.as_of);
-        let table = read.open_table(ORDER_BOOK)?;
-        let mut rows = Vec::new();
-        for entry in table.iter()? {
-            let (key, value) = entry?;
-            let key = key.value();
-            if after.is_some_and(|after| key <= after) {
-                continue;
-            }
-            let entry: OrderBookEntry = decode_record(value.value())?;
-            if entry.market_id != market_id
-                || side.is_some_and(|side| entry.side != side)
-                || direction.is_some_and(|direction| entry.direction != direction)
-            {
-                continue;
-            }
-            let key_array: [u8; 86] = key
-                .try_into()
-                .map_err(|_| StoreError::CorruptIndexKey("order_book"))?;
-            let contract_id = decode_contract_key(&key_array[50..])?;
-            let Some(contract) = contracts.get(contract_id.to_fixed_key().as_slice())? else {
-                return Err(StoreError::CorruptMaterializedIndex("order_book"));
-            };
-            let mut contract: ContractRecord = decode_record(contract.value())?;
-            if !matches!(contract.sync_state, ContractSyncState::Ready { .. }) {
-                continue;
-            }
-            normalize_ready_anchor(&mut contract, snapshot.as_of);
-            rows.push((key.to_vec(), MaterializedOrder { contract, entry }));
-            if rows.len() > limit {
-                break;
-            }
-        }
-        materialized_page(snapshot, scope, rows, limit)
-    }
-
-    /// Return the complete ready book in deterministic key order. Callers can
-    /// split asks/bids without rebuilding contract state.
-    pub fn order_book_entries(
-        &self,
-        market_id: ContractId,
-    ) -> Result<
-        (
-            StoreSnapshotMetadata,
-            Option<ContractRecord>,
-            Vec<MaterializedOrder>,
-        ),
-        StoreError,
-    > {
-        let read = self.database.begin_read()?;
-        let snapshot = snapshot_from_read(&read)?;
-        let contracts = read.open_table(CONTRACTS)?;
-        let mut market = contracts
-            .get(market_id.to_fixed_key().as_slice())?
-            .map(|value| decode_record(value.value()))
-            .transpose()?;
-        if let Some(market) = market.as_mut() {
-            normalize_ready_anchor(market, snapshot.as_of);
-        }
-        let table = read.open_table(ORDER_BOOK)?;
-        let mut orders = Vec::new();
-        for entry in table.iter()? {
-            let (key, value) = entry?;
-            let book: OrderBookEntry = decode_record(value.value())?;
-            if book.market_id != market_id {
-                continue;
-            }
-            let key: [u8; 86] = key
-                .value()
-                .try_into()
-                .map_err(|_| StoreError::CorruptIndexKey("order_book"))?;
-            let contract_id = decode_contract_key(&key[50..])?;
-            let Some(contract) = contracts.get(contract_id.to_fixed_key().as_slice())? else {
-                return Err(StoreError::CorruptMaterializedIndex("order_book"));
-            };
-            let mut contract: ContractRecord = decode_record(contract.value())?;
-            if matches!(contract.sync_state, ContractSyncState::Ready { .. }) {
-                normalize_ready_anchor(&mut contract, snapshot.as_of);
-                orders.push(MaterializedOrder {
-                    contract,
-                    entry: book,
-                });
-            }
-        }
-        Ok((snapshot, market, orders))
     }
 
     /// Page public recovery hints by canonical chain/output location. A
@@ -2028,7 +1828,6 @@ impl Store {
         let mut current_tip = old_tip;
         let mut orphaned_positions = Vec::new();
         let mut affected_contract_ids = Vec::new();
-        let mut affected_market_ids = Vec::new();
         for height in (ancestor.height + 1..=old_tip.height).rev() {
             let undo: UndoBlock =
                 read_fixed_from_write(&write, UNDO_BLOCKS, &height.to_be_bytes())?
@@ -2036,7 +1835,6 @@ impl Store {
             for change in undo.contract_changes.iter().rev() {
                 if let Some(current) = read_contract_from_write(&write, change.contract_id)? {
                     affected_contract_ids.push(change.contract_id);
-                    collect_market_id(&current, &mut affected_market_ids);
                     remove_contract(&write, &current)?;
                 }
                 if let Some(before) = &change.before {
@@ -2088,7 +1886,6 @@ impl Store {
             });
         }
         sort_dedup_contracts(&mut affected_contract_ids);
-        sort_dedup_contracts(&mut affected_market_ids);
         orphaned_positions.sort();
         write_tip(&write, ancestor)?;
         #[cfg(test)]
@@ -2101,7 +1898,6 @@ impl Store {
             new_tip: ancestor,
             orphaned_positions: orphaned_positions.clone(),
             affected_contract_ids,
-            affected_market_ids,
         };
         let high = append_event(&write, event)?;
         #[cfg(test)]
@@ -2406,11 +2202,7 @@ fn associate_registration_hint(
     else {
         return Ok(());
     };
-    let expected_family = match record.kind {
-        ContractKind::BinaryMarketV1 => RecoveryFamily::BinaryMarketV1,
-        ContractKind::MakerOrderV1 => RecoveryFamily::MakerOrderV1,
-        ContractKind::LmsrV1Reserved => return Ok(()),
-    };
+    let expected_family = RecoveryFamily::BinaryMarketV1;
     if hint.location == location
         && hint.creation_txid == record.contract_id.txid()
         && hint.family == expected_family
@@ -2423,31 +2215,8 @@ fn associate_registration_hint(
 }
 
 fn declaration_from_record(record: &ContractRecord) -> Result<ContractDeclaration, StoreError> {
-    let descriptor = match (
-        record.kind,
-        &record.params,
-        record.parent_market,
-        record.outcome_side,
-    ) {
-        (ContractKind::BinaryMarketV1, ContractParameters::BinaryMarket(params), None, None) => {
-            ContractDescriptor::BinaryMarketV1 { params: *params }
-        }
-        (
-            ContractKind::MakerOrderV1,
-            ContractParameters::MakerOrder(params),
-            Some(parent_market),
-            Some(side),
-        ) => ContractDescriptor::MakerOrderV1 {
-            parent_market,
-            side,
-            params: *params,
-        },
-        _ => {
-            return Err(StoreError::InvalidContract(
-                "contract cannot be normalized into a retained declaration".to_owned(),
-            ));
-        }
-    };
+    let ContractParameters::BinaryMarket(params) = &record.params;
+    let descriptor = ContractDescriptor::BinaryMarketV1 { params: *params };
     Ok(ContractDeclaration {
         contract_id: record.contract_id,
         descriptor,
@@ -2459,8 +2228,6 @@ fn registration_identity_matches(existing: &ContractRecord, registration: &Contr
         && existing.kind == registration.kind
         && existing.params == registration.params
         && existing.creation_position == registration.creation_position
-        && existing.parent_market == registration.parent_market
-        && existing.outcome_side == registration.outcome_side
         && existing.scripts == registration.scripts
         && existing.assets == registration.assets
 }
@@ -2667,7 +2434,6 @@ fn apply_backfill_transaction(
         let mut after = before;
         after.state = update.new_state;
         after.outpoints.clone_from(&update.new_outpoints);
-        update_order_book(&mut after, update.order_remaining_base)?;
         after.validate()?;
         insert_contract(write, &after)?;
 
@@ -2801,10 +2567,6 @@ fn apply_chain_transaction(
         .iter()
         .map(|contract| contract.contract_id)
         .collect::<Vec<_>>();
-    let mut markets = Vec::new();
-    for contract in &delta.created_contracts {
-        collect_market_id(contract, &mut markets);
-    }
     for update in &delta.state_updates {
         let before = read_contract_from_write(write, update.contract_id)?
             .ok_or(StoreError::ContractNotFound(update.contract_id))?;
@@ -2823,7 +2585,6 @@ fn apply_chain_transaction(
         let mut after = before.clone();
         after.state = update.new_state;
         after.outpoints.clone_from(&update.new_outpoints);
-        update_order_book(&mut after, update.order_remaining_base)?;
         after.validate()?;
         insert_contract(write, &after)?;
         let history = StoredHistoryEntry {
@@ -2845,11 +2606,9 @@ fn apply_chain_transaction(
         write_fixed(write, CONTRACT_HISTORY, &history_key, &history)?;
         undo.history_keys.push((update.contract_id, delta.position));
         affected.push(update.contract_id);
-        collect_market_id(&after, &mut markets);
     }
 
     sort_dedup_contracts(&mut affected);
-    sort_dedup_contracts(&mut markets);
     let stored = StoredTransaction {
         position: delta.position,
         block_hash: delta.block_hash,
@@ -2884,7 +2643,6 @@ fn apply_chain_transaction(
             txid: delta.txid,
             position: delta.position,
             affected_contract_ids: affected,
-            affected_market_ids: markets,
         },
     )?;
     Ok(())
@@ -3079,35 +2837,6 @@ fn validate_new_outpoints(
     Ok(())
 }
 
-fn update_order_book(
-    record: &mut ContractRecord,
-    remaining: Option<u64>,
-) -> Result<(), StoreError> {
-    match (record.state, remaining) {
-        (ContractState::BinaryMarket(_), None) if record.order_book.is_none() => Ok(()),
-        (
-            ContractState::MakerOrder(MakerOrderState::Active { remaining_base, .. }),
-            Some(supplied),
-        ) if remaining_base == supplied => {
-            let book = record.order_book.as_mut().ok_or_else(|| {
-                StoreError::InvalidTransition("active order has no order-book metadata".to_owned())
-            })?;
-            book.remaining_base = supplied;
-            Ok(())
-        }
-        (
-            ContractState::MakerOrder(MakerOrderState::Consumed | MakerOrderState::Cancelled),
-            None,
-        ) => {
-            record.order_book = None;
-            Ok(())
-        }
-        _ => Err(StoreError::InvalidTransition(
-            "order-book capacity disagrees with new contract state".to_owned(),
-        )),
-    }
-}
-
 fn insert_recovery_hint(
     write: &WriteTransaction,
     hint: &RecoveryHintDelta,
@@ -3176,26 +2905,6 @@ fn insert_contract(write: &WriteTransaction, record: &ContractRecord) -> Result<
             asset,
         )?;
     }
-    if let Some(parent) = record.parent_market {
-        write_fixed(
-            write,
-            MARKET_CHILDREN,
-            &market_child_key(
-                parent,
-                record.contract_id,
-                record.outcome_side.expect("validated maker order side"),
-            ),
-            &record.contract_id,
-        )?;
-    }
-    if let Some(order) = record.order_book {
-        write_fixed(
-            write,
-            ORDER_BOOK,
-            &order_key(record.contract_id, order),
-            &order,
-        )?;
-    }
     write_fixed(write, CONTRACTS, &contract_key, record)
 }
 
@@ -3224,33 +2933,7 @@ fn remove_contract(write: &WriteTransaction, record: &ContractRecord) -> Result<
             &asset_key(record.contract_id, *asset),
         )?;
     }
-    if let Some(parent) = record.parent_market {
-        remove_fixed(
-            write,
-            MARKET_CHILDREN,
-            &market_child_key(
-                parent,
-                record.contract_id,
-                record.outcome_side.expect("validated maker order side"),
-            ),
-        )?;
-    }
-    if let Some(order) = record.order_book {
-        remove_fixed(write, ORDER_BOOK, &order_key(record.contract_id, order))?;
-    }
     remove_fixed(write, CONTRACTS, &record.contract_id.to_fixed_key())
-}
-
-fn collect_market_id(record: &ContractRecord, output: &mut Vec<ContractId>) {
-    match record.kind {
-        ContractKind::BinaryMarketV1 => output.push(record.contract_id),
-        ContractKind::MakerOrderV1 => {
-            if let Some(parent) = record.parent_market {
-                output.push(parent);
-            }
-        }
-        ContractKind::LmsrV1Reserved => {}
-    }
 }
 
 fn contract_is_live(state: ContractState) -> bool {
@@ -3267,8 +2950,6 @@ fn contract_is_live(state: ContractState) -> bool {
                 collateral_unredeemed,
             },
         ) => collateral_unredeemed != 0,
-        ContractState::MakerOrder(MakerOrderState::Active { .. }) => true,
-        ContractState::MakerOrder(MakerOrderState::Consumed | MakerOrderState::Cancelled) => false,
     }
 }
 
@@ -3402,8 +3083,6 @@ fn create_tables(write: &WriteTransaction) -> Result<(), StoreError> {
     drop(write.open_table(CONTRACT_OUTPOINTS)?);
     drop(write.open_table(SCRIPT_INDEX)?);
     drop(write.open_table(ASSET_RELATIONS)?);
-    drop(write.open_table(MARKET_CHILDREN)?);
-    drop(write.open_table(ORDER_BOOK)?);
     drop(write.open_table(RECOVERY_HINTS)?);
     drop(write.open_table(CONTRACT_HISTORY)?);
     drop(write.open_table(BACKFILL_PROGRESS)?);
@@ -3421,8 +3100,6 @@ fn clear_chain_tables(write: &WriteTransaction) -> Result<(), StoreError> {
     write.open_table(CONTRACT_OUTPOINTS)?.retain(|_, _| false)?;
     write.open_table(SCRIPT_INDEX)?.retain(|_, _| false)?;
     write.open_table(ASSET_RELATIONS)?.retain(|_, _| false)?;
-    write.open_table(MARKET_CHILDREN)?.retain(|_, _| false)?;
-    write.open_table(ORDER_BOOK)?.retain(|_, _| false)?;
     write.open_table(RECOVERY_HINTS)?.retain(|_, _| false)?;
     write.open_table(CONTRACT_HISTORY)?.retain(|_, _| false)?;
     write.open_table(BACKFILL_PROGRESS)?.retain(|_, _| false)?;
@@ -3697,7 +3374,11 @@ fn decode_record<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, StoreError> {
             actual: version,
         });
     }
-    Ok(postcard::from_bytes(payload)?)
+    let (value, trailing) = postcard::take_from_bytes(payload)?;
+    if !trailing.is_empty() {
+        return Err(StoreError::TrailingRecordBytes(trailing.len()));
+    }
+    Ok(value)
 }
 
 fn digest<T: Serialize>(value: &T) -> Result<[u8; 32], StoreError> {
@@ -3780,32 +3461,6 @@ fn asset_key(contract_id: ContractId, binding: AssetBinding) -> [u8; 70] {
     key
 }
 
-fn market_child_key(parent: ContractId, child: ContractId, side: OrderSide) -> [u8; 74] {
-    let mut key = [0_u8; 74];
-    key[..36].copy_from_slice(&parent.to_fixed_key());
-    key[36] = match side {
-        OrderSide::Yes => 0,
-        OrderSide::No => 1,
-    };
-    key[37] = 0; // v1 child kind: maker order
-    key[38..].copy_from_slice(&child.to_fixed_key());
-    key
-}
-
-fn order_key(contract_id: ContractId, order: OrderBookEntry) -> [u8; 86] {
-    let mut key = [0_u8; 86];
-    key[..36].copy_from_slice(&order.market_id.to_fixed_key());
-    key[36] = match order.side {
-        OrderSide::Yes => 0,
-        OrderSide::No => 1,
-    };
-    key[37] = order.direction.protocol_byte();
-    key[38..42].copy_from_slice(&order.price.to_be_bytes());
-    key[42..50].copy_from_slice(&order.creation_position.to_fixed_key());
-    key[50..].copy_from_slice(&contract_id.to_fixed_key());
-    key
-}
-
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[cfg(test)]
@@ -3839,18 +3494,12 @@ pub enum StoreError {
     CorruptMetadata(&'static str),
     #[error("persisted index key has an invalid encoding: {0}")]
     CorruptIndexKey(&'static str),
-    #[error("materialized index points to missing state: {0}")]
-    CorruptMaterializedIndex(&'static str),
-    #[error("materialized market was not found: {0:?}")]
-    MaterializedMarketNotFound(ContractId),
-    #[error("materialized contract is not a binary market: {0:?}")]
-    MaterializedContractIsNotMarket(ContractId),
-    #[error("materialized market is not ready: {0:?}")]
-    MaterializedMarketNotReady(ContractId),
     #[error("persisted record is empty")]
     EmptyRecord,
     #[error("record version mismatch: expected {expected}, found {actual}")]
     RecordVersionMismatch { expected: u8, actual: u8 },
+    #[error("persisted record has {0} trailing bytes from an incompatible shape")]
+    TrailingRecordBytes(usize),
     #[error("network policy asset validation failed: {0}")]
     NetworkPolicy(#[from] PolicyAssetError),
     #[error("chain identity mismatch: database has {expected:?}, requested {actual:?}")]
@@ -4000,6 +3649,22 @@ mod tests {
     use super::*;
     use elements::{LockTime, OutPoint, TxIn};
 
+    #[derive(Serialize)]
+    struct LegacyMarketRecord {
+        contract_id: ContractId,
+        kind: ContractKind,
+        params: ContractParameters,
+        creation_position: ChainPosition,
+        state: ContractState,
+        sync_state: ContractSyncState,
+        parent_market: Option<ContractId>,
+        outcome_side: Option<()>,
+        scripts: Vec<ScriptBinding>,
+        assets: Vec<AssetBinding>,
+        outpoints: Vec<TrackedOutpoint>,
+        order_book: Option<()>,
+    }
+
     fn block_hash(byte: u8) -> BlockHash {
         BlockHash::from_byte_array([byte; 32])
     }
@@ -4062,8 +3727,6 @@ mod tests {
             creation_position,
             state: ContractState::BinaryMarket(BinaryMarketState::Trading { outstanding_pairs }),
             sync_state: ContractSyncState::Ready { synced_through },
-            parent_market: None,
-            outcome_side: None,
             scripts: vec![ScriptBinding {
                 role: 0,
                 script_pubkey: vec![marker, 0x51],
@@ -4077,7 +3740,6 @@ mod tests {
                 role: 0,
                 outpoint: OutPoint::new(txid, vout),
             }],
-            order_book: None,
         }
     }
 
@@ -4102,7 +3764,6 @@ mod tests {
                 role: 0,
                 outpoint: OutPoint::new(spending_txid, vout),
             }],
-            order_remaining_base: None,
             transition: TransitionRecord {
                 kind: 1,
                 payload: new_pairs.to_be_bytes().to_vec(),
@@ -4142,6 +3803,41 @@ mod tests {
         let store = Store::open(&path).expect("open");
         store.initialize_tip(anchor(0)).expect("initial tip");
         (dir, path, store)
+    }
+
+    #[test]
+    fn record_decoder_rejects_the_trailing_fields_from_alpha_market_records() {
+        let current = market_record(
+            0x33,
+            ChainPosition {
+                block_height: 1,
+                tx_index: 0,
+            },
+            Txid::from_byte_array([0x44; 32]),
+            0,
+            0,
+            anchor(1),
+        );
+        let legacy = LegacyMarketRecord {
+            contract_id: current.contract_id,
+            kind: current.kind,
+            params: current.params,
+            creation_position: current.creation_position,
+            state: current.state,
+            sync_state: current.sync_state,
+            parent_market: None,
+            outcome_side: None,
+            scripts: Vec::new(),
+            assets: Vec::new(),
+            outpoints: Vec::new(),
+            order_book: None,
+        };
+
+        let encoded = encode_record(&legacy).expect("legacy record");
+        assert!(matches!(
+            decode_record::<ContractRecord>(&encoded),
+            Err(StoreError::TrailingRecordBytes(_))
+        ));
     }
 
     #[test]
@@ -5134,12 +4830,12 @@ mod tests {
                 recovery_hints: vec![RecoveryHintDelta {
                     location: mismatched_location,
                     creation_txid: mismatched_tx.txid(),
-                    family: RecoveryFamily::MakerOrderV1,
+                    family: RecoveryFamily::BinaryMarketV1,
                     payload: vec![0x20, 0x01],
                     associated_contract: None,
                 }],
             })
-            .expect("index mismatched-family hint");
+            .expect("index mismatched-transaction hint");
 
         let mut missing = market_record(0x69, missing_position, missing_tx.txid(), 0, 0, anchor(1));
         missing.sync_state = ContractSyncState::CatchingUp {
@@ -5172,7 +4868,7 @@ mod tests {
                     RegistrationEvidence {
                         anchor: anchor(1),
                         transaction: Arc::new(mismatched_tx),
-                        associated_hint: Some(mismatched_location),
+                        associated_hint: Some(missing_location),
                     },
                 ),
             ])
@@ -5271,10 +4967,8 @@ mod tests {
             synced_through: anchor(2),
         };
         assert_eq!(contract, Some(expected_market));
-        let collateral = match market_a.params {
-            ContractParameters::BinaryMarket(params) => params.collateral_asset_id,
-            ContractParameters::MakerOrder(_) => unreachable!(),
-        };
+        let ContractParameters::BinaryMarket(params) = market_a.params;
+        let collateral = params.collateral_asset_id;
         assert!(
             store
                 .asset_relations(collateral)
