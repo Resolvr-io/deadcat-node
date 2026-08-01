@@ -1,0 +1,108 @@
+use crate::binary_market::common::{
+    and,
+    ensure_burn_script,
+    ensure_output_script,
+    not,
+    script_for_slot,
+};
+
+// A/B confidential one-unit RT commitments.
+
+pub type CompressedCommitment = (bool, u256); // (odd y, x)
+// (side-A asset, side-B asset, side-independent one-unit value)
+pub type RtCommitments = (CompressedCommitment, CompressedCommitment, CompressedCommitment);
+
+fn commitment_matches(actual: (u1, u256), expected: CompressedCommitment) -> bool {
+    let (actual_parity, actual_x): (u1, u256) = actual;
+    let (expected_parity, expected_x): CompressedCommitment = expected;
+    and(
+        jet::eq_1(actual_parity, <bool>::into(expected_parity)),
+        jet::eq_256(actual_x, expected_x),
+    )
+}
+
+fn get_input_confidential(index: u32) -> ((u1, u256), (u1, u256)) {
+    let (asset, amount): (Asset1, Amount1) = unwrap(jet::input_amount(index));
+    let asset_commitment: (u1, u256) = unwrap_left::<u256>(asset);
+    let value_commitment: (u1, u256) = unwrap_left::<u64>(amount);
+    (asset_commitment, value_commitment)
+}
+
+fn get_output_confidential(index: u32) -> ((u1, u256), (u1, u256)) {
+    let (asset, amount): (Asset1, Amount1) = unwrap(jet::output_amount(index));
+    let asset_commitment: (u1, u256) = unwrap_left::<u256>(asset);
+    let value_commitment: (u1, u256) = unwrap_left::<u64>(amount);
+    (asset_commitment, value_commitment)
+}
+
+pub fn yes_rt_commitments() -> RtCommitments {
+    (
+        (param::YES_RT_ASSET_A_PARITY, param::YES_RT_ASSET_A_X),
+        (param::YES_RT_ASSET_B_PARITY, param::YES_RT_ASSET_B_X),
+        (param::YES_RT_VALUE_PARITY, param::YES_RT_VALUE_X),
+    )
+}
+
+pub fn no_rt_commitments() -> RtCommitments {
+    (
+        (param::NO_RT_ASSET_A_PARITY, param::NO_RT_ASSET_A_X),
+        (param::NO_RT_ASSET_B_PARITY, param::NO_RT_ASSET_B_X),
+        (param::NO_RT_VALUE_PARITY, param::NO_RT_VALUE_X),
+    )
+}
+
+pub fn ensure_same_rt_side(yes_is_a: bool, no_is_a: bool) {
+    assert!(jet::eq_1(<bool>::into(yes_is_a), <bool>::into(no_is_a)));
+}
+
+// Validate the complete input/output commitments and return the input side.
+// Every transition, including terminal burns, must flip A <-> B.
+fn verify_rt_flip(
+    input_index: u32,
+    output_index: u32,
+    expected: RtCommitments,
+) -> bool {
+    let (asset_a, asset_b, value): RtCommitments = expected;
+    let (input_asset, input_value): ((u1, u256), (u1, u256)) =
+        get_input_confidential(input_index);
+    let (output_asset, output_value): ((u1, u256), (u1, u256)) =
+        get_output_confidential(output_index);
+
+    assert!(commitment_matches(input_value, value));
+    assert!(commitment_matches(output_value, value));
+
+    let input_is_a: bool = commitment_matches(input_asset, asset_a);
+    let input_is_b: bool = commitment_matches(input_asset, asset_b);
+    match input_is_a {
+        true => {
+            assert!(not(input_is_b));
+            assert!(commitment_matches(output_asset, asset_b));
+        },
+        false => {
+            assert!(input_is_b);
+            assert!(commitment_matches(output_asset, asset_a));
+        },
+    };
+    input_is_a
+}
+
+pub fn ensure_rt_continuation(
+    input_index: u32,
+    output_index: u32,
+    expected: RtCommitments,
+    output_slot: u8,
+) -> bool {
+    let input_is_a: bool = verify_rt_flip(input_index, output_index, expected);
+    ensure_output_script(output_index, script_for_slot(output_slot));
+    input_is_a
+}
+
+pub fn ensure_rt_burn(
+    input_index: u32,
+    output_index: u32,
+    expected: RtCommitments,
+) -> bool {
+    let input_is_a: bool = verify_rt_flip(input_index, output_index, expected);
+    ensure_burn_script(output_index);
+    input_is_a
+}
