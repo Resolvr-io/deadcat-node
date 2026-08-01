@@ -4,8 +4,9 @@ use deadcat_client::market_builder::{
 };
 use deadcat_contracts::SimplicityNetwork;
 use deadcat_contracts::binary_market::{
-    BinaryMarketAction, BinaryMarketEconomics, BinaryMarketSlot, BinaryOutcome,
-    CompiledBinaryMarket, derived_binary_market,
+    BinaryMarketAction, BinaryMarketCoordinatorAction, BinaryMarketCoordinatorRole,
+    BinaryMarketEconomics, BinaryMarketLayout, BinaryMarketOperation, BinaryMarketResolution,
+    BinaryMarketSlot, BinaryMarketWitness, BinaryOutcome, CompiledBinaryMarket,
 };
 use deadcat_contracts::finalized_spend::FinalizedSimplicitySpend;
 use deadcat_contracts::interpret::{
@@ -22,19 +23,18 @@ use elements::pset::{Input as PsetInput, Output as PsetOutput, PartiallySignedTr
 use elements::secp256k1_zkp::{Keypair, Message, Secp256k1, Tweak};
 use elements::{AssetId, LockTime, OutPoint, Script, Sequence, TxOut, TxOutWitness, Txid};
 use serde::Serialize;
-use simplex::program::WitnessTrait as _;
 use simplex::simplicityhl::simplicity::Cost;
 
-// Rounded CI ceilings with headroom above the reviewed maxima of 4,557,857 mw,
-// 70,903 cells, 62 frames, 6,223 stack bytes, 15,334 transaction bytes,
-// 17,284 WU, and 4,321 vB. The exact measurements remain in the JSON report.
-const MAX_MARKET_COVENANT_COST_MILLIWEIGHT: u64 = 5_000_000;
+// Rounded CI ceilings with headroom above the typed-action maxima of 3,633,302
+// mw, 72,462 cells, 62 frames, 4,339 stack bytes, 13,624 transaction bytes,
+// 15,574 WU, and 3,894 vB. The exact measurements are emitted by the test.
+const MAX_MARKET_COVENANT_COST_MILLIWEIGHT: u64 = 4_000_000;
 const MAX_MARKET_INPUT_EXTRA_CELLS: usize = 80_000;
 const MAX_MARKET_INPUT_EXTRA_FRAMES: usize = 70;
-const MAX_MARKET_COVENANT_STACK_BYTES: usize = 7_000;
-const MAX_MARKET_TX_BYTES: usize = 17_000;
-const MAX_MARKET_TX_WEIGHT: usize = 19_000;
-const MAX_MARKET_TX_VSIZE: usize = 5_000;
+const MAX_MARKET_COVENANT_STACK_BYTES: usize = 5_000;
+const MAX_MARKET_TX_BYTES: usize = 15_000;
+const MAX_MARKET_TX_WEIGHT: usize = 17_000;
+const MAX_MARKET_TX_VSIZE: usize = 4_500;
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 struct CovenantMetrics {
@@ -535,27 +535,22 @@ fn direct_market_witness(
     attestation: Option<OracleAttestation>,
     slot: BinaryMarketSlot,
     output_base: usize,
-) -> derived_binary_market::BinaryMarketWitness {
-    let (tokens_burned, redeem_yes) = match action {
-        BinaryMarketAction::Redeem { outcome, tokens } => (tokens, outcome == BinaryOutcome::Yes),
-        _ => (0, false),
+) -> BinaryMarketWitness {
+    let resolution = match (action, attestation) {
+        (BinaryMarketAction::Resolve { outcome }, Some(attestation)) => {
+            Some(BinaryMarketResolution::new(outcome, attestation.signature))
+        }
+        _ => None,
     };
-    let oracle_outcome_yes = redeem_yes
-        || matches!(
-            action,
-            BinaryMarketAction::Resolve {
-                outcome: BinaryOutcome::Yes
-            }
-        );
-    derived_binary_market::BinaryMarketWitness {
-        path: plan.path() as u8,
-        slot: slot as u8,
-        output_base: u32::try_from(output_base).expect("test output index fits u32"),
-        oracle_outcome_yes,
-        oracle_signature: attestation.map_or([0; 64], |value| value.signature),
-        tokens_burned,
-        redeem_yes,
-    }
+    let layout = plan.layout();
+    let coordinator_action = BinaryMarketCoordinatorAction::for_layout(
+        layout,
+        u32::try_from(output_base).expect("test output index fits u32"),
+        resolution,
+    )
+    .expect("action matches transition layout");
+    BinaryMarketWitness::for_slot(layout, slot, coordinator_action)
+        .expect("slot belongs to transition layout")
 }
 
 fn attach_dummy_issuance(input: &mut PsetInput) {
@@ -1356,14 +1351,19 @@ fn market_coordinator_rejects_adversarial_solvency_and_authorization_mutations()
         output_base,
     );
     let coordinator = BinaryMarketSlot::UnresolvedYesRt;
-    let mut bad_signature = direct_market_witness(
-        &resolution_plan,
-        resolve_yes,
-        resolution_attestation,
-        coordinator,
-        output_base,
-    );
-    bad_signature.oracle_signature[0] ^= 1;
+    let mut signature = resolution_attestation
+        .expect("resolution attestation")
+        .signature;
+    signature[0] ^= 1;
+    let bad_action = BinaryMarketCoordinatorAction::for_layout(
+        resolution_plan.layout(),
+        u32::try_from(output_base).expect("test output index fits u32"),
+        Some(BinaryMarketResolution::new(BinaryOutcome::Yes, signature)),
+    )
+    .expect("resolution action");
+    let bad_signature =
+        BinaryMarketWitness::for_slot(resolution_plan.layout(), coordinator, bad_action)
+            .expect("coordinator witness");
     assert!(
         compiled
             .execute(
@@ -1472,27 +1472,16 @@ fn market_coordinator_rejects_adversarial_solvency_and_authorization_mutations()
         input_base,
         output_base,
     );
-    let resolved_slot = BinaryMarketSlot::ResolvedYesCollateral;
     for tokens in [0, 4] {
-        let mut witness = direct_market_witness(
-            &redemption_plan,
+        let mut wrong_burn = redemption.clone();
+        wrong_burn.outputs_mut()[output_base + 1].amount = Some(tokens);
+        assert_rejected(
+            resolved,
             redeem_yes,
             redemption_attestation,
-            resolved_slot,
-            output_base,
-        );
-        witness.tokens_burned = tokens;
-        assert!(
-            compiled
-                .execute(
-                    resolved_slot,
-                    &redemption,
-                    &witness.build_witness(),
-                    input_base,
-                    &network,
-                )
-                .is_err(),
-            "resolved redemption accepted {tokens} adversarial tokens"
+            &redemption_plan,
+            &wrong_burn,
+            "resolved redemption with an invalid derived burn amount",
         );
     }
 
@@ -1558,15 +1547,42 @@ fn market_coordinator_rejects_adversarial_solvency_and_authorization_mutations()
         "expiry redemption using the resolved-market payout",
     );
 
-    let mut wrong_expiry_token = expired_redemption;
-    wrong_expiry_token.outputs_mut()[output_base + 1].asset = Some(params.yes_token_asset_id);
-    assert_rejected(
-        expired,
+    let mut alternate_expiry_token = expired_redemption;
+    alternate_expiry_token.outputs_mut()[output_base + 1].asset = Some(params.yes_token_asset_id);
+    let slot = BinaryMarketSlot::ExpiredCollateral;
+    let witness = direct_market_witness(
+        &expired_plan,
         redeem_expired_no,
         expired_attestation,
-        &expired_plan,
-        &wrong_expiry_token,
-        "expiry redemption burning the other outcome token",
+        slot,
+        output_base,
+    );
+    compiled
+        .execute(
+            slot,
+            &alternate_expiry_token,
+            &witness.build_witness(),
+            input_base,
+            &network,
+        )
+        .expect("expiry redemption derives and accepts either token side");
+    let transaction = alternate_expiry_token
+        .extract_tx()
+        .expect("extract alternate expiry redemption");
+    let expired_live = live_inputs(&compiled, expired, RtSide::A);
+    let interpreted = interpret_binary_market_spend_with_compiled(
+        &compiled,
+        expired,
+        &interpreter_live_outputs(&compiled, expired, &expired_live),
+        &transaction,
+    )
+    .expect("interpret alternate expiry token side");
+    assert_eq!(
+        interpreted.action,
+        BinaryMarketAction::Redeem {
+            outcome: BinaryOutcome::Yes,
+            tokens: 1,
+        }
     );
 }
 
@@ -1627,15 +1643,12 @@ fn market_followers_ignore_transition_witnesses_but_require_the_exact_coordinato
     .into_iter()
     .enumerate()
     {
-        for path in (0_u8..=9).chain([u8::MAX]) {
-            let mut witness =
-                direct_market_witness(&active_plan, active_action, None, slot, output_base);
-            witness.path = path;
-            witness.output_base = u32::MAX;
-            witness.oracle_outcome_yes = true;
-            witness.oracle_signature = [0xa5; 64];
-            witness.tokens_burned = u64::MAX;
-            witness.redeem_yes = true;
+        for divergent_output_base in [0, u32::MAX - 1, u32::MAX] {
+            let action = BinaryMarketCoordinatorAction::Cancel {
+                output_base: divergent_output_base,
+            };
+            let witness = BinaryMarketWitness::for_slot(active_plan.layout(), slot, action)
+                .expect("follower witness");
             compiled
                 .execute(
                     slot,
@@ -1645,20 +1658,64 @@ fn market_followers_ignore_transition_witnesses_but_require_the_exact_coordinato
                     &network,
                 )
                 .unwrap_or_else(|error| {
-                    panic!("path-independent follower {slot:?} rejected path {path}: {error}")
+                    panic!(
+                        "action-independent follower {slot:?} rejected output base \
+                         {divergent_output_base}: {error}"
+                    )
                 });
         }
     }
 
-    for wrong_path in (0_u8..=9).filter(|path| *path != 2).chain([u8::MAX]) {
-        let mut witness = direct_market_witness(
-            &active_plan,
-            active_action,
-            None,
+    let output_base_u32 = u32::try_from(output_base).expect("test output index fits u32");
+    let wrong_layouts = [
+        (
+            BinaryMarketLayout::for_operation(
+                BinaryMarketCoordinatorRole::UnresolvedYesRt,
+                BinaryMarketOperation::Issue,
+                None,
+            )
+            .expect("issuance layout"),
+            BinaryMarketCoordinatorAction::Issue {
+                output_base: output_base_u32,
+            },
+            "issue",
+        ),
+        (
+            BinaryMarketLayout::for_operation(
+                BinaryMarketCoordinatorRole::UnresolvedYesRt,
+                BinaryMarketOperation::Resolve,
+                None,
+            )
+            .expect("resolution layout"),
+            BinaryMarketCoordinatorAction::Resolve {
+                output_base: output_base_u32,
+                resolution: BinaryMarketResolution::new(
+                    BinaryOutcome::Yes,
+                    sign_attestation(params, BinaryOutcome::Yes).signature,
+                ),
+            },
+            "resolve",
+        ),
+        (
+            BinaryMarketLayout::for_operation(
+                BinaryMarketCoordinatorRole::UnresolvedYesRt,
+                BinaryMarketOperation::Expire,
+                None,
+            )
+            .expect("expiry layout"),
+            BinaryMarketCoordinatorAction::Expire {
+                output_base: output_base_u32,
+            },
+            "expire",
+        ),
+    ];
+    for (wrong_layout, wrong_action, label) in wrong_layouts {
+        let witness = BinaryMarketWitness::for_slot(
+            wrong_layout,
             BinaryMarketSlot::UnresolvedYesRt,
-            output_base,
-        );
-        witness.path = wrong_path;
+            wrong_action,
+        )
+        .expect("wrong semantic coordinator witness");
         assert!(
             compiled
                 .execute(
@@ -1669,14 +1726,17 @@ fn market_followers_ignore_transition_witnesses_but_require_the_exact_coordinato
                     &network,
                 )
                 .is_err(),
-            "coordinator accepted partial cancellation under path {wrong_path}"
+            "coordinator accepted cancellation transaction under {label} action"
         );
     }
 
     for (offset, slot) in active_slots.into_iter().enumerate() {
-        let mut witness =
-            direct_market_witness(&active_plan, active_action, None, slot, output_base);
-        witness.slot = ((slot as u8) + 1) % (BinaryMarketSlot::ALL.len() as u8);
+        let wrong_slot = active_slots[(offset + 1) % active_slots.len()];
+        let action = BinaryMarketCoordinatorAction::Cancel {
+            output_base: output_base_u32,
+        };
+        let witness = BinaryMarketWitness::for_slot(active_plan.layout(), wrong_slot, action)
+            .expect("wrong role still belongs to active layout");
         assert!(
             compiled
                 .execute(
@@ -1778,19 +1838,19 @@ fn market_followers_ignore_transition_witnesses_but_require_the_exact_coordinato
             &network,
         )
         .expect("finalize canonical coordinator and followers");
-    for (offset, slot, path, signature) in [
-        (1, BinaryMarketSlot::UnresolvedNoRt, u8::MAX, [0xb6; 64]),
-        (2, BinaryMarketSlot::UnresolvedCollateral, 9, [0xc7; 64]),
+    for (offset, slot, divergent_output_base) in [
+        (1, BinaryMarketSlot::UnresolvedNoRt, u32::MAX - 1),
+        (2, BinaryMarketSlot::UnresolvedCollateral, u32::MAX),
     ] {
         let input_index = input_base + offset;
-        let mut witness =
-            direct_market_witness(&active_plan, active_action, None, slot, output_base);
-        witness.path = path;
-        witness.output_base = u32::MAX - u32::try_from(offset).expect("small offset");
-        witness.oracle_outcome_yes = offset == 1;
-        witness.oracle_signature = signature;
-        witness.tokens_burned = u64::MAX - u64::try_from(offset).expect("small offset");
-        witness.redeem_yes = offset == 2;
+        let witness = BinaryMarketWitness::for_slot(
+            active_plan.layout(),
+            slot,
+            BinaryMarketCoordinatorAction::Cancel {
+                output_base: divergent_output_base,
+            },
+        )
+        .expect("follower witness with divergent action payload");
         compiled
             .execute(
                 slot,
@@ -1816,6 +1876,10 @@ fn market_followers_ignore_transition_witnesses_but_require_the_exact_coordinato
             .expect("finalize mixed follower")
             .into_witness_stack();
         assert!((4..=5).contains(&canonical_stack.len()));
+        assert_eq!(
+            mixed_stack, canonical_stack,
+            "follower {slot:?} must prune ACTION from its witness program"
+        );
         record_budget(format!("mixed-follower-{slot:?}"), &mixed_stack);
         mixed_witness_pset.inputs_mut()[input_index].final_script_witness = Some(mixed_stack);
     }
@@ -1857,20 +1921,15 @@ fn market_followers_ignore_transition_witnesses_but_require_the_exact_coordinato
         .prepare_expiry(&mut dormant_pset, input_base)
         .expect("prepare dormant expiry");
     let dormant_follower = BinaryMarketSlot::DormantNoRt;
-    for path in (0_u8..=9).chain([u8::MAX]) {
-        let mut witness = direct_market_witness(
-            &dormant_plan,
-            dormant_action,
-            None,
+    for divergent_output_base in [0, u32::MAX - 1, u32::MAX] {
+        let witness = BinaryMarketWitness::for_slot(
+            dormant_plan.layout(),
             dormant_follower,
-            output_base,
-        );
-        witness.path = path;
-        witness.output_base = u32::MAX;
-        witness.oracle_outcome_yes = true;
-        witness.oracle_signature = [0xd8; 64];
-        witness.tokens_burned = u64::MAX;
-        witness.redeem_yes = true;
+            BinaryMarketCoordinatorAction::Expire {
+                output_base: divergent_output_base,
+            },
+        )
+        .expect("dormant follower witness with divergent action payload");
         compiled
             .execute(
                 dormant_follower,
@@ -1880,7 +1939,36 @@ fn market_followers_ignore_transition_witnesses_but_require_the_exact_coordinato
                 &network,
             )
             .unwrap_or_else(|error| {
-                panic!("dormant path-independent follower rejected path {path}: {error}")
+                panic!(
+                    "ACTION-independent dormant follower rejected output base \
+                     {divergent_output_base}: {error}"
+                )
+            });
+    }
+
+    // Dormant RTs may originate at nonconsecutive outputs of one composed
+    // creation transaction. Only unresolved continuation groups are required
+    // to occupy consecutive prior vouts.
+    let mut composed_dormant_pset = dormant_pset.clone();
+    composed_dormant_pset.inputs_mut()[input_base + 1].previous_output_index += 7;
+    for (offset, slot) in [
+        BinaryMarketSlot::DormantYesRt,
+        BinaryMarketSlot::DormantNoRt,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let witness = direct_market_witness(&dormant_plan, dormant_action, None, slot, output_base);
+        compiled
+            .execute(
+                slot,
+                &composed_dormant_pset,
+                &witness.build_witness(),
+                input_base + offset,
+                &network,
+            )
+            .unwrap_or_else(|error| {
+                panic!("{slot:?} rejected a valid nonconsecutive dormant sibling: {error}")
             });
     }
 
@@ -1891,9 +1979,19 @@ fn market_followers_ignore_transition_witnesses_but_require_the_exact_coordinato
     .into_iter()
     .enumerate()
     {
-        let mut witness =
-            direct_market_witness(&dormant_plan, dormant_action, None, slot, output_base);
-        witness.slot = ((slot as u8) + 1) % (BinaryMarketSlot::ALL.len() as u8);
+        let dormant_slots = [
+            BinaryMarketSlot::DormantYesRt,
+            BinaryMarketSlot::DormantNoRt,
+        ];
+        let wrong_slot = dormant_slots[(offset + 1) % dormant_slots.len()];
+        let witness = BinaryMarketWitness::for_slot(
+            dormant_plan.layout(),
+            wrong_slot,
+            BinaryMarketCoordinatorAction::Expire {
+                output_base: u32::try_from(output_base).expect("output index fits u32"),
+            },
+        )
+        .expect("wrong role still belongs to dormant layout");
         assert!(
             compiled
                 .execute(
@@ -1950,6 +2048,7 @@ fn every_terminal_market_slot_rejects_a_false_slot_witness() {
                 tokens: 1,
             },
             BinaryMarketSlot::ResolvedYesCollateral,
+            BinaryMarketCoordinatorRole::ResolvedNoCollateral,
         ),
         (
             BinaryMarketState::ResolvedNo {
@@ -1960,6 +2059,7 @@ fn every_terminal_market_slot_rejects_a_false_slot_witness() {
                 tokens: 1,
             },
             BinaryMarketSlot::ResolvedNoCollateral,
+            BinaryMarketCoordinatorRole::ResolvedYesCollateral,
         ),
         (
             BinaryMarketState::Expired {
@@ -1970,10 +2070,11 @@ fn every_terminal_market_slot_rejects_a_false_slot_witness() {
                 tokens: 1,
             },
             BinaryMarketSlot::ExpiredCollateral,
+            BinaryMarketCoordinatorRole::ResolvedYesCollateral,
         ),
     ];
-    for (before, action, slot) in cases {
-        let (plan, attestation, pset) = finalized_market_fixture(
+    for (before, action, slot, wrong_coordinator) in cases {
+        let (_plan, _attestation, pset) = finalized_market_fixture(
             &compiled,
             before,
             action,
@@ -1981,8 +2082,20 @@ fn every_terminal_market_slot_rejects_a_false_slot_witness() {
             input_base,
             output_base,
         );
-        let mut witness = direct_market_witness(&plan, action, attestation, slot, output_base);
-        witness.slot = ((slot as u8) + 1) % (BinaryMarketSlot::ALL.len() as u8);
+        let wrong_layout = BinaryMarketLayout::for_operation(
+            wrong_coordinator,
+            BinaryMarketOperation::Redeem,
+            None,
+        )
+        .expect("alternate terminal redemption layout");
+        let witness = BinaryMarketWitness::for_slot(
+            wrong_layout,
+            wrong_coordinator.slot(),
+            BinaryMarketCoordinatorAction::Redeem {
+                output_base: u32::try_from(output_base).expect("output index fits u32"),
+            },
+        )
+        .expect("alternate terminal coordinator witness");
         assert!(
             compiled
                 .execute(slot, &pset, &witness.build_witness(), input_base, &network,)

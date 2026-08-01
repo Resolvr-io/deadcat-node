@@ -22,8 +22,9 @@ use deadcat_client::market_builder::{
 use deadcat_client::validation::replay_contract_history;
 use deadcat_contracts::SimplicityNetwork;
 use deadcat_contracts::binary_market::{
-    BinaryMarketAction, BinaryMarketEconomics, BinaryMarketSlot, BinaryMarketTransition,
-    BinaryOutcome, CompiledBinaryMarket, derived_binary_market,
+    BinaryMarketAction, BinaryMarketCoordinatorAction, BinaryMarketEconomics, BinaryMarketPath,
+    BinaryMarketSlot, BinaryMarketTransition, BinaryMarketWitness, BinaryOutcome,
+    CompiledBinaryMarket,
 };
 use deadcat_contracts::market_crypto::{
     BinaryOutcome as OracleOutcome, derive_issuance_assets, oracle_message,
@@ -62,7 +63,6 @@ use elements::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
-use simplex::program::WitnessTrait as _;
 use simplex::provider::ElementsRpc;
 use simplex::signer::{Signer, SignerTrait as _};
 use simplex::transaction::{FinalTransaction, PartialOutput};
@@ -1140,40 +1140,19 @@ fn rebuild_pruned_market_followers_from_divergent_witnesses(
     network: &SimplicityNetwork,
 ) {
     let compiled = CompiledBinaryMarket::new(params).expect("compile canonical market");
-    for (input_index, slot, path, output_base, signature, tokens_burned, redeem_yes) in [
-        (
-            1,
-            BinaryMarketSlot::UnresolvedNoRt,
-            u8::MAX,
-            u32::MAX,
-            [0xa5; 64],
-            u64::MAX,
-            true,
-        ),
-        (
-            2,
-            BinaryMarketSlot::UnresolvedCollateral,
-            9,
-            u32::MAX - 1,
-            [0x5a; 64],
-            u64::MAX - 1,
-            false,
-        ),
+    let layout = plan.layout();
+    for (input_index, slot, output_base) in [
+        (1, BinaryMarketSlot::UnresolvedNoRt, u32::MAX),
+        (2, BinaryMarketSlot::UnresolvedCollateral, u32::MAX - 1),
     ] {
         let canonical = pset.inputs()[input_index]
             .final_script_witness
             .as_ref()
             .expect("canonical follower witness")
             .clone();
-        let witness = derived_binary_market::BinaryMarketWitness {
-            path,
-            slot: slot as u8,
-            output_base,
-            oracle_outcome_yes: input_index == 1,
-            oracle_signature: signature,
-            tokens_burned,
-            redeem_yes,
-        };
+        let action = BinaryMarketCoordinatorAction::Cancel { output_base };
+        let witness = BinaryMarketWitness::for_slot(layout, slot, action)
+            .expect("follower slot belongs to cancellation layout");
         let rebuilt = compiled
             .finalize(slot, pset, &witness.build_witness(), input_index, network)
             .unwrap_or_else(|error| panic!("finalize divergent {slot:?} follower: {error}"))
@@ -1181,10 +1160,7 @@ fn rebuild_pruned_market_followers_from_divergent_witnesses(
         assert!((4..=5).contains(&canonical.len()));
         pset.inputs_mut()[input_index].final_script_witness = Some(rebuilt);
     }
-    assert_eq!(
-        plan.path(),
-        deadcat_contracts::interpret::BinaryMarketPath::PartialCancellation
-    );
+    assert_eq!(plan.path(), BinaryMarketPath::PartialCancellation);
 }
 
 #[allow(clippy::too_many_arguments)]

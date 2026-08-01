@@ -3,12 +3,13 @@
 mod support;
 
 use deadcat_contracts::binary_market::{
-    BinaryMarketAction, BinaryMarketSlot, CompiledBinaryMarket, derived_binary_market,
+    BinaryMarketAction, BinaryMarketCoordinatorAction, BinaryMarketCoordinatorRole,
+    BinaryMarketLayout, BinaryMarketOperation, BinaryMarketPath, BinaryMarketSlot,
+    BinaryMarketWitness, CompiledBinaryMarket,
 };
 use deadcat_contracts::finalized_spend::FinalizedSimplicitySpendError;
 use deadcat_contracts::interpret::{
-    BinaryMarketLiveOutputs, BinaryMarketPath, InterpretError, TrackedContractOutput,
-    interpret_binary_market_spend,
+    BinaryMarketLiveOutputs, InterpretError, TrackedContractOutput, interpret_binary_market_spend,
 };
 use deadcat_contracts::rt::{RtFactors, RtLeg, RtSide, factors};
 use deadcat_types::{BinaryMarketParams, BinaryMarketState};
@@ -17,8 +18,6 @@ use elements::hashes::Hash as _;
 use elements::pset::PartiallySignedTransaction;
 use elements::secp256k1_zkp::{Generator, Keypair, PedersenCommitment, Secp256k1, Tweak};
 use elements::{LockTime, OutPoint, Script, Sequence, Transaction, TxOut, TxOutWitness};
-use simplex::program::WitnessTrait as _;
-
 use support::{asset, bare_op_return, explicit_txout, network, pset_input, pset_output, script};
 
 fn key(seed: u8) -> [u8; 32] {
@@ -48,6 +47,20 @@ struct BinaryScenario {
     live: BinaryMarketLiveOutputs,
     pset: PartiallySignedTransaction,
     transaction: Transaction,
+}
+
+fn coordinator_witness(
+    slot: BinaryMarketSlot,
+    operation: BinaryMarketOperation,
+    full_cancellation: Option<bool>,
+    output_base: u32,
+) -> BinaryMarketWitness {
+    let coordinator = BinaryMarketCoordinatorRole::try_from(slot).expect("coordinator slot");
+    let layout = BinaryMarketLayout::for_operation(coordinator, operation, full_cancellation)
+        .expect("valid test layout");
+    let action = BinaryMarketCoordinatorAction::for_layout(layout, output_base, None)
+        .expect("valid test action");
+    BinaryMarketWitness::for_slot(layout, slot, action).expect("valid test witness")
 }
 
 fn resolved_redemption_scenario(full: bool, decoy: bool) -> BinaryScenario {
@@ -128,15 +141,12 @@ fn resolved_redemption_scenario(full: bool, decoy: bool) -> BinaryScenario {
         script(0x90),
     )));
 
-    let witness = derived_binary_market::BinaryMarketWitness {
-        path: 8,
-        slot: BinaryMarketSlot::ResolvedYesCollateral as u8,
+    let witness = coordinator_witness(
+        BinaryMarketSlot::ResolvedYesCollateral,
+        BinaryMarketOperation::Redeem,
+        None,
         output_base,
-        oracle_outcome_yes: false,
-        oracle_signature: [0; 64],
-        tokens_burned: tokens,
-        redeem_yes: false,
-    };
+    );
     let net = network(params.collateral_asset_id);
     let stack = compiled
         .finalize(
@@ -362,7 +372,7 @@ fn finalized_active_expiry(side: RtSide, sequences: [Sequence; 3]) -> BinaryScen
         input.sequence = Some(sequence);
         pset.add_input(input);
     }
-    // Same-script decoy at vout 0; the decoded OUTPUT_BASE is 2.
+    // Same-script decoy at vout 0; the decoded action's output base is 2.
     pset.add_output(pset_output(explicit_txout(
         params.collateral_asset_id,
         599,
@@ -395,15 +405,12 @@ fn finalized_active_expiry(side: RtSide, sequences: [Sequence; 3]) -> BinaryScen
             .clone(),
     )));
 
-    let witness = derived_binary_market::BinaryMarketWitness {
-        path: 6,
-        slot: BinaryMarketSlot::UnresolvedYesRt as u8,
-        output_base: 2,
-        oracle_outcome_yes: false,
-        oracle_signature: [0; 64],
-        tokens_burned: 0,
-        redeem_yes: false,
-    };
+    let witness = coordinator_witness(
+        BinaryMarketSlot::UnresolvedYesRt,
+        BinaryMarketOperation::Expire,
+        None,
+        2,
+    );
     let net = network(params.collateral_asset_id);
     let stack = compiled
         .finalize(
@@ -546,7 +553,7 @@ fn rejects_inactive_or_time_typed_active_expiry_locktime() {
 }
 
 #[test]
-fn interprets_partial_cancellation_when_path_equals_slot_and_bases_are_shared() {
+fn interprets_partial_cancellation_from_action_and_output_shape() {
     let params = binary_params();
     let compiled = CompiledBinaryMarket::new(params).expect("compile market");
     let before = BinaryMarketState::Trading {
@@ -631,15 +638,12 @@ fn interprets_partial_cancellation_when_path_equals_slot_and_bases_are_shared() 
         200,
         script(0x92),
     )));
-    let witness = derived_binary_market::BinaryMarketWitness {
-        path: 2,
-        slot: 2,
-        output_base: 0,
-        oracle_outcome_yes: false,
-        oracle_signature: [0; 64],
-        tokens_burned: 0,
-        redeem_yes: false,
-    };
+    let witness = coordinator_witness(
+        BinaryMarketSlot::UnresolvedYesRt,
+        BinaryMarketOperation::Cancel,
+        Some(false),
+        0,
+    );
     let net = network(params.collateral_asset_id);
     let stack = compiled
         .finalize(

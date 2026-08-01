@@ -8,11 +8,11 @@ use std::collections::{HashMap, HashSet};
 
 use deadcat_contracts::SimplicityNetwork;
 use deadcat_contracts::binary_market::{
-    BinaryMarketEconomics, BinaryMarketSlot, BinaryMarketTransition, BinaryOutcome,
-    CompiledBinaryMarket, CompiledBinaryMarketError,
+    BinaryMarketEconomics, BinaryMarketPath, BinaryMarketSlot, BinaryMarketTransition,
+    BinaryOutcome, CompiledBinaryMarket, CompiledBinaryMarketError,
 };
 use deadcat_contracts::interpret::{
-    BinaryMarketLiveOutputs, BinaryMarketPath, TrackedContractOutput, interpret_binary_market_spend,
+    BinaryMarketLiveOutputs, TrackedContractOutput, interpret_binary_market_spend,
 };
 use deadcat_contracts::rt::{RtLeg, RtSide, commitments, factors};
 use deadcat_rpc::{

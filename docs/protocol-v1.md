@@ -253,6 +253,10 @@ collateral_per_pair = cp = checked_mul(base_payout, 2)
 ```
 
 Its four-bit recovery index is the zero-based position in this list.
+Compiler and creation validation enforce this supported-denomination profile.
+The spend covenant commits the selected value and uses checked payout
+arithmetic, but does not repeat the recovery-policy membership check on every
+spend.
 
 Amounts are in the smallest indivisible unit of the relevant asset. The
 contract accepts any Liquid collateral asset; transaction fees remain in the
@@ -291,14 +295,12 @@ the contract input base from their own `current_index` and validate the complete
 transition. They check every sibling input, both RT legs, every constrained
 output, the full collateral equation, and issuance fields on every market input.
 
-Dormant NO, unresolved NO, and unresolved collateral dispatch by their committed
-slot before consulting any transition witness. They ignore `PATH`, `OUTPUT_BASE`,
-oracle, and redemption fields and authorize only a co-spend with the exact
-coordinator group at the required adjacent transaction-input positions. The
-unresolved group must also spend consecutive prior outputs YES, NO, collateral.
+Dormant NO, unresolved NO, and unresolved collateral authenticate their
+committed slot and exact coordinator group without consulting `ACTION`.
 Consensus executes all inputs atomically, so a follower succeeds only when its
-coordinator independently authorizes the complete transition. Terminal
-collateral inputs validate their own redemption paths.
+coordinator independently authorizes the complete transition. The unresolved
+group must also spend consecutive prior outputs YES, NO, collateral. Terminal
+collateral inputs authenticate their own slot and validate their redemption.
 
 The canonical node state is:
 
@@ -339,11 +341,39 @@ Every market path enforces:
 - no transition creates unmatched YES/NO supply; and
 - checked arithmetic cannot wrap.
 
-The interpreter derives the input base from the tracked coordinator outpoint and
-uses only the coordinator's decoded path and output base. Follower transition
-witness values are non-authoritative. It does not find a continuation by taking
-the first output with a matching script. Decoy same-script outputs in an
-otherwise valid custom transaction must not change the interpreted state.
+The interpreter derives the input base from the tracked coordinator outpoint
+and decodes the coordinator's exact typed action. Follower action values are
+non-authoritative. It does not find a continuation by taking the first output
+with a matching script. Decoy same-script outputs in an otherwise valid custom
+transaction must not change the interpreted state.
+
+### Covenant witness ABI
+
+The source-level witness has two fields:
+
+```text
+SLOT:   u8
+ACTION: Either<Either<u32, u32>,
+               Either<(u32, bool, Signature), Either<u32, u32>>>
+```
+
+`SLOT` is authenticated against the hidden TapData word before it can grant any
+authority. `ACTION` is a five-way semantic sum whose branches are:
+
+| Operation | Encoding | Payload |
+|---|---|---|
+| Issue | `Left(Left(output_base))` | output window only |
+| Cancel | `Left(Right(output_base))` | output window only |
+| Resolve | `Right(Left((output_base, outcome_yes, signature)))` | output window and oracle attestation |
+| Expire | `Right(Right(Left(output_base)))` | output window only |
+| Redeem | `Right(Right(Right(output_base)))` | output window only |
+
+The authenticated slot and transaction determine the old-state variant. In
+particular, the slot distinguishes initial from subsequent issuance,
+dormant from active resolution/expiry, and resolved from expired redemption.
+Cancellation shape is derived from its mandatory outputs. Redemption quantity,
+completion, and token side are derived from the explicit burn and collateral
+outputs. They are not independently witness-selected.
 
 ### Spend paths
 
@@ -408,10 +438,11 @@ the canonical spend confirms.
 #### Expiry
 
 Expiry uses the same unresolved/dormant shapes as resolution. `expiry_height`
-is the exact CLTV-style lock-height threshold and must satisfy
-`1 <= expiry_height < 500_000_000`. The covenant requires transaction
-`nLockTime >= expiry_height`; the transaction must also use a non-final input
-sequence so consensus locktime is active. Because consensus requires
+is the exact CLTV-style lock-height threshold. Compiler and creation validation
+require `1 <= expiry_height < 500_000_000`; the covenant enforces the committed
+height by requiring transaction `nLockTime >= expiry_height`. The transaction
+must also use a non-final input sequence so consensus locktime is active.
+Because consensus requires
 `nLockTime < candidate_block_height`, a transaction with locktime exactly `H`
 is first confirmable in block `H + 1`. Unresolved collateral moves unchanged
 to slot 7.

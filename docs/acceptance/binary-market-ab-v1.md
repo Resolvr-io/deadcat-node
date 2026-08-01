@@ -1,7 +1,8 @@
 # Binary-market A/B v1 acceptance packet
 
 - Status: Engineering candidate complete; protocol-owner approved; focused external review pending
-- Prepared: 2026-07-13; strict coordinator hardening updated 2026-07-22
+- Prepared: 2026-07-13; strict coordinator hardening updated 2026-07-22;
+  typed-action ABI candidate updated 2026-07-31
 - Protocol-owner approval: Tommy Volk; 2026-07-14
 - Decision record: [ADR 0005](../adr/0005-rt-blinding-schedule.md)
 - Protocol specification: [Deadcat protocol v1](../protocol-v1.md)
@@ -22,6 +23,13 @@ dormant transition or three-input unresolved transition, while each follower
 proves it belongs to that exact coordinator group. No compatibility path or
 migration is required because the superseded candidate was never deployed.
 
+The still-undeployed v1 covenant was subsequently simplified to a typed
+five-operation `ACTION` sum plus authenticated `SLOT`. Path variants, burn
+quantity, redemption side, and dummy oracle fields are derived from the slot,
+semantic action, and mandatory transaction outputs. The exact branch-pruned
+decoder and current identity are recorded in the
+[PR3 witness conformance note](../binary-market-witness-conformance-pr3.md).
+
 ADR 0005 remains Proposed until a focused reviewer records a conclusion. Tommy
 Volk approved every protocol-owner choice below on 2026-07-14 against the
 candidate implementation commit. Reviewer checkboxes remain for the independent
@@ -33,7 +41,7 @@ For the golden fixture in `deadcat-contracts/tests/golden_vectors.rs`, the
 parameterized binary-market CMR is:
 
 ```text
-ebbd8f3001141120edb0880c8e14f40d2054018116627624fc31c1bcf73af473
+e8912f8e5deb3c04ba47eaacacc8d194ae0473e35cee9e171b8a71e3513abca0
 ```
 
 The v1 consensus scalars are big-endian 32-byte integers:
@@ -50,7 +58,10 @@ The golden test also freezes all four asset commitments, both
 side-independent value commitments, and all eight Taproot script/control-block
 pairs. A second set of independently derived commitments uses nonuniform asset
 IDs so an accidental Elements display-order reversal cannot pass unnoticed.
-The CMR above is not universal across market parameters.
+The CMR above is not universal across market parameters. The prior strict
+coordinator/follower implementation compiled this fixture to
+`ebbd8f3001141120edb0880c8e14f40d2054018116627624fc31c1bcf73af473`;
+that value remains historical evidence rather than the current candidate.
 
 ## Engineering evidence
 
@@ -63,6 +74,7 @@ The CMR above is not universal across market parameters.
 | Mandatory synchronized flip/burn | Complete | SimplicityHL and Rust checks plus A→B, B→A, same-side, mixed-side, wrong-role, malformed-commitment, and terminal-burn tests |
 | Input-side reissuance nonce | Complete | Covenant/builder/interpreter adversarial tests and live A/B issuances inspect the exact nonce |
 | Every lifecycle shape | Complete | All 18 builder/BitMachine/interpreter shapes execute; every RT-consuming shape executes on both A and B, every sibling, with sufficient Simplicity budget; direct mutation tests cover solvency, issuance authority, terminal burns, oracle/expiry, redemption arithmetic, wrong slots, and follower source-witness independence |
+| Typed semantic action ABI | Complete | Golden source ABI contains only `SLOT` and the five-branch `ACTION`; checked Rust facades prevent invalid role/action layouts; exact finalized decoding rejects missing, duplicate, unexpected, or near-miss structural values without width scans or candidate search |
 | Elements consensus and policy | Complete | Three full-contract chains, 15 market transactions plus one setup-funding transaction confirmed; every valid stage through `testmempoolaccept`, broadcast, mining, and confirmation; strict rerun adds a divergent-follower-stack transaction and rejects follower stacks transplanted into the coordinator input |
 | Confidential proofs | Complete | Creation/continuation/burn rangeproofs and complete-domain surjection proofs accepted live; missing and parseable-corrupt proofs rejected |
 | Golden integration identity | Complete | Constants, six fixture commitments, six independently derived nonuniform-ID commitments, CMR, eight scripts, and eight control blocks are literal regression vectors |
@@ -71,8 +83,8 @@ The CMR above is not universal across market parameters.
 | Composition/orchestration | Complete for v1 gate | Live confidential wallet input/change composition and deterministic synthetic two-market atomic indexing; the mandatory multi-contract liquidregtest gate mines and atomically indexes a real market-plus-two-orders transaction |
 | Full-market before/after measurements | Captured with provenance limitation | A/B reporter is reproducible; exact rolling rows are a preserved capture from temporary baseline instrumentation whose patch was not committed; the strict live rerun passed locally but its per-transaction raw JSON is not committed; isolated rolling/A-B study remains reproducible |
 | Rolling retirement | Complete | No rolling implementation, compatibility mode, study crate, or schema migration remains in the candidate tree |
-| Clean pinned-Nix CI | Passed on 2026-07-13; strict local rerun on 2026-07-22 | `nix develop path:.#default --command just ci`; rerun after freezing nonuniform commitment vectors; `nix develop .#default --command just ci-checks` validates the strict contract review update |
-| Independent implementation review | Complete for A/B vectors and pre-strict CMR; current strict CMR is regression-tested | Plain-integer scalar arithmetic, direct C libsecp256k1-zkp commitments, and isolated pinned-compiler CMR reproduction all matched on 2026-07-13; the strict CMR and eight scripts/control blocks are covered by committed golden vectors |
+| Clean pinned-Nix CI | Passed on 2026-07-13, 2026-07-22, and typed-action candidate on 2026-07-31 | `nix develop .#default --command just ci-checks` passes formatting, strict Clippy, 211 workspace tests, doc tests, and WASM; `just regtest-market-ab` passes the production-shaped live lifecycle |
+| Independent implementation review | Complete for A/B vectors and pre-strict CMR; current typed-action identity is regression-tested | Plain-integer scalar arithmetic, direct C libsecp256k1-zkp commitments, and isolated pinned-compiler CMR reproduction all matched on 2026-07-13; current CMRs and all eight scripts/control blocks are covered by committed golden vectors |
 | Focused external human review | Pending | Reviewer record below |
 | Protocol-owner approval | Complete | Tommy Volk; 2026-07-14; candidate implementation commit below |
 
@@ -104,7 +116,7 @@ nix develop path:.#default --command cargo test --locked \
 | nixpkgs revision | `50ab793786d9de88ee30ec4e4c24fb4236fc2674` |
 | rustc | `1.94.1 (e408947bf 2026-03-25)` |
 | Cargo | `1.94.0 (29ea6fb6a 2026-03-24)` |
-| Simplex CLI / smplx crates | `0.0.6` |
+| Simplex CLI / smplx crates | `0.0.9` |
 | Elements Core | `23.3.3` |
 | Electrs | `0.4.1` |
 | Original expanded live record | Passed, 44.81 seconds, 2026-07-13 |
@@ -124,9 +136,15 @@ confirmed setup-funding transaction, for 16 confirmed transactions total.
 The same production-shaped gate was rerun against the strict canonical
 contract on 2026-07-22: all 16 transactions confirmed, both malformed-proof
 variants were rejected, and a coordinator/follower pruning negative was rejected.
-Transaction identifiers are intentionally treated as run-local; the deterministic
-strict covenant metrics and CMR are recorded in the current measurement and
-golden-vector files.
+Transaction identifiers are intentionally treated as run-local. The preserved
+measurement file records that strict-covenant run; the typed-action candidate's
+current CMR and resource maxima are recorded in the golden vectors and PR3
+conformance note.
+
+The gate was rerun again against the typed-action candidate on 2026-07-31. All
+16 transactions confirmed across the three lifecycle chains, both malformed
+proofs were rejected, and transplanting a follower stack into the coordinator
+was rejected.
 
 | Chain | Stage | Side | Height | Txid |
 |---|---|---|---:|---|
@@ -231,7 +249,7 @@ The external reviewer should work from the recorded implementation commit:
   the group base from its own index, checks every required market input and the
   complete transition, and prohibits issuance on every market input when
   appropriate.
-- [ ] Confirm each follower ignores path/output witnesses yet requires its
+- [ ] Confirm each follower ignores `ACTION` yet requires its
   exact role, position, and sibling outpoints in the same coordinator group.
 - [ ] Confirm issuance binds the nonce to the input side for both legs.
 - [ ] Confirm rangeproof VBFs and the complete canonical surjection domain agree
@@ -261,7 +279,7 @@ for the focused human review above.
 | Field | Value |
 |---|---|
 | Independent vector method/result | Python big integers reproduced all CBF/VBF arithmetic; standalone C using upstream libsecp256k1-zkp reproduced the fixture and nonuniform-asset-ID commitment sets; isolated Simplex 0.0.6 build reproduced the pre-strict CMR; all matched on 2026-07-13 |
-| Automated implementation audit | No production A/B findings on 2026-07-13; no strict-contract production findings on 2026-07-22, with adversarial BitMachine/regtest coverage added |
+| Automated implementation audit | No production A/B findings on 2026-07-13; no strict-contract production findings on 2026-07-22; typed-action ABI/domain/interpreter review completed on 2026-07-31 with exact-decoder, adversarial BitMachine, and live-regtest coverage |
 | External reviewer | `<PENDING>` |
 | Commit reviewed | `<PENDING>` |
 | Review date | `<PENDING>` |

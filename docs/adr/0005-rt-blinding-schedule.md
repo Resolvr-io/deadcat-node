@@ -70,6 +70,15 @@ membership in the coordinator's market group. This does not alter the A/B
 blinding decision recorded here. It changes the parameterized golden CMR to
 `ebbd8f3001141120edb0880c8e14f40d2054018116627624fc31c1bcf73af473`.
 
+On 2026-07-31, still before deployment, redundant path, amount, redemption-side,
+and dummy oracle witness fields were replaced by an authenticated slot and a
+typed five-operation action sum. Transaction outputs now supply cancellation
+and redemption refinements. This also leaves the A/B decision unchanged and
+changes the current parameterized golden CMR to
+`e8912f8e5deb3c04ba47eaacacc8d194ae0473e35cee9e171b8a71e3513abca0`.
+The exact source and finalized witness shapes are recorded in the
+[PR3 conformance note](../binary-market-witness-conformance-pr3.md).
+
 ## Candidate schedule
 
 Let `n` be the secp256k1 group order. Use these fixed, valid, nonzero scalars:
@@ -280,7 +289,7 @@ The candidate is integrated across the production-shaped binary-market stack:
 - The lowest-index market input is the coordinator. It derives the market
   input base from its own index, checks the selected transition, every required
   market input, every issuance prohibition or exact reissuance field, and all
-  required outputs. Followers ignore transition witnesses but require their
+  required outputs. Followers do not consult `ACTION` but require their
   exact role, position, and coordinator-group outpoint relationship.
 
 - SimplicityHL receives the two asset commitments and one value commitment for

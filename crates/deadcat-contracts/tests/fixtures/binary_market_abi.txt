@@ -20,10 +20,5 @@ YES_RT_VALUE_PARITY: bool
 YES_RT_VALUE_X: u256
 YES_TOKEN_ASSET_ID: u256
 witnesses:
-ORACLE_OUTCOME_YES: bool
-ORACLE_SIGNATURE: [u8; 64]
-OUTPUT_BASE: u32
-PATH: u8
-REDEEM_YES: bool
+ACTION: Either<Either<u32, u32>, Either<(u32, bool, [u8; 64]), Either<u32, u32>>>
 SLOT: u8
-TOKENS_BURNED: u64
