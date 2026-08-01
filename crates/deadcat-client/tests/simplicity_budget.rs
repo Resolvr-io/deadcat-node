@@ -25,7 +25,7 @@ use elements::{AssetId, LockTime, OutPoint, Script, Sequence, TxOut, TxOutWitnes
 use serde::Serialize;
 use simplex::simplicityhl::simplicity::Cost;
 
-// Rounded CI ceilings with headroom above the typed-action maxima of 3,633,302
+// Rounded CI ceilings with headroom above the oracle-precomputed maxima of 3,633,302
 // mw, 72,462 cells, 62 frames, 4,339 stack bytes, 13,624 transaction bytes,
 // 15,574 WU, and 3,894 vB. The exact measurements are emitted by the test.
 const MAX_MARKET_COVENANT_COST_MILLIWEIGHT: u64 = 4_000_000;
@@ -1399,6 +1399,34 @@ fn market_coordinator_rejects_adversarial_solvency_and_authorization_mutations()
             )
             .is_err(),
         "coordinator accepted a valid NO attestation with a YES continuation"
+    );
+
+    let (no_resolution_plan, _, no_resolution) = finalized_market_fixture(
+        &compiled,
+        active,
+        resolve_no,
+        RtSide::A,
+        input_base,
+        output_base,
+    );
+    let yes_signature_for_no = direct_market_witness(
+        &no_resolution_plan,
+        resolve_no,
+        resolution_attestation,
+        coordinator,
+        output_base,
+    );
+    assert!(
+        compiled
+            .execute(
+                coordinator,
+                &no_resolution,
+                &yes_signature_for_no.build_witness(),
+                input_base,
+                &network,
+            )
+            .is_err(),
+        "coordinator accepted a valid YES signature for the NO message"
     );
 
     let mut wrong_resolution_collateral = resolution.clone();

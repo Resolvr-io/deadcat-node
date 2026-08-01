@@ -154,6 +154,8 @@ static instance facts such as:
 
 - valid and distinct collateral, outcome-token, and RT asset identities;
 - a valid oracle public key;
+- correct derivation of both oracle messages from the outcome-token identities
+  and the protocol domain;
 - correct derivation of the public RT commitments from the RT asset IDs;
 - a positive base payout whose per-pair collateral is representable; and
 - an expiry value with the advertised block-height semantics.

@@ -2,7 +2,7 @@
 
 - Status: Engineering candidate complete; protocol-owner approved; focused external review pending
 - Prepared: 2026-07-13; strict coordinator hardening updated 2026-07-22;
-  typed-action ABI candidate updated 2026-07-31
+  typed-action ABI and oracle-precomputed candidates updated 2026-07-31
 - Protocol-owner approval: Tommy Volk; 2026-07-14
 - Decision record: [ADR 0005](../adr/0005-rt-blinding-schedule.md)
 - Protocol specification: [Deadcat protocol v1](../protocol-v1.md)
@@ -27,8 +27,14 @@ The still-undeployed v1 covenant was subsequently simplified to a typed
 five-operation `ACTION` sum plus authenticated `SLOT`. Path variants, burn
 quantity, redemption side, and dummy oracle fields are derived from the slot,
 semantic action, and mandatory transaction outputs. The exact branch-pruned
-decoder and current identity are recorded in the
+decoder and historical typed-action identity are recorded in the
 [PR3 witness conformance note](../binary-market-witness-conformance-pr3.md).
+
+The compiler subsequently moved the two fixed oracle-message derivations to
+compile time. The signed bytes and public market parameters are unchanged; the
+covenant selects the derived YES or NO digest before BIP340 verification. The
+exact vectors and measurements are recorded in the
+[oracle-precomputation note](../binary-market-oracle-precomputation.md).
 
 ADR 0005 remains Proposed until a focused reviewer records a conclusion. Tommy
 Volk approved every protocol-owner choice below on 2026-07-14 against the
@@ -41,7 +47,7 @@ For the golden fixture in `deadcat-contracts/tests/golden_vectors.rs`, the
 parameterized binary-market CMR is:
 
 ```text
-e8912f8e5deb3c04ba47eaacacc8d194ae0473e35cee9e171b8a71e3513abca0
+702f5d04f15bcdec3fa1070540bf2f68c0ecdcf40bc8aa8024e1e77ef19cd5ee
 ```
 
 The v1 consensus scalars are big-endian 32-byte integers:
@@ -61,7 +67,9 @@ IDs so an accidental Elements display-order reversal cannot pass unnoticed.
 The CMR above is not universal across market parameters. The prior strict
 coordinator/follower implementation compiled this fixture to
 `ebbd8f3001141120edb0880c8e14f40d2054018116627624fc31c1bcf73af473`;
-that value remains historical evidence rather than the current candidate.
+the typed-action implementation then compiled it to
+`e8912f8e5deb3c04ba47eaacacc8d194ae0473e35cee9e171b8a71e3513abca0`.
+Those values remain historical evidence rather than the current candidate.
 
 ## Engineering evidence
 
@@ -75,6 +83,7 @@ that value remains historical evidence rather than the current candidate.
 | Input-side reissuance nonce | Complete | Covenant/builder/interpreter adversarial tests and live A/B issuances inspect the exact nonce |
 | Every lifecycle shape | Complete | All 18 builder/BitMachine/interpreter shapes execute; every RT-consuming shape executes on both A and B, every sibling, with sufficient Simplicity budget; direct mutation tests cover solvency, issuance authority, terminal burns, oracle/expiry, redemption arithmetic, wrong slots, and follower source-witness independence |
 | Typed semantic action ABI | Complete | Golden source ABI contains only `SLOT` and the five-branch `ACTION`; checked Rust facades prevent invalid role/action layouts; exact finalized decoding rejects missing, duplicate, unexpected, or near-miss structural values without width scans or candidate search |
+| Static oracle-message derivation | Complete | The canonical compiler derives both digests from the outcome asset IDs; literal nonuniform vectors freeze byte order and outcome tags; active/dormant YES/NO execution plus corrupt and cross-outcome signatures exercise selection and verification |
 | Elements consensus and policy | Complete | Three full-contract chains, 15 market transactions plus one setup-funding transaction confirmed; every valid stage through `testmempoolaccept`, broadcast, mining, and confirmation; strict rerun adds a divergent-follower-stack transaction and rejects follower stacks transplanted into the coordinator input |
 | Confidential proofs | Complete | Creation/continuation/burn rangeproofs and complete-domain surjection proofs accepted live; missing and parseable-corrupt proofs rejected |
 | Golden integration identity | Complete | Constants, six fixture commitments, six independently derived nonuniform-ID commitments, CMR, eight scripts, and eight control blocks are literal regression vectors |
@@ -83,8 +92,8 @@ that value remains historical evidence rather than the current candidate.
 | Composition/orchestration | Complete for v1 gate | Live confidential wallet input/change composition and deterministic synthetic two-market atomic indexing; the mandatory multi-contract liquidregtest gate mines and atomically indexes a real market-plus-two-orders transaction |
 | Full-market before/after measurements | Captured with provenance limitation | A/B reporter is reproducible; exact rolling rows are a preserved capture from temporary baseline instrumentation whose patch was not committed; the strict live rerun passed locally but its per-transaction raw JSON is not committed; isolated rolling/A-B study remains reproducible |
 | Rolling retirement | Complete | No rolling implementation, compatibility mode, study crate, or schema migration remains in the candidate tree |
-| Clean pinned-Nix CI | Passed on 2026-07-13, 2026-07-22, and typed-action candidate on 2026-07-31 | `nix develop .#default --command just ci-checks` passes formatting, strict Clippy, 211 workspace tests, doc tests, and WASM; `just regtest-market-ab` passes the production-shaped live lifecycle |
-| Independent implementation review | Complete for A/B vectors and pre-strict CMR; current typed-action identity is regression-tested | Plain-integer scalar arithmetic, direct C libsecp256k1-zkp commitments, and isolated pinned-compiler CMR reproduction all matched on 2026-07-13; current CMRs and all eight scripts/control blocks are covered by committed golden vectors |
+| Clean pinned-Nix CI | Passed on 2026-07-13, 2026-07-22, and the typed-action and oracle-precomputed candidates on 2026-07-31 | `nix develop .#default --command just ci` passes formatting, strict Clippy, 211 workspace tests, doc tests, WASM, the complete market lifecycle, multi-market indexing/reorg/rebuild, backend equivalence, and daemon/CLI process-boundary gates |
+| Independent implementation review | Complete for A/B vectors and pre-strict CMR; current oracle-precomputed identity is regression-tested | Plain-integer scalar arithmetic, direct C libsecp256k1-zkp commitments, and isolated pinned-compiler CMR reproduction all matched on 2026-07-13; current message digests, CMRs, and all eight scripts/control blocks are covered by committed golden vectors |
 | Focused external human review | Pending | Reviewer record below |
 | Protocol-owner approval | Complete | Tommy Volk; 2026-07-14; candidate implementation commit below |
 
@@ -138,13 +147,19 @@ contract on 2026-07-22: all 16 transactions confirmed, both malformed-proof
 variants were rejected, and a coordinator/follower pruning negative was rejected.
 Transaction identifiers are intentionally treated as run-local. The preserved
 measurement file records that strict-covenant run; the typed-action candidate's
-current CMR and resource maxima are recorded in the golden vectors and PR3
-conformance note.
+historical CMR and witness ABI are recorded in the PR3 conformance note.
 
 The gate was rerun again against the typed-action candidate on 2026-07-31. All
 16 transactions confirmed across the three lifecycle chains, both malformed
 proofs were rejected, and transplanting a follower stack into the coordinator
 was rejected.
+
+The complete `just ci` gate was rerun after oracle-message precomputation on
+2026-07-31. The same 16-transaction lifecycle and three negative cases passed;
+the multi-market indexing/reorg/rebuild, Elements/Esplora equivalence, and
+daemon/CLI process-boundary gates also passed. Current CMRs, oracle vectors, and
+resource measurements are recorded in the
+[oracle-precomputation note](../binary-market-oracle-precomputation.md).
 
 | Chain | Stage | Side | Height | Txid |
 |---|---|---|---:|---|
@@ -256,8 +271,17 @@ The external reviewer should work from the recorded implementation commit:
   with Elements serialization and proof APIs.
 - [ ] Confirm Rust builder/interpreter, node registration, and independent
   client replay fail closed on the same commitment/side shapes.
-- [ ] Reproduce the CMR and review the covenant/witness diff from
-  `ed6de4c4c8a177b4a4ba92c2bac17f55b324781f`.
+- [ ] Independently derive the YES and NO oracle digests from nonuniform outcome
+  asset IDs, including consensus byte order, the domain tag, and `0x01`/`0x00`
+  outcome bytes. Confirm the canonical host compiler binds exactly those
+  digests and the covenant selects the matching digest before BIP340
+  verification.
+- [ ] Reproduce the current CMR and review the covenant/witness diff from
+  `ed6de4c4c8a177b4a4ba92c2bac17f55b324781f`, including the typed-action CMR
+  `e8912f8e5deb3c04ba47eaacacc8d194ae0473e35cee9e171b8a71e3513abca0`
+  to oracle-precomputed CMR
+  `702f5d04f15bcdec3fa1070540bf2f68c0ecdcf40bc8aa8024e1e77ef19cd5ee`
+  transition.
 - [ ] Reproduce the current A/B full-market rows. If acceptance depends on the
   exact rolling full-market percentages, reconstruct and review equivalent
   instrumentation at `ed6de4c...`; otherwise record acceptance of the preserved
@@ -279,14 +303,14 @@ for the focused human review above.
 | Field | Value |
 |---|---|
 | Independent vector method/result | Python big integers reproduced all CBF/VBF arithmetic; standalone C using upstream libsecp256k1-zkp reproduced the fixture and nonuniform-asset-ID commitment sets; isolated Simplex 0.0.6 build reproduced the pre-strict CMR; all matched on 2026-07-13 |
-| Automated implementation audit | No production A/B findings on 2026-07-13; no strict-contract production findings on 2026-07-22; typed-action ABI/domain/interpreter review completed on 2026-07-31 with exact-decoder, adversarial BitMachine, and live-regtest coverage |
+| Automated implementation audit | No production A/B findings on 2026-07-13; no strict-contract production findings on 2026-07-22; typed-action ABI/domain/interpreter and oracle-precomputation reviews completed on 2026-07-31 with exact-decoder, digest-vector, adversarial BitMachine, and complete live-regtest coverage |
 | External reviewer | `<PENDING>` |
 | Commit reviewed | `<PENDING>` |
 | Review date | `<PENDING>` |
 | Findings and dispositions | `<PENDING>` |
 | Reviewer conclusion | `<PENDING>` |
 
-- [x] Clean pinned-Nix CI is recorded against the candidate and strict contract commits.
+- [x] Clean pinned-Nix CI is recorded through the oracle-precomputed candidate.
 - [ ] Every focused-review finding has a disposition.
 - [x] Every protocol-owner checkbox is checked.
 - [ ] ADR 0005 is changed from Proposed to Accepted only after those reviews.
@@ -295,6 +319,7 @@ for the focused human review above.
 |---|---|---|---|---|
 | Implementation owner | Codex candidate | 2026-07-13 | `7ed20b8b81306eaf81ee49b80b4ea65b49804871` | Engineering-complete |
 | Implementation owner | Codex strict hardening review | 2026-07-22 | `044fdf07d92217df7ad794ff2a9dff0fc9ae62b2` | Engineering-complete; external review still pending |
+| Implementation owner | Codex oracle precomputation | 2026-07-31 | This pull request head | Engineering-complete; external review still pending |
 | External reviewer | `<PENDING>` | `<PENDING>` | `<PENDING>` | `<PENDING>` |
 | Protocol owner | Tommy Volk | 2026-07-14 | `7ed20b8b81306eaf81ee49b80b4ea65b49804871` | Approved |
 

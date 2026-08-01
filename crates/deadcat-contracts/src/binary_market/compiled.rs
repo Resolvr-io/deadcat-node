@@ -27,6 +27,7 @@ use thiserror::Error;
 use super::{BinaryMarketEconomics, BinaryMarketParams, BinaryMarketSlot};
 use crate::artifacts::binary_market::{BinaryMarketProgram, derived_binary_market};
 use crate::finalized_spend::{FinalizedSimplicitySpend, FinalizedSimplicitySpendError};
+use crate::market_crypto::{BinaryOutcome as OracleOutcome, oracle_message};
 use crate::rt::{RtCommitmentError, RtLeg, RtSide, commitments, factors};
 
 const NUMS_INTERNAL_KEY: [u8; 32] = [
@@ -439,8 +440,20 @@ fn contract_arguments(
 ) -> Result<derived_binary_market::BinaryMarketArguments, CompiledBinaryMarketError> {
     let yes = rt_commitment_arguments(params.yes_reissuance_token_id, RtLeg::Yes)?;
     let no = rt_commitment_arguments(params.no_reissuance_token_id, RtLeg::No)?;
+    let oracle_message_yes = oracle_message(
+        params.yes_token_asset_id,
+        params.no_token_asset_id,
+        OracleOutcome::Yes,
+    );
+    let oracle_message_no = oracle_message(
+        params.yes_token_asset_id,
+        params.no_token_asset_id,
+        OracleOutcome::No,
+    );
     Ok(derived_binary_market::BinaryMarketArguments {
         oracle_public_key: params.oracle_public_key,
+        oracle_message_yes,
+        oracle_message_no,
         collateral_asset_id: params.collateral_asset_id.into_inner().to_byte_array(),
         yes_token_asset_id: params.yes_token_asset_id.into_inner().to_byte_array(),
         no_token_asset_id: params.no_token_asset_id.into_inner().to_byte_array(),
@@ -901,6 +914,22 @@ mod tests {
             params.oracle_public_key
         );
         assert_eq!(
+            compiled.arguments.oracle_message_yes,
+            oracle_message(
+                params.yes_token_asset_id,
+                params.no_token_asset_id,
+                OracleOutcome::Yes,
+            )
+        );
+        assert_eq!(
+            compiled.arguments.oracle_message_no,
+            oracle_message(
+                params.yes_token_asset_id,
+                params.no_token_asset_id,
+                OracleOutcome::No,
+            )
+        );
+        assert_eq!(
             compiled.arguments.collateral_asset_id,
             params.collateral_asset_id.into_inner().to_byte_array()
         );
@@ -1014,9 +1043,9 @@ mod tests {
         assert_eq!(
             first.cmr(),
             [
-                0xe8, 0x91, 0x2f, 0x8e, 0x5d, 0xeb, 0x3c, 0x04, 0xba, 0x47, 0xea, 0xac, 0xac, 0xc8,
-                0xd1, 0x94, 0xae, 0x04, 0x73, 0xe3, 0x5c, 0xee, 0x9e, 0x17, 0x1b, 0x8a, 0x71, 0xe3,
-                0x51, 0x3a, 0xbc, 0xa0,
+                0x70, 0x2f, 0x5d, 0x04, 0xf1, 0x5b, 0xcd, 0xec, 0x3f, 0xa1, 0x07, 0x05, 0x40, 0xbf,
+                0x2f, 0x68, 0xc0, 0xec, 0xdc, 0xf4, 0x0b, 0xc8, 0xaa, 0x80, 0x24, 0xe1, 0xe7, 0x7e,
+                0xf1, 0x9c, 0xd5, 0xee,
             ]
         );
 
