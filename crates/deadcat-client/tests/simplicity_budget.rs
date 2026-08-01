@@ -25,9 +25,9 @@ use elements::{AssetId, LockTime, OutPoint, Script, Sequence, TxOut, TxOutWitnes
 use serde::Serialize;
 use simplex::simplicityhl::simplicity::Cost;
 
-// Rounded CI ceilings with headroom above the oracle-precomputed maxima of 3,633,302
-// mw, 72,462 cells, 62 frames, 4,339 stack bytes, 13,624 transaction bytes,
-// 15,574 WU, and 3,894 vB. The exact measurements are emitted by the test.
+// Rounded CI ceilings with headroom above the legibility-refactor maxima of 3,635,230
+// mw, 73,049 cells, 64 frames, 4,371 stack bytes, 13,656 transaction bytes,
+// 15,606 WU, and 3,902 vB. The exact measurements are emitted by the test.
 const MAX_MARKET_COVENANT_COST_MILLIWEIGHT: u64 = 4_000_000;
 const MAX_MARKET_INPUT_EXTRA_CELLS: usize = 80_000;
 const MAX_MARKET_INPUT_EXTRA_FRAMES: usize = 70;
@@ -1738,7 +1738,7 @@ fn market_followers_ignore_transition_witnesses_but_require_the_exact_coordinato
         ),
     ];
     for (wrong_layout, wrong_action, label) in wrong_layouts {
-        let witness = BinaryMarketWitness::for_slot(
+        let coordinator_witness = BinaryMarketWitness::for_slot(
             wrong_layout,
             BinaryMarketSlot::UnresolvedYesRt,
             wrong_action,
@@ -1749,13 +1749,39 @@ fn market_followers_ignore_transition_witnesses_but_require_the_exact_coordinato
                 .execute(
                     BinaryMarketSlot::UnresolvedYesRt,
                     &active_pset,
-                    &witness.build_witness(),
+                    &coordinator_witness.build_witness(),
                     input_base,
                     &network,
                 )
                 .is_err(),
             "coordinator accepted cancellation transaction under {label} action"
         );
+
+        for (offset, follower_slot) in [
+            BinaryMarketSlot::UnresolvedNoRt,
+            BinaryMarketSlot::UnresolvedCollateral,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let follower_witness =
+                BinaryMarketWitness::for_slot(wrong_layout, follower_slot, wrong_action)
+                    .expect("structurally divergent follower witness");
+            compiled
+                .execute(
+                    follower_slot,
+                    &active_pset,
+                    &follower_witness.build_witness(),
+                    input_base + offset + 1,
+                    &network,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "ACTION-independent follower {follower_slot:?} rejected {label} action: \
+                         {error}"
+                    )
+                });
+        }
     }
 
     for (offset, slot) in active_slots.into_iter().enumerate() {
