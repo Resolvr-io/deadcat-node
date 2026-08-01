@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 use deadcat_contracts::binary_market::{
     BinaryMarketProgram, BinaryMarketSlot, CompiledBinaryMarket,
 };
+use deadcat_contracts::market_crypto::{BinaryOutcome as OracleOutcome, oracle_message};
 use deadcat_contracts::rt::{ABF_A, ABF_B, RtLeg, RtSide, YES_CBF, commitments, factors, no_cbf};
 use deadcat_types::BinaryMarketParams;
 use elements::AssetId;
@@ -73,10 +74,27 @@ fn nonuniform_contract_arguments_compile_to_stable_cmr() {
     // Every asset byte is position-sensitive. This golden therefore changes if
     // `contract_arguments` accidentally substitutes display order for consensus
     // byte order before compiling the parameterized program.
-    let compiled = CompiledBinaryMarket::new(nonuniform_params()).expect("compile market");
+    let params = nonuniform_params();
+    assert_eq!(
+        hex(&oracle_message(
+            params.yes_token_asset_id,
+            params.no_token_asset_id,
+            OracleOutcome::Yes,
+        )),
+        "0091d6c79a16ced37737ac34a7a461359d93ce1eebebca50eefd9197a1bc0876"
+    );
+    assert_eq!(
+        hex(&oracle_message(
+            params.yes_token_asset_id,
+            params.no_token_asset_id,
+            OracleOutcome::No,
+        )),
+        "10c3d52c18c0a9d2d1d9cd90dc1ae4537ad53cf2e2a4e980b5dd4f04b5f1263e"
+    );
+    let compiled = CompiledBinaryMarket::new(params).expect("compile market");
     assert_eq!(
         hex(&compiled.cmr()),
-        "2d350901b53cfeb3204f97e7708980fd62bf24914bf8e4aafb6530ce025dbb7f"
+        "090548f91e2f07d2e691216336b578bf15fcdbde96f2e4255e4e70c60e4c1931"
     );
 }
 
@@ -225,40 +243,40 @@ fn sample_binary_market_consensus_vectors_are_stable() {
     let compiled = CompiledBinaryMarket::new(params).expect("compile market");
     assert_eq!(
         hex(&compiled.cmr()),
-        "e8912f8e5deb3c04ba47eaacacc8d194ae0473e35cee9e171b8a71e3513abca0"
+        "702f5d04f15bcdec3fa1070540bf2f68c0ecdcf40bc8aa8024e1e77ef19cd5ee"
     );
     let expected_slots = [
         (
-            "51203fbf4e0e02df806affc1f0c66180a2d49b2ec03e1848a5ab326700157a7a15bd",
+            "512001d36e8c57cfcd1f3c2f17fb588985f8dcd5834e9938c4f7d35e3ef2a4e5acf7",
             "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac03491a3e42d2db13335d900b3cbadcb0d5088b4eb9073869ff309910862294069",
         ),
         (
-            "51206126a2324335d42fe5b9998579b9187b2b6af2a1ffa3e9e10042fc856ebc708c",
-            "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac09c44e27f20b80c93313762a6f4e71fc82db38469d90f902bc1720755b61660f3",
+            "5120d33c3880d2a6c1fb3a95b359fd7d602a793a10e2af5da30806685bb2c50c8390",
+            "bf50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac09c44e27f20b80c93313762a6f4e71fc82db38469d90f902bc1720755b61660f3",
         ),
         (
-            "5120a252a8b117ebdd1bf207f98a6c2034344119d492f84d03e7052c103c1dfad71b",
+            "51208e9a829d1fb7d7c0cb19d524cb469dbe4e248744304f60c1bb487676ba660de5",
             "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac04bbdde171ae4fa8cfe1c7790ec1d737b4044251c647103b3e2c320a25a8b61e2",
         ),
         (
-            "51207bea2e337f0bb4f7235a16a61b8aa2935fcbc011d423ebcda8c3f0f7d4456d35",
+            "5120a4e68ecf6a94a73272c75e2023f9ab3cd3fd1ce0e86e5556540ce33bec5739b1",
             "bf50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac013169a5cae722314cc26e3f278b4f9d087affe9b0dab437d6d8c2b28ace343d0",
         ),
         (
-            "5120b1920be3d3c368dd49067dd3958bd1c5c79af3166ba5534d34ddf2a6e087e68a",
+            "51208745d41c870ac38b4aa9d9c9bf345f160a9e82f1691daa50216a79a224b6b7ea",
             "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac04b7b02768d8d3b9339bfd3417355db78cada99eb21f1e32873b3ab77065ee015",
         ),
         (
-            "5120fccd0ab4351768ecf55fbf7cbe2bb65591845bdc13978e8b5832de33f87afa74",
-            "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac094c17910e4ec9a08d1a445308fd4b66ee01cc818d1772a8deff59dd38b649bee",
+            "512098e5b0dc5969b4f0716f179507d882026857b84f507692da10d258081ff979f1",
+            "bf50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac094c17910e4ec9a08d1a445308fd4b66ee01cc818d1772a8deff59dd38b649bee",
         ),
         (
-            "51206b247f70cbae80525455896174fb5d3129d417b224418650bd7d6e444dd8a4c7",
-            "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0838594e38820be8487ed62ea7663c1d3ce2f20b3f0c7d8075b1bd3f436239d25",
+            "5120ba9e2e04ae3c5b62b8a2eba46eddb764d7d2038f2640a6db0654ee9d52e793ac",
+            "bf50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0838594e38820be8487ed62ea7663c1d3ce2f20b3f0c7d8075b1bd3f436239d25",
         ),
         (
-            "51208e44c81c10c744ea9d5ab30469e1c1510e5a67c08c42a10db2973c9f876f91bb",
-            "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac03efb3634a85ea11aa3a246775edf9406ff088af069350d5b8a4ef7a9f862ae0c",
+            "51200a566889ec9ce31dea29985827ae10915373de02c609285b4d735b04880d7338",
+            "bf50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac03efb3634a85ea11aa3a246775edf9406ff088af069350d5b8a4ef7a9f862ae0c",
         ),
     ];
     for (slot, (script, control_block)) in BinaryMarketSlot::ALL.into_iter().zip(expected_slots) {

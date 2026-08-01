@@ -479,6 +479,12 @@ outcome_byte = 0x01 for YES
 outcome_byte = 0x00 for NO
 ```
 
+The canonical compiler derives both possible messages from the outcome asset
+IDs and binds them as internal program arguments. They are not independently
+selectable market parameters. At resolution, the covenant selects the bound
+digest from `outcome_yes` and verifies the BIP340 signature; this preserves the
+message format above while avoiding repeated SHA work at spend time.
+
 The oracle supplies a BIP-340 signature under `oracle_public_key`.
 
 ### Fixed A/B RT construction

@@ -79,6 +79,15 @@ changes the current parameterized golden CMR to
 The exact source and finalized witness shapes are recorded in the
 [PR3 conformance note](../binary-market-witness-conformance-pr3.md).
 
+Later on 2026-07-31, the canonical compiler began deriving and binding the YES
+and NO oracle messages from the outcome asset IDs. The covenant now selects one
+of those messages before BIP340 verification instead of rebuilding the market
+ID and tagged hash during every resolution spend. This preserves the oracle
+protocol and A/B decision while changing the current parameterized golden CMR
+to `702f5d04f15bcdec3fa1070540bf2f68c0ecdcf40bc8aa8024e1e77ef19cd5ee`.
+The exact derived-message vectors and resource bounds are recorded in the
+[oracle-precomputation note](../binary-market-oracle-precomputation.md).
+
 ## Candidate schedule
 
 Let `n` be the secp256k1 group order. Use these fixed, valid, nonzero scalars:
@@ -160,6 +169,11 @@ These are derived compilation inputs, not independently selectable public
 market parameters. Clients and nodes recompile them from the RT asset IDs and
 the constants above. Prebinding removes runtime curve generation and outpoint
 hashing while preserving the normal CMR/script verification trust model.
+
+The compiler likewise derives and binds the two possible oracle messages from
+the outcome asset IDs and fixed oracle domain. Clients and nodes independently
+derive the same messages during recompilation; the covenant merely selects the
+outcome-specific digest and verifies the supplied signature.
 
 Off-chain code exposes typed `RtLeg` and `RtSide` values and derives
 factors from them. A live RT is accepted only after its raw `TxOut` matches one

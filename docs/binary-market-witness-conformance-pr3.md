@@ -91,12 +91,16 @@ output-base selection and independently invalid transaction shapes.
 
 ## Candidate identity and resource bounds
 
-For the canonical golden parameter fixture, this refactor produces CMR
+For the canonical golden parameter fixture, this refactor originally produced CMR
 `e8912f8e5deb3c04ba47eaacacc8d194ae0473e35cee9e171b8a71e3513abca0`.
-The nonuniform-asset fixture produces
+The nonuniform-asset fixture originally produced
 `2d350901b53cfeb3204f97e7708980fd62bf24914bf8e4aafb6530ce025dbb7f`.
-The golden-vector suite pins both CMRs, the source ABI, and all eight resulting
-Taproot script/control-block pairs.
+A later semantic-preserving compiler change precomputed the two oracle messages,
+changing the current CMRs while retaining this witness ABI. The current identity
+and derived-message vectors are recorded in the
+[oracle-precomputation note](binary-market-oracle-precomputation.md). The
+golden-vector suite pins both current CMRs, the source ABI, and all eight
+resulting Taproot script/control-block pairs.
 
 The all-path, both-RT-side budget corpus records these current maxima:
 
@@ -110,5 +114,6 @@ The all-path, both-RT-side budget corpus records these current maxima:
 | Transaction weight | 15,574 WU |
 | Transaction vsize | 3,894 vB |
 
-CI uses rounded ceilings above these measurements and fails if a later compiler
-or covenant change crosses them.
+These overall maxima remain current after oracle-message precomputation because
+non-resolution paths determine them. CI uses rounded ceilings above the
+measurements and fails if a later compiler or covenant change crosses them.
