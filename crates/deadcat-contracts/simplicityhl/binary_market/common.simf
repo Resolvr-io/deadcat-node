@@ -1,0 +1,301 @@
+// Shared boolean, arithmetic, transaction, and slot helpers.
+
+// -----------------------------------------------------------------------------
+// Boolean and arithmetic helpers
+// -----------------------------------------------------------------------------
+
+pub fn not(bit: bool) -> bool {
+    <u1>::into(jet::complement_1(<bool>::into(bit)))
+}
+
+pub fn or(a: bool, b: bool) -> bool {
+    <u1>::into(jet::or_1(<bool>::into(a), <bool>::into(b)))
+}
+
+pub fn and(a: bool, b: bool) -> bool {
+    <u1>::into(jet::and_1(<bool>::into(a), <bool>::into(b)))
+}
+
+pub fn safe_add_32(a: u32, b: u32) -> u32 {
+    let (carry, sum): (bool, u32) = jet::add_32(a, b);
+    assert!(not(carry));
+    sum
+}
+
+fn safe_subtract_32(a: u32, b: u32) -> u32 {
+    let (borrow, difference): (bool, u32) = jet::subtract_32(a, b);
+    assert!(not(borrow));
+    difference
+}
+
+pub fn safe_add(a: u64, b: u64) -> u64 {
+    let (carry, sum): (bool, u64) = jet::add_64(a, b);
+    assert!(not(carry));
+    sum
+}
+
+pub fn safe_subtract(a: u64, b: u64) -> u64 {
+    let (borrow, difference): (bool, u64) = jet::subtract_64(a, b);
+    assert!(not(borrow));
+    difference
+}
+
+pub fn safe_multiply(a: u64, b: u64) -> u64 {
+    let product: u128 = jet::multiply_64(a, b);
+    let (high, low): (u64, u64) = <u128>::into(product);
+    assert!(jet::is_zero_64(high));
+    low
+}
+
+pub fn ensure_nonzero(value: u64) {
+    assert!(not(jet::is_zero_64(value)));
+}
+
+fn collateral_per_pair() -> u64 {
+    safe_multiply(param::BASE_PAYOUT, 2)
+}
+
+pub fn collateral_for_pairs(pairs: u64) -> u64 {
+    safe_multiply(pairs, collateral_per_pair())
+}
+
+// -----------------------------------------------------------------------------
+// Transaction inspection
+// -----------------------------------------------------------------------------
+
+fn get_input_script_hash(index: u32) -> u256 {
+    unwrap(jet::input_script_hash(index))
+}
+
+fn get_output_script_hash(index: u32) -> u256 {
+    unwrap(jet::output_script_hash(index))
+}
+
+pub fn ensure_input_script(index: u32, expected: u256) {
+    assert!(jet::eq_256(get_input_script_hash(index), expected));
+}
+
+pub fn ensure_output_script(index: u32, expected: u256) {
+    assert!(jet::eq_256(get_output_script_hash(index), expected));
+}
+
+fn get_input_explicit(index: u32) -> (u256, u64) {
+    let (asset, amount): (Asset1, Amount1) = unwrap(jet::input_amount(index));
+    let explicit_asset: u256 = unwrap_right::<(u1, u256)>(asset);
+    let explicit_amount: u64 = unwrap_right::<(u1, u256)>(amount);
+    (explicit_asset, explicit_amount)
+}
+
+pub fn get_output_explicit(index: u32) -> (u256, u64) {
+    let (asset, amount): (Asset1, Amount1) = unwrap(jet::output_amount(index));
+    let explicit_asset: u256 = unwrap_right::<(u1, u256)>(asset);
+    let explicit_amount: u64 = unwrap_right::<(u1, u256)>(amount);
+    (explicit_asset, explicit_amount)
+}
+
+pub fn ensure_input_explicit(index: u32, expected_asset: u256) -> u64 {
+    let (asset, amount): (u256, u64) = get_input_explicit(index);
+    assert!(jet::eq_256(asset, expected_asset));
+    amount
+}
+
+pub fn ensure_output_explicit(index: u32, expected_asset: u256, expected_amount: u64) {
+    let (asset, amount): (u256, u64) = get_output_explicit(index);
+    assert!(jet::eq_256(asset, expected_asset));
+    assert!(jet::eq_64(amount, expected_amount));
+}
+
+pub fn ensure_no_issuance(index: u32) {
+    let asset_amount: Option<Amount1> = unwrap(jet::issuance_asset_amount(index));
+    let token_amount: Option<Amount1> = unwrap(jet::issuance_token_amount(index));
+    let entropy: Option<u256> = unwrap(jet::issuance_entropy(index));
+    assert!(is_none::<Amount1>(asset_amount));
+    assert!(is_none::<Amount1>(token_amount));
+    assert!(is_none::<u256>(entropy));
+}
+
+fn rt_abf_a() -> u256 {
+    0x0101010101010101010101010101010101010101010101010101010101010101
+}
+
+fn rt_abf_b() -> u256 {
+    0x0202020202020202020202020202020202020202020202020202020202020202
+}
+
+pub fn ensure_reissuance(
+    index: u32,
+    expected_asset: u256,
+    expected_rt: u256,
+    input_is_a: bool,
+) -> u64 {
+    let issued_asset: u256 = unwrap(unwrap(jet::issuance_asset(index)));
+    let issuance_token: u256 = unwrap(unwrap(jet::issuance_token(index)));
+    assert!(jet::eq_256(issued_asset, expected_asset));
+    assert!(jet::eq_256(issuance_token, expected_rt));
+
+    let amount: u64 = unwrap_right::<(u1, u256)>(
+        unwrap(unwrap(jet::issuance_asset_amount(index)))
+    );
+    // Elements exposes the token amount of a reissuance as
+    // Some(Explicit(0)), not None. Requiring that exact semantic value rejects
+    // a new issuance, a confidential amount, and any nonzero token issuance.
+    let token_amount: u64 = unwrap_right::<(u1, u256)>(
+        unwrap(unwrap(jet::issuance_token_amount(index)))
+    );
+    assert!(jet::is_zero_64(token_amount));
+    let reissuance_blinding: u256 = unwrap(unwrap(jet::reissuance_blinding(index)));
+    let expected_blinding: u256 = match input_is_a {
+        true => rt_abf_a(),
+        false => rt_abf_b(),
+    };
+    assert!(jet::eq_256(reissuance_blinding, expected_blinding));
+    ensure_nonzero(amount);
+    amount
+}
+
+fn burn_script_hash() -> u256 {
+    // SHA256(0x6a), where 0x6a is the complete bare OP_RETURN script.
+    0x189f40034be7a199f1fa9891668ee3ab6049f82d38c68be70f596eab2e1857b7
+}
+
+pub fn ensure_burn_script(index: u32) {
+    ensure_output_script(index, burn_script_hash());
+}
+
+pub fn explicit_burn_amount(index: u32, expected_asset: u256) -> u64 {
+    let (asset, amount): (u256, u64) = get_output_explicit(index);
+    assert!(jet::eq_256(asset, expected_asset));
+    ensure_nonzero(amount);
+    ensure_burn_script(index);
+    amount
+}
+
+pub fn market_token_burn(index: u32) -> (bool, u64) {
+    let (asset, amount): (u256, u64) = get_output_explicit(index);
+    let burns_yes: bool = jet::eq_256(asset, param::YES_TOKEN_ASSET_ID);
+    match burns_yes {
+        true => assert!(jet::eq_256(asset, param::YES_TOKEN_ASSET_ID)),
+        false => assert!(jet::eq_256(asset, param::NO_TOKEN_ASSET_ID)),
+    };
+    ensure_nonzero(amount);
+    ensure_burn_script(index);
+    (burns_yes, amount)
+}
+
+pub fn ensure_current_index(expected: u32) {
+    assert!(jet::eq_32(jet::current_index(), expected));
+}
+
+fn ensure_same_previous_transaction_2(first: u32, second: u32) {
+    let (first_txid, first_vout): (u256, u32) = unwrap(jet::input_prev_outpoint(first));
+    let (second_txid, second_vout): (u256, u32) = unwrap(jet::input_prev_outpoint(second));
+    assert!(jet::eq_256(first_txid, second_txid));
+}
+
+fn ensure_same_previous_transaction_3(first: u32, second: u32, third: u32) {
+    let (first_txid, first_vout): (u256, u32) = unwrap(jet::input_prev_outpoint(first));
+    let (second_txid, second_vout): (u256, u32) = unwrap(jet::input_prev_outpoint(second));
+    let (third_txid, third_vout): (u256, u32) = unwrap(jet::input_prev_outpoint(third));
+    assert!(jet::eq_256(first_txid, second_txid));
+    assert!(jet::eq_256(first_txid, third_txid));
+    assert!(jet::eq_32(second_vout, safe_add_32(first_vout, 1)));
+    assert!(jet::eq_32(third_vout, safe_add_32(first_vout, 2)));
+}
+
+// -----------------------------------------------------------------------------
+// Static slot scripts
+// -----------------------------------------------------------------------------
+
+fn covenant_nums_key() -> u256 {
+    0x50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0
+}
+
+fn compute_p2tr_script_hash(output_key: u256) -> u256 {
+    let ctx: Ctx8 = jet::sha_256_ctx_8_init();
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_2(ctx, 0x5120);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, output_key);
+    jet::sha_256_ctx_8_finalize(ctx)
+}
+
+pub fn script_for_slot(slot: u8) -> u256 {
+    // Hidden TapData leaf: exactly 30 zero bytes, version 0x01, then slot.
+    let storage: Ctx8 = jet::tapdata_init();
+    let storage: Ctx8 = jet::sha_256_ctx_8_add_16(storage, 0);
+    let storage: Ctx8 = jet::sha_256_ctx_8_add_8(storage, 0);
+    let storage: Ctx8 = jet::sha_256_ctx_8_add_4(storage, 0);
+    let storage: Ctx8 = jet::sha_256_ctx_8_add_2(storage, 0);
+    let storage: Ctx8 = jet::sha_256_ctx_8_add_1(storage, 0x01);
+    let storage: Ctx8 = jet::sha_256_ctx_8_add_1(storage, slot);
+    let storage_leaf: u256 = jet::sha_256_ctx_8_finalize(storage);
+
+    let program_leaf: u256 = jet::tapleaf_hash();
+    let merkle_root: u256 = jet::build_tapbranch(program_leaf, storage_leaf);
+    let output_key: u256 = jet::build_taptweak(covenant_nums_key(), merkle_root);
+    compute_p2tr_script_hash(output_key)
+}
+
+// The current input's slot script is authenticated once in main. These helpers
+// authenticate only its siblings before any coordinator reads ACTION.
+pub fn ensure_dormant_coordinator_group(yes_index: u32, no_index: u32) {
+    ensure_input_script(no_index, script_for_slot(1));
+    ensure_same_previous_transaction_2(yes_index, no_index);
+}
+
+fn ensure_dormant_follower_group(yes_index: u32, no_index: u32) {
+    ensure_input_script(yes_index, script_for_slot(0));
+    ensure_same_previous_transaction_2(yes_index, no_index);
+}
+
+pub fn ensure_unresolved_coordinator_group(
+    yes_index: u32,
+    no_index: u32,
+    collateral_index: u32,
+) {
+    ensure_input_script(no_index, script_for_slot(3));
+    ensure_input_script(collateral_index, script_for_slot(4));
+    ensure_same_previous_transaction_3(yes_index, no_index, collateral_index);
+}
+
+fn ensure_unresolved_no_follower_group(
+    yes_index: u32,
+    no_index: u32,
+    collateral_index: u32,
+) {
+    ensure_input_script(yes_index, script_for_slot(2));
+    ensure_input_script(collateral_index, script_for_slot(4));
+    ensure_same_previous_transaction_3(yes_index, no_index, collateral_index);
+}
+
+fn ensure_unresolved_collateral_follower_group(
+    yes_index: u32,
+    no_index: u32,
+    collateral_index: u32,
+) {
+    ensure_input_script(yes_index, script_for_slot(2));
+    ensure_input_script(no_index, script_for_slot(3));
+    ensure_same_previous_transaction_3(yes_index, no_index, collateral_index);
+}
+
+// -----------------------------------------------------------------------------
+// Role-local follower guards
+// -----------------------------------------------------------------------------
+
+pub fn dormant_no_follower() {
+    let no_in: u32 = jet::current_index();
+    let yes_in: u32 = safe_subtract_32(no_in, 1);
+    ensure_dormant_follower_group(yes_in, no_in);
+}
+
+pub fn unresolved_no_follower() {
+    let no_in: u32 = jet::current_index();
+    let yes_in: u32 = safe_subtract_32(no_in, 1);
+    let collateral_in: u32 = safe_add_32(yes_in, 2);
+    ensure_unresolved_no_follower_group(yes_in, no_in, collateral_in);
+}
+
+pub fn unresolved_collateral_follower() {
+    let collateral_in: u32 = jet::current_index();
+    let yes_in: u32 = safe_subtract_32(collateral_in, 2);
+    let no_in: u32 = safe_add_32(yes_in, 1);
+    ensure_unresolved_collateral_follower_group(yes_in, no_in, collateral_in);
+}
