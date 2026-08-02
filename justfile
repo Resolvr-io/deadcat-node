@@ -47,6 +47,13 @@ regtest-backend-equivalence: generate
         elements_and_esplora_backends_index_the_same_live_chain \
         -- --ignored --nocapture --test-threads=1
 
+# Prove a confidential two-wallet P2TR RFQ settlement, collaborative PSET
+# blinding/signing, and child spends of both parties' received outputs.
+regtest-rfq-settlement: generate
+    cargo test --locked -p deadcat-client --test rfq_regtest \
+        two_wallet_confidential_p2tr_rfq_settlement_is_accepted_and_spendable \
+        -- --ignored --nocapture --test-threads=1
+
 # Cross actual daemon/CLI process boundaries over direct Iroh, including
 # restart identity persistence, deep-reorg refusal, and operator rebuild.
 regtest-process-boundary: generate
@@ -56,7 +63,7 @@ regtest-process-boundary: generate
         -- --ignored --nocapture --test-threads=1
 
 # Every isolated live-chain protocol gate required before CI succeeds.
-regtest: regtest-market-ab regtest-multi-market regtest-backend-equivalence regtest-process-boundary
+regtest: regtest-market-ab regtest-multi-market regtest-backend-equivalence regtest-rfq-settlement regtest-process-boundary
 
 wasm-check:
     NIX_HARDENING_ENABLE=pic cargo check --locked -p deadcat-iroh --lib --target wasm32-unknown-unknown

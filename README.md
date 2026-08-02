@@ -74,6 +74,7 @@ Focused live-chain gates:
 just regtest-market-ab
 just regtest-multi-market
 just regtest-backend-equivalence
+just regtest-rfq-settlement
 just regtest-process-boundary
 ```
 
@@ -137,6 +138,7 @@ for individual `ContractId` arguments.
 - [Architecture decisions](docs/adr/README.md)
 - [Binary-market A/B acceptance packet](docs/acceptance/binary-market-ab-v1.md)
 - [Multi-market assurance test](crates/deadcat-client/tests/market_regtest.rs)
+- [Confidential RFQ settlement assurance test](crates/deadcat-client/tests/rfq_regtest.rs)
 - [Elements RPC and Esplora backend-equivalence packet](docs/acceptance/backend-equivalence-v1.md)
 - [Daemon/Iroh/CLI process-boundary packet](docs/acceptance/process-boundary-v1.md)
 - [Completed v1 alpha implementation record](docs/implementation-plan.md)
