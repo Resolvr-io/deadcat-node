@@ -28,19 +28,19 @@ fn safe_subtract_32(a: u32, b: u32) -> u32 {
     difference
 }
 
-pub fn safe_add(a: u64, b: u64) -> u64 {
+pub fn safe_add_64(a: u64, b: u64) -> u64 {
     let (carry, sum): (bool, u64) = jet::add_64(a, b);
     assert!(not(carry));
     sum
 }
 
-pub fn safe_subtract(a: u64, b: u64) -> u64 {
+pub fn safe_subtract_64(a: u64, b: u64) -> u64 {
     let (borrow, difference): (bool, u64) = jet::subtract_64(a, b);
     assert!(not(borrow));
     difference
 }
 
-pub fn safe_multiply(a: u64, b: u64) -> u64 {
+pub fn safe_multiply_64(a: u64, b: u64) -> u64 {
     let product: u128 = jet::multiply_64(a, b);
     let (high, low): (u64, u64) = <u128>::into(product);
     assert!(jet::is_zero_64(high));
@@ -52,11 +52,11 @@ pub fn ensure_nonzero(value: u64) {
 }
 
 fn collateral_per_pair() -> u64 {
-    safe_multiply(param::BASE_PAYOUT, 2)
+    safe_multiply_64(param::BASE_PAYOUT, 2)
 }
 
 pub fn collateral_for_pairs(pairs: u64) -> u64 {
-    safe_multiply(pairs, collateral_per_pair())
+    safe_multiply_64(pairs, collateral_per_pair())
 }
 
 // -----------------------------------------------------------------------------
@@ -114,11 +114,11 @@ pub fn ensure_no_issuance(index: u32) {
     assert!(is_none::<u256>(entropy));
 }
 
-fn rt_abf_a() -> u256 {
+fn rt_asset_blinding_factor_a() -> u256 {
     0x0101010101010101010101010101010101010101010101010101010101010101
 }
 
-fn rt_abf_b() -> u256 {
+fn rt_asset_blinding_factor_b() -> u256 {
     0x0202020202020202020202020202020202020202020202020202020202020202
 }
 
@@ -126,31 +126,34 @@ pub fn ensure_reissuance(
     index: u32,
     expected_asset: u256,
     expected_rt: u256,
-    input_is_a: bool,
+    input_is_side_a: bool,
 ) -> u64 {
     let issued_asset: u256 = unwrap(unwrap(jet::issuance_asset(index)));
     let issuance_token: u256 = unwrap(unwrap(jet::issuance_token(index)));
     assert!(jet::eq_256(issued_asset, expected_asset));
     assert!(jet::eq_256(issuance_token, expected_rt));
 
-    let amount: u64 = unwrap_right::<(u1, u256)>(
+    let issued_amount: u64 = unwrap_right::<(u1, u256)>(
         unwrap(unwrap(jet::issuance_asset_amount(index)))
     );
     // Elements exposes the token amount of a reissuance as
     // Some(Explicit(0)), not None. Requiring that exact semantic value rejects
     // a new issuance, a confidential amount, and any nonzero token issuance.
-    let token_amount: u64 = unwrap_right::<(u1, u256)>(
+    let reissuance_token_amount: u64 = unwrap_right::<(u1, u256)>(
         unwrap(unwrap(jet::issuance_token_amount(index)))
     );
-    assert!(jet::is_zero_64(token_amount));
-    let reissuance_blinding: u256 = unwrap(unwrap(jet::reissuance_blinding(index)));
-    let expected_blinding: u256 = match input_is_a {
-        true => rt_abf_a(),
-        false => rt_abf_b(),
+    assert!(jet::is_zero_64(reissuance_token_amount));
+    let actual_asset_blinding_factor: u256 = unwrap(unwrap(jet::reissuance_blinding(index)));
+    let expected_asset_blinding_factor: u256 = match input_is_side_a {
+        true => rt_asset_blinding_factor_a(),
+        false => rt_asset_blinding_factor_b(),
     };
-    assert!(jet::eq_256(reissuance_blinding, expected_blinding));
-    ensure_nonzero(amount);
-    amount
+    assert!(jet::eq_256(
+        actual_asset_blinding_factor,
+        expected_asset_blinding_factor,
+    ));
+    ensure_nonzero(issued_amount);
+    issued_amount
 }
 
 fn burn_script_hash() -> u256 {
@@ -170,32 +173,36 @@ pub fn explicit_burn_amount(index: u32, expected_asset: u256) -> u64 {
     amount
 }
 
-pub fn market_token_burn(index: u32) -> (bool, u64) {
-    let (asset, amount): (u256, u64) = get_output_explicit(index);
-    let burns_yes: bool = jet::eq_256(asset, param::YES_TOKEN_ASSET_ID);
-    match burns_yes {
-        true => assert!(jet::eq_256(asset, param::YES_TOKEN_ASSET_ID)),
-        false => assert!(jet::eq_256(asset, param::NO_TOKEN_ASSET_ID)),
+pub fn ensure_market_token_burn(index: u32) -> (bool, u64) {
+    let (token_asset, tokens_burned): (u256, u64) = get_output_explicit(index);
+    let burns_yes_token: bool = jet::eq_256(token_asset, param::YES_TOKEN_ASSET_ID);
+    match burns_yes_token {
+        true => assert!(jet::eq_256(token_asset, param::YES_TOKEN_ASSET_ID)),
+        false => assert!(jet::eq_256(token_asset, param::NO_TOKEN_ASSET_ID)),
     };
-    ensure_nonzero(amount);
+    ensure_nonzero(tokens_burned);
     ensure_burn_script(index);
-    (burns_yes, amount)
+    (burns_yes_token, tokens_burned)
 }
 
 pub fn ensure_current_index(expected: u32) {
     assert!(jet::eq_32(jet::current_index(), expected));
 }
 
-fn ensure_same_previous_transaction_2(first: u32, second: u32) {
-    let (first_txid, first_vout): (u256, u32) = unwrap(jet::input_prev_outpoint(first));
-    let (second_txid, second_vout): (u256, u32) = unwrap(jet::input_prev_outpoint(second));
+fn ensure_same_previous_transaction(first_input: u32, second_input: u32) {
+    let (first_txid, _): (u256, u32) = unwrap(jet::input_prev_outpoint(first_input));
+    let (second_txid, _): (u256, u32) = unwrap(jet::input_prev_outpoint(second_input));
     assert!(jet::eq_256(first_txid, second_txid));
 }
 
-fn ensure_same_previous_transaction_3(first: u32, second: u32, third: u32) {
-    let (first_txid, first_vout): (u256, u32) = unwrap(jet::input_prev_outpoint(first));
-    let (second_txid, second_vout): (u256, u32) = unwrap(jet::input_prev_outpoint(second));
-    let (third_txid, third_vout): (u256, u32) = unwrap(jet::input_prev_outpoint(third));
+fn ensure_consecutive_previous_outpoints(
+    first_input: u32,
+    second_input: u32,
+    third_input: u32,
+) {
+    let (first_txid, first_vout): (u256, u32) = unwrap(jet::input_prev_outpoint(first_input));
+    let (second_txid, second_vout): (u256, u32) = unwrap(jet::input_prev_outpoint(second_input));
+    let (third_txid, third_vout): (u256, u32) = unwrap(jet::input_prev_outpoint(third_input));
     assert!(jet::eq_256(first_txid, second_txid));
     assert!(jet::eq_256(first_txid, third_txid));
     assert!(jet::eq_32(second_vout, safe_add_32(first_vout, 1)));
@@ -238,12 +245,12 @@ pub fn script_for_slot(slot: u8) -> u256 {
 // authenticate only its siblings before any coordinator reads ACTION.
 pub fn ensure_dormant_coordinator_group(yes_index: u32, no_index: u32) {
     ensure_input_script(no_index, script_for_slot(1));
-    ensure_same_previous_transaction_2(yes_index, no_index);
+    ensure_same_previous_transaction(yes_index, no_index);
 }
 
 fn ensure_dormant_follower_group(yes_index: u32, no_index: u32) {
     ensure_input_script(yes_index, script_for_slot(0));
-    ensure_same_previous_transaction_2(yes_index, no_index);
+    ensure_same_previous_transaction(yes_index, no_index);
 }
 
 pub fn ensure_unresolved_coordinator_group(
@@ -253,7 +260,7 @@ pub fn ensure_unresolved_coordinator_group(
 ) {
     ensure_input_script(no_index, script_for_slot(3));
     ensure_input_script(collateral_index, script_for_slot(4));
-    ensure_same_previous_transaction_3(yes_index, no_index, collateral_index);
+    ensure_consecutive_previous_outpoints(yes_index, no_index, collateral_index);
 }
 
 fn ensure_unresolved_no_follower_group(
@@ -263,7 +270,7 @@ fn ensure_unresolved_no_follower_group(
 ) {
     ensure_input_script(yes_index, script_for_slot(2));
     ensure_input_script(collateral_index, script_for_slot(4));
-    ensure_same_previous_transaction_3(yes_index, no_index, collateral_index);
+    ensure_consecutive_previous_outpoints(yes_index, no_index, collateral_index);
 }
 
 fn ensure_unresolved_collateral_follower_group(
@@ -273,7 +280,7 @@ fn ensure_unresolved_collateral_follower_group(
 ) {
     ensure_input_script(yes_index, script_for_slot(2));
     ensure_input_script(no_index, script_for_slot(3));
-    ensure_same_previous_transaction_3(yes_index, no_index, collateral_index);
+    ensure_consecutive_previous_outpoints(yes_index, no_index, collateral_index);
 }
 
 // -----------------------------------------------------------------------------
