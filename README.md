@@ -28,9 +28,14 @@ packets remain in `docs/` as explicitly marked historical records.
 direction: the planned initial venue is a separate noncustodial liquidity
 service, with a client-side router responsible for quote validation and
 transaction construction. A future AMM or decentralized limit-order book can
-implement the same venue boundary. The RFQ service remains separate from
-`deadcat-node`; future AMM and DLOB protocols are not implemented by this
-repository today.
+implement the same venue boundary. [ADR 0007](docs/adr/0007-rfq-provider-state-machine.md)
+defines the provider's durable reservation and commit-before-sign boundary.
+The transport-free provider state core is implemented, while its wallet,
+pricing, transaction validator, signer adapter, remote service, and relay
+layers remain future work. Until the validator and signer adapter land, the
+safety-critical commit and signed-result transitions are intentionally
+crate-internal. The RFQ provider remains separate from `deadcat-node`; future
+AMM and DLOB protocols are not implemented by this repository today.
 
 ## Assurance
 

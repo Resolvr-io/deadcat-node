@@ -8,6 +8,7 @@ members = [
     "crates/deadcat-iroh",
     "crates/deadcat-node",
     "crates/deadcat-cli",
+    "crates/deadcat-rfq-provider",
 ]
 
 [workspace.package]
@@ -41,6 +42,7 @@ deadcat-contracts = { path = "crates/deadcat-contracts" }
 deadcat-client = { path = "crates/deadcat-client" }
 deadcat-rpc = { path = "crates/deadcat-rpc" }
 deadcat-iroh = { path = "crates/deadcat-iroh" }
+deadcat-rfq-provider = { path = "crates/deadcat-rfq-provider" }
 
 # The CLI and Rust libraries must remain on the exact same smplx release.
 # smplx 0.0.9 caps simplicityhl at 0.6.x; Cargo.lock pins the newest
