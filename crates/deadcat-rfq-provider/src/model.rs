@@ -1,3 +1,6 @@
+use core::fmt;
+
+use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, BlockHash, OutPoint};
 use thiserror::Error;
 
@@ -54,6 +57,37 @@ fixed_id!(
     /// Domain-separated commitment to the exact persisted signed response.
     SignedArtifactDigest
 );
+fixed_id!(
+    /// Commitment to the wallet-authenticated public and durable metadata for one output.
+    InventoryBinding
+);
+
+/// Stable, non-secret handle used by the provider wallet or HSM to recover a key.
+///
+/// The bytes are deliberately opaque to the state machine. They must not be a
+/// private key, blinding factor, seed, or derivation path containing secrets.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WalletKeyLocator([u8; 32]);
+
+impl WalletKeyLocator {
+    pub fn new(bytes: [u8; 32]) -> Result<Self, ModelError> {
+        if bytes == [0; 32] {
+            return Err(ModelError::InvalidWalletKeyLocator);
+        }
+        Ok(Self(bytes))
+    }
+
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl fmt::Debug for WalletKeyLocator {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WalletKeyLocator([opaque])")
+    }
+}
 
 /// Absolute Unix time in milliseconds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -125,10 +159,20 @@ pub struct InventoryItem {
     outpoint: OutPoint,
     asset: AssetId,
     amount: u64,
+    wallet_locator: WalletKeyLocator,
+    internal_key: XOnlyPublicKey,
+    binding: InventoryBinding,
 }
 
 impl InventoryItem {
-    pub fn new(outpoint: OutPoint, asset: AssetId, amount: u64) -> Result<Self, ModelError> {
+    pub(crate) fn new(
+        outpoint: OutPoint,
+        asset: AssetId,
+        amount: u64,
+        wallet_locator: WalletKeyLocator,
+        internal_key: XOnlyPublicKey,
+        binding: InventoryBinding,
+    ) -> Result<Self, ModelError> {
         if outpoint.is_null() || outpoint.vout & 0xc000_0000 != 0 {
             return Err(ModelError::InvalidInventoryOutpoint(outpoint));
         }
@@ -139,6 +183,9 @@ impl InventoryItem {
             outpoint,
             asset,
             amount,
+            wallet_locator,
+            internal_key,
+            binding,
         })
     }
 
@@ -155,6 +202,24 @@ impl InventoryItem {
     #[must_use]
     pub const fn amount(self) -> u64 {
         self.amount
+    }
+
+    /// Opaque, non-secret handle required to recover the provider signing key.
+    #[must_use]
+    pub const fn wallet_locator(self) -> WalletKeyLocator {
+        self.wallet_locator
+    }
+
+    /// Untweaked key committed by the tree-less P2TR output.
+    #[must_use]
+    pub const fn internal_key(self) -> XOnlyPublicKey {
+        self.internal_key
+    }
+
+    /// Commitment to the wallet-authenticated public prevout and durable metadata.
+    #[must_use]
+    pub const fn binding(self) -> InventoryBinding {
+        self.binding
     }
 }
 
@@ -513,6 +578,12 @@ impl ReservationView {
     }
 }
 
+/// Durable allocation state only.
+///
+/// `Available` means that no reservation owns the outpoint in redb. It does
+/// not prove that the wallet still reports the output as unspent or that a
+/// sufficiently fresh discovery snapshot exists. Quote construction must use
+/// the wallet coordinator's eligible-inventory view instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InventoryState {
     Available,
@@ -554,6 +625,7 @@ pub struct SigningJob {
     pub(crate) commitment: SigningCommitment,
     pub(crate) pre_sign_payload: Vec<u8>,
     pub(crate) fee: TransactionFee,
+    pub(crate) targets: Vec<SigningTarget>,
 }
 
 impl SigningJob {
@@ -575,6 +647,47 @@ impl SigningJob {
     #[must_use]
     pub const fn fee(&self) -> TransactionFee {
         self.fee
+    }
+
+    /// Exact provider-owned inputs authorized by this durable signing job.
+    #[must_use]
+    pub fn targets(&self) -> &[SigningTarget] {
+        &self.targets
+    }
+}
+
+/// Non-secret wallet authorization for one provider input in a durable job.
+///
+/// The signing policy is fixed by the wallet boundary to tree-less P2TR key
+/// path with explicit `SIGHASH_ALL`; it is intentionally not caller-selectable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SigningTarget {
+    pub(crate) outpoint: OutPoint,
+    pub(crate) wallet_locator: WalletKeyLocator,
+    pub(crate) internal_key: XOnlyPublicKey,
+    pub(crate) inventory_binding: InventoryBinding,
+}
+
+impl SigningTarget {
+    #[must_use]
+    pub const fn outpoint(self) -> OutPoint {
+        self.outpoint
+    }
+
+    #[must_use]
+    pub const fn wallet_locator(self) -> WalletKeyLocator {
+        self.wallet_locator
+    }
+
+    #[must_use]
+    pub const fn internal_key(self) -> XOnlyPublicKey {
+        self.internal_key
+    }
+
+    /// Commitment to the wallet-authenticated public prevout and durable metadata.
+    #[must_use]
+    pub const fn inventory_binding(self) -> InventoryBinding {
+        self.inventory_binding
     }
 }
 
@@ -668,6 +781,8 @@ pub enum ModelError {
     InvalidInventoryOutpoint(OutPoint),
     #[error("inventory amount must be nonzero")]
     ZeroInventoryAmount,
+    #[error("wallet key locator must not be the all-zero reserved value")]
+    InvalidWalletKeyLocator,
     #[error("minimum fee rate must be nonzero")]
     ZeroMinimumFeeRate,
     #[error("maximum transaction weight must be nonzero")]

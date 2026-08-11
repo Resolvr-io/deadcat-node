@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use elements::hashes::Hash as _;
+use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, BlockHash, OutPoint};
 use redb::{
     Database, Durability, ReadableDatabase as _, ReadableTable as _, TableDefinition,
@@ -16,11 +17,11 @@ use thiserror::Error;
 
 use crate::model::{
     AuditEntry, AuditEvent, Clock, FeePolicy, FeePolicyViolation, FeeSizeMetric, IdempotencyKey,
-    InventoryItem, InventoryState, InventoryView, MAX_RESERVATION_INPUTS, MAX_SETTLEMENT_BYTES,
-    OwnerId, ProviderId, ProviderIdentity, QuoteCommitment, RecoveryAction, ReleaseReason,
-    ReservationAccess, ReservationId, ReservationPlan, ReservationState, ReservationView,
-    SignedArtifact, SignedArtifactDigest, SigningCommitment, SigningJob, TransactionFee,
-    UnixMillis,
+    InventoryBinding, InventoryItem, InventoryState, InventoryView, MAX_RESERVATION_INPUTS,
+    MAX_SETTLEMENT_BYTES, OwnerId, ProviderId, ProviderIdentity, QuoteCommitment, RecoveryAction,
+    ReleaseReason, ReservationAccess, ReservationId, ReservationPlan, ReservationState,
+    ReservationView, SignedArtifact, SignedArtifactDigest, SigningCommitment, SigningJob,
+    SigningTarget, TransactionFee, UnixMillis, WalletKeyLocator,
 };
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -160,34 +161,56 @@ impl ReservationBook {
 
     /// Add one wallet-discovered output without changing an existing record.
     /// Exact retries are idempotent; conflicting metadata is rejected.
-    pub fn import_inventory<C: Clock>(
+    #[cfg(test)]
+    pub(crate) fn import_inventory<C: Clock>(
         &self,
         item: InventoryItem,
         clock: &C,
     ) -> Result<bool, ProviderError> {
-        let (_operation_guard, write, now) = self.begin_timed_write(clock)?;
-        let key = outpoint_key(item.outpoint());
-        let stored = StoredInventoryItem::from(item);
-        if let Some(existing) = read_record_from_write(&write, INVENTORY, &key)? {
-            let existing: StoredInventoryItem = existing;
-            if existing != stored {
-                return Err(ProviderError::InventoryMetadataConflict {
-                    outpoint: item.outpoint(),
-                });
+        Ok(self.import_inventory_batch(&[item], clock)? == 1)
+    }
+
+    /// Atomically import one complete wallet discovery set. Every item is
+    /// validated against existing immutable metadata before any item is added.
+    pub(crate) fn import_inventory_batch<C: Clock>(
+        &self,
+        items: &[InventoryItem],
+        clock: &C,
+    ) -> Result<usize, ProviderError> {
+        let mut unique = BTreeSet::new();
+        for item in items {
+            if !unique.insert(item.outpoint()) {
+                return Err(ProviderError::DuplicateInventoryOutpoint(item.outpoint()));
             }
-            self.commit_write(write)?;
-            return Ok(false);
         }
-        write_record(&write, INVENTORY, &key, &stored)?;
-        append_audit(
-            &write,
-            now,
-            StoredAuditEvent::InventoryImported {
-                outpoint: item.outpoint(),
-            },
-        )?;
+        let (_operation_guard, write, now) = self.begin_timed_write(clock)?;
+        let mut pending = Vec::new();
+        for item in items {
+            let key = outpoint_key(item.outpoint());
+            let stored = StoredInventoryItem::from(*item);
+            if let Some(existing) = read_record_from_write(&write, INVENTORY, &key)? {
+                let existing: StoredInventoryItem = existing;
+                if existing != stored {
+                    return Err(ProviderError::InventoryMetadataConflict {
+                        outpoint: item.outpoint(),
+                    });
+                }
+            } else {
+                pending.push((key, stored));
+            }
+        }
+        for (key, stored) in &pending {
+            write_record(&write, INVENTORY, key, stored)?;
+            append_audit(
+                &write,
+                now,
+                StoredAuditEvent::InventoryImported {
+                    outpoint: stored.outpoint,
+                },
+            )?;
+        }
         self.commit_write(write)?;
-        Ok(true)
+        Ok(pending.len())
     }
 
     pub fn inventory(&self, outpoint: OutPoint) -> Result<Option<InventoryView>, ProviderError> {
@@ -209,7 +232,7 @@ impl ReservationBook {
         Ok(Some(InventoryView::new(item.to_domain()?, state)))
     }
 
-    pub fn inventory_all(&self) -> Result<Vec<InventoryView>, ProviderError> {
+    pub(crate) fn inventory_all(&self) -> Result<Vec<InventoryView>, ProviderError> {
         self.ensure_healthy()?;
         let read = self.database.begin_read()?;
         let inventory = read.open_table(INVENTORY)?;
@@ -228,14 +251,90 @@ impl ReservationBook {
         Ok(result)
     }
 
+    /// Whether this exact authenticated request already has a durable binding.
+    ///
+    /// The wallet coordinator uses this read-only check to preserve idempotent
+    /// retries even when the discovery snapshot used by the original request
+    /// has since been superseded. A positive result must still be passed to
+    /// [`Self::reserve`] so deadline expiry and state replay happen atomically.
+    pub(crate) fn has_matching_request(
+        &self,
+        plan: &ReservationPlan,
+    ) -> Result<bool, ProviderError> {
+        self.ensure_healthy()?;
+        if plan.fee_policy().policy_asset() != self.identity.policy_asset() {
+            return Err(ProviderError::WrongPolicyAsset {
+                expected: self.identity.policy_asset(),
+                actual: plan.fee_policy().policy_asset(),
+            });
+        }
+        let expected_digest = request_digest(self.identity, plan)?;
+        let read = self.database.begin_read()?;
+        let request_keys = read.open_table(REQUEST_KEYS)?;
+        let key = request_key(plan.owner(), plan.idempotency_key());
+        let Some(binding) = request_keys.get(key.as_slice())? else {
+            return Ok(false);
+        };
+        let binding: StoredRequestBinding = decode_record(binding.value())?;
+        if binding.request_digest != expected_digest {
+            return Err(ProviderError::IdempotencyConflict {
+                owner: plan.owner(),
+                key: plan.idempotency_key(),
+            });
+        }
+        drop(request_keys);
+        let reservations = read.open_table(RESERVATIONS)?;
+        let record = reservations
+            .get(binding.reservation_id.as_slice())?
+            .ok_or_else(|| {
+                ProviderError::CorruptState(
+                    "idempotency binding references a missing reservation".to_owned(),
+                )
+            })?;
+        let record: StoredReservation = decode_record(record.value())?;
+        if record.id != binding.reservation_id || record.request_digest != binding.request_digest {
+            return Err(ProviderError::CorruptState(
+                "idempotency binding disagrees with its reservation".to_owned(),
+            ));
+        }
+        record.validate()?;
+        Ok(true)
+    }
+
     /// Atomically reserve every requested outpoint or none of them.
     ///
     /// The clock is sampled after acquiring redb's serial writer, so a request
     /// queued behind another writer cannot commit using a stale pre-lock time.
-    pub fn reserve<C: Clock>(
+    pub(crate) fn reserve<C: Clock>(
         &self,
         plan: &ReservationPlan,
         clock: &C,
+    ) -> Result<ReserveOutcome, ProviderError> {
+        self.reserve_inner(plan, clock, None)
+    }
+
+    /// Reserve from one wallet snapshot, rechecking its exclusive freshness
+    /// deadline using the same post-writer-lock observation as the quote
+    /// deadline and durable allocation.
+    pub(crate) fn reserve_from_snapshot<C: Clock>(
+        &self,
+        plan: &ReservationPlan,
+        snapshot_observed_at: UnixMillis,
+        maximum_snapshot_age_millis: u64,
+        clock: &C,
+    ) -> Result<ReserveOutcome, ProviderError> {
+        self.reserve_inner(
+            plan,
+            clock,
+            Some((snapshot_observed_at, maximum_snapshot_age_millis)),
+        )
+    }
+
+    fn reserve_inner<C: Clock>(
+        &self,
+        plan: &ReservationPlan,
+        clock: &C,
+        snapshot_freshness: Option<(UnixMillis, u64)>,
     ) -> Result<ReserveOutcome, ProviderError> {
         if plan.fee_policy().policy_asset() != self.identity.policy_asset() {
             return Err(ProviderError::WrongPolicyAsset {
@@ -265,6 +364,21 @@ impl ReservationBook {
                 reservation: record.to_view()?,
                 created: false,
             });
+        }
+
+        if let Some((observed_at, maximum_age_millis)) = snapshot_freshness {
+            if now < observed_at {
+                self.commit_write(write)?;
+                return Err(ProviderError::InventorySnapshotObservedInFuture { observed_at, now });
+            }
+            if now.value() - observed_at.value() >= maximum_age_millis {
+                self.commit_write(write)?;
+                return Err(ProviderError::InventorySnapshotStale {
+                    observed_at,
+                    now,
+                    maximum_age_millis,
+                });
+            }
         }
 
         if now >= plan.accept_before() {
@@ -486,7 +600,8 @@ impl ReservationBook {
 
         match &record.state {
             StoredReservationState::Committed { intent } => {
-                let proposed = signing_commitment(&record, &pre_sign_payload, fee)?;
+                let proposed =
+                    signing_commitment(&record, &pre_sign_payload, fee, &intent.targets)?;
                 if intent.commitment != proposed.to_bytes()
                     || intent.pre_sign_payload != pre_sign_payload
                     || intent.fee != StoredTransactionFee::from(fee)
@@ -498,7 +613,8 @@ impl ReservationBook {
                 return Ok(CommitOutcome::AlreadyCommitted(job));
             }
             StoredReservationState::Signed { intent, artifact } => {
-                let proposed = signing_commitment(&record, &pre_sign_payload, fee)?;
+                let proposed =
+                    signing_commitment(&record, &pre_sign_payload, fee, &intent.targets)?;
                 if intent.commitment != proposed.to_bytes()
                     || intent.pre_sign_payload != pre_sign_payload
                     || intent.fee != StoredTransactionFee::from(fee)
@@ -527,7 +643,8 @@ impl ReservationBook {
 
         let policy = record.fee_policy.to_domain()?;
         policy.validate(fee)?;
-        let commitment = signing_commitment(&record, &pre_sign_payload, fee)?;
+        let targets = signing_targets_for_reservation(&write, &record)?;
+        let commitment = signing_commitment(&record, &pre_sign_payload, fee, &targets)?;
         for outpoint in &record.outpoints {
             let key = outpoint_key(*outpoint);
             let allocation = read_record_from_write::<StoredAllocation>(&write, ALLOCATIONS, &key)?
@@ -552,6 +669,7 @@ impl ReservationBook {
             pre_sign_payload,
             fee: StoredTransactionFee::from(fee),
             committed_at: now.value(),
+            targets,
         };
         for outpoint in &record.outpoints {
             write_record(
@@ -1140,10 +1258,32 @@ fn read_request_binding(
     read_record_from_write(write, REQUEST_KEYS, &request_key(owner, key))
 }
 
+fn signing_targets_for_reservation(
+    write: &WriteTransaction,
+    reservation: &StoredReservation,
+) -> Result<Vec<StoredSigningTarget>, ProviderError> {
+    let mut targets = Vec::with_capacity(reservation.outpoints.len());
+    for outpoint in &reservation.outpoints {
+        let key = outpoint_key(*outpoint);
+        let inventory = read_record_from_write::<StoredInventoryItem>(write, INVENTORY, &key)?
+            .ok_or_else(|| {
+                ProviderError::CorruptState(format!(
+                    "reserved outpoint {outpoint:?} has no inventory metadata"
+                ))
+            })?;
+        // Decode through the domain constructor before handing any persisted
+        // locator or key material to a signer.
+        inventory.to_domain()?;
+        targets.push(StoredSigningTarget::from_inventory(inventory));
+    }
+    Ok(targets)
+}
+
 fn signing_commitment(
     reservation: &StoredReservation,
     pre_sign_payload: &[u8],
     fee: TransactionFee,
+    targets: &[StoredSigningTarget],
 ) -> Result<SigningCommitment, ProviderError> {
     let transcript = StoredSigningTranscript {
         request_digest: reservation.request_digest,
@@ -1152,6 +1292,7 @@ fn signing_commitment(
         quote_commitment: reservation.quote_commitment,
         fee_policy: reservation.fee_policy,
         fee: StoredTransactionFee::from(fee),
+        targets,
         pre_sign_payload,
     };
     Ok(SigningCommitment::new(domain_digest(
@@ -1443,14 +1584,14 @@ fn validate_store_integrity(
             }
         }
 
-        for outpoint in &record.outpoints {
+        for (target_index, outpoint) in record.outpoints.iter().enumerate() {
             let key = outpoint_key(*outpoint);
-            if !inventory.contains_key(&key) {
-                return Err(ProviderError::CorruptState(format!(
+            let inventory_item = inventory.get(&key).ok_or_else(|| {
+                ProviderError::CorruptState(format!(
                     "reservation {:?} references missing inventory {outpoint:?}",
                     record.id()
-                )));
-            }
+                ))
+            })?;
             let allocation = allocations.get(&key);
             match &record.state {
                 StoredReservationState::Reserved => {
@@ -1467,6 +1608,13 @@ fn validate_store_integrity(
                 }
                 StoredReservationState::Committed { intent }
                 | StoredReservationState::Signed { intent, .. } => {
+                    let expected_target = StoredSigningTarget::from_inventory(*inventory_item);
+                    if intent.targets.get(target_index) != Some(&expected_target) {
+                        return Err(ProviderError::CorruptState(format!(
+                            "committed reservation {:?} signing target disagrees with inventory {outpoint:?}",
+                            record.id()
+                        )));
+                    }
                     if allocation
                         != Some(&StoredAllocation::Committed {
                             reservation_id: record.id,
@@ -1995,6 +2143,9 @@ struct StoredInventoryItem {
     outpoint: OutPoint,
     asset: AssetId,
     amount: u64,
+    wallet_locator: [u8; 32],
+    internal_key: [u8; 32],
+    binding: [u8; 32],
 }
 
 impl From<InventoryItem> for StoredInventoryItem {
@@ -2003,13 +2154,32 @@ impl From<InventoryItem> for StoredInventoryItem {
             outpoint: value.outpoint(),
             asset: value.asset(),
             amount: value.amount(),
+            wallet_locator: value.wallet_locator().to_bytes(),
+            internal_key: value.internal_key().serialize(),
+            binding: value.binding().to_bytes(),
         }
     }
 }
 
 impl StoredInventoryItem {
     fn to_domain(self) -> Result<InventoryItem, ProviderError> {
-        InventoryItem::new(self.outpoint, self.asset, self.amount).map_err(|error| {
+        let wallet_locator = WalletKeyLocator::new(self.wallet_locator).map_err(|error| {
+            ProviderError::CorruptState(format!("invalid persisted inventory: {error}"))
+        })?;
+        let internal_key = XOnlyPublicKey::from_slice(&self.internal_key).map_err(|error| {
+            ProviderError::CorruptState(format!(
+                "invalid persisted inventory internal key: {error}"
+            ))
+        })?;
+        InventoryItem::new(
+            self.outpoint,
+            self.asset,
+            self.amount,
+            wallet_locator,
+            internal_key,
+            InventoryBinding::new(self.binding),
+        )
+        .map_err(|error| {
             ProviderError::CorruptState(format!("invalid persisted inventory: {error}"))
         })
     }
@@ -2166,12 +2336,47 @@ impl StoredReleaseReason {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredSigningTarget {
+    outpoint: OutPoint,
+    wallet_locator: [u8; 32],
+    internal_key: [u8; 32],
+    inventory_binding: [u8; 32],
+}
+
+impl StoredSigningTarget {
+    fn from_inventory(item: StoredInventoryItem) -> Self {
+        Self {
+            outpoint: item.outpoint,
+            wallet_locator: item.wallet_locator,
+            internal_key: item.internal_key,
+            inventory_binding: item.binding,
+        }
+    }
+
+    fn to_domain(self) -> Result<SigningTarget, ProviderError> {
+        let wallet_locator = WalletKeyLocator::new(self.wallet_locator).map_err(|error| {
+            ProviderError::CorruptState(format!("invalid persisted signing locator: {error}"))
+        })?;
+        let internal_key = XOnlyPublicKey::from_slice(&self.internal_key).map_err(|error| {
+            ProviderError::CorruptState(format!("invalid persisted signing key: {error}"))
+        })?;
+        Ok(SigningTarget {
+            outpoint: self.outpoint,
+            wallet_locator,
+            internal_key,
+            inventory_binding: InventoryBinding::new(self.inventory_binding),
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredSigningIntent {
     commitment: [u8; 32],
     pre_sign_payload: Vec<u8>,
     fee: StoredTransactionFee,
     committed_at: u64,
+    targets: Vec<StoredSigningTarget>,
 }
 
 impl StoredSigningIntent {
@@ -2184,6 +2389,12 @@ impl StoredSigningIntent {
             commitment: SigningCommitment::new(self.commitment),
             pre_sign_payload: self.pre_sign_payload.clone(),
             fee: self.fee.to_domain()?,
+            targets: self
+                .targets
+                .iter()
+                .copied()
+                .map(StoredSigningTarget::to_domain)
+                .collect::<Result<_, _>>()?,
         })
     }
 }
@@ -2302,7 +2513,22 @@ impl StoredReservation {
                         "persisted signing fee violates its policy: {error}"
                     ))
                 })?;
-                let expected = signing_commitment(self, &intent.pre_sign_payload, fee)?;
+                if intent.targets.len() != self.outpoints.len()
+                    || intent
+                        .targets
+                        .iter()
+                        .zip(&self.outpoints)
+                        .any(|(target, outpoint)| target.outpoint != *outpoint)
+                {
+                    return Err(ProviderError::CorruptState(
+                        "persisted signing targets do not match reservation outpoints".to_owned(),
+                    ));
+                }
+                for target in &intent.targets {
+                    target.to_domain()?;
+                }
+                let expected =
+                    signing_commitment(self, &intent.pre_sign_payload, fee, &intent.targets)?;
                 if expected.to_bytes() != intent.commitment {
                     return Err(ProviderError::CorruptState(
                         "persisted signing commitment does not match its transcript".to_owned(),
@@ -2375,6 +2601,7 @@ struct StoredSigningTranscript<'a> {
     quote_commitment: [u8; 32],
     fee_policy: StoredFeePolicy,
     fee: StoredTransactionFee,
+    targets: &'a [StoredSigningTarget],
     pre_sign_payload: &'a [u8],
 }
 
@@ -2503,6 +2730,19 @@ pub enum ProviderError {
         previous: UnixMillis,
         now: UnixMillis,
     },
+    #[error("wallet snapshot observed at {observed_at:?} is in the future at {now:?}")]
+    InventorySnapshotObservedInFuture {
+        observed_at: UnixMillis,
+        now: UnixMillis,
+    },
+    #[error(
+        "wallet snapshot observed at {observed_at:?} is stale at {now:?}; maximum age is {maximum_age_millis} ms"
+    )]
+    InventorySnapshotStale {
+        observed_at: UnixMillis,
+        now: UnixMillis,
+        maximum_age_millis: u64,
+    },
     #[error("persisted audit sequence is corrupt")]
     CorruptAuditSequence,
     #[error("audit sequence overflowed")]
@@ -2517,6 +2757,8 @@ pub enum ProviderError {
     UnknownInventory(OutPoint),
     #[error("inventory metadata conflicts at {outpoint:?}")]
     InventoryMetadataConflict { outpoint: OutPoint },
+    #[error("wallet discovery contains duplicate inventory outpoint {0:?}")]
+    DuplicateInventoryOutpoint(OutPoint),
     #[error("outpoint {outpoint:?} is unavailable: {state:?}")]
     OutpointUnavailable {
         outpoint: OutPoint,

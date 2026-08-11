@@ -141,11 +141,94 @@ overpayment while the provider rejects transactions likely to strand shared
 inventory. CPFP is a provider-operated recovery mechanism, not a substitute
 for initial fee admission and not a cost silently imposed on later traders.
 
-The state-only crate in this change models and persists those validator-derived
-facts, but deliberately does not expose its commit or signed-artifact recording
-transitions as externally callable service APIs. They remain crate-internal
-until the concrete PSET validator and signer adapter can construct their inputs;
-detached caller assertions are not an admissible production trust boundary.
+The durable state layer models and persists those validator-derived facts, but
+deliberately does not expose its commit or signed-artifact recording transitions
+as externally callable service APIs. They remain crate-internal until the
+concrete PSET validator and signer adapter can construct their inputs; detached
+caller assertions are not an admissible production trust boundary.
+
+### Wallet capability and quote-eligibility boundary
+
+The provider's first wallet boundary is backend-neutral: it defines complete
+inventory discovery, fresh confidential receive/change destinations, and a
+signer capability without selecting Elements RPC, a descriptor wallet, an HSM,
+or another production backend.
+
+Version-one provider inventory has one fixed spend profile:
+
+- confidential asset, value, and nonce fields;
+- present range and surjection proofs;
+- an opening whose asset and value reconstruct the on-chain commitments;
+- a valid rangeproof for the output script and commitments;
+- an exact tree-less P2TR script for the wallet's untweaked internal key; and
+- P2TR key-path signatures with an explicit `SIGHASH_ALL` byte.
+
+Surjection-proof verification needs the creating transaction's complete input
+generator domain, so isolated discovery requires proof presence and relies on
+the wallet/chain backend's guarantee that the creating transaction passed its
+configured chain or mempool validation policy. The later final-transaction
+validator rechecks the authoritative prevout and validates the new settlement's
+proofs and balance; it cannot reconstruct the historical proof's missing
+generator domain from an isolated prevout.
+
+Discovery returns a complete canonically ordered snapshot bound to the provider
+identity and a chain anchor. After validating the complete discovery result,
+the service stamps it with the same clock observation persisted by its atomic
+inventory import.
+The only inventory suitable for quote construction is:
+
+```text
+fresh complete wallet snapshot
+    intersection
+durable allocation state == Available
+```
+
+Durable `Available` by itself means only “not allocated in redb.” It never
+means “currently unspent” or “fresh enough to quote.” A process restart has no
+positive discovery cache and must scan again. A later complete snapshot
+replaces membership without deleting durable inventory history; outputs absent
+from it become ineligible, while reserved and committed outputs never re-enter
+eligibility merely because the wallet rediscovers them.
+
+A wallet-source error may retain the last successful view only within its
+original freshness window. Once the source returns a newer complete view, that
+result supersedes the old observation even if identity, size, immutable
+metadata, import, or reconciliation checks reject it: the coordinator clears
+the positive cache and requires another successful scan. An authoritative
+contradiction can therefore never fall back to older quoteable inventory.
+
+The coordinator serializes refresh, eligibility, and reservation. A reservation
+must present the current in-process snapshot token and may name only outputs in
+that exact eligible view. Token and membership are rechecked while the refresh
+lock is held; snapshot freshness and the quote deadline are then sampled again
+after acquiring the durable writer lock. This closes the local
+list-then-reserve and queued-writer expiry races; authoritative prevouts must
+still be rechecked before commitment because chain state can change immediately
+after any scan. Exact idempotent reservation retries replay their durable result
+even after the original snapshot has been superseded.
+
+Wallet blinding factors authenticate discovery and remain only in the redacted
+in-memory complete snapshot so provider-side collaborative blinding can consume
+them. That fresh complete view does not filter out reserved or committed
+outputs, so they remain available for transaction construction when the wallet
+source still reports them; the separate eligible view contains only its
+durable-`Available` intersection. redb never retains blinding factors: it stores
+the unblinded asset and amount, untweaked public key, a fixed-size opaque
+non-secret wallet locator, and a commitment to the public discovery metadata.
+The locator must resolve through wallet ownership history, not only the current
+unspent set. When a reservation crosses the point of no return, its exact
+locators, keys, outpoints, and inventory commitments become part of the durable
+signing job and signing commitment. Signing recovery therefore does not depend
+on a committed input continuing to appear in `listunspent` after an ambiguous
+signing or broadcast attempt. Restarted pre-commit collaborative blinding does
+require a new authenticated wallet scan to recover the opening in memory.
+
+The signer interface accepts only an unforgeable durable signing job. It cannot
+be asked through this boundary to sign detached caller bytes or a
+caller-selected sighash policy, and it returns exactly one ordered explicit
+`SIGHASH_ALL` signature per durable provider target. Cryptographic signature
+verification and insertion into the exact PSET remain duties of the next
+validator/signer-adapter layer.
 
 ## Consequences
 
@@ -156,9 +239,10 @@ detached caller assertions are not an admissible production trust boundary.
   replay.
 - Immediate provider relay and optional provider-funded CPFP reduce the time
   committed inventory remains unavailable; cooperative RBF is deferred.
-- The state core stores no private keys and implements no pricing, inventory
-  discovery, transaction validation, signing, networking, relay, mempool, or
-  reorg policy. Those layers consume its transition-specific API.
+- The persistence core stores no private keys and implements no pricing,
+  transaction validation, signing, networking, relay, mempool, or reorg policy.
+  Backend-neutral discovery and signer capabilities surround it, but a concrete
+  wallet/RPC/HSM backend remains a separate security principal.
 - Multiple interactive RFQ signers remain deferred. Future AMM and DLOB legs
   may coexist because a reservation covers only the provider's exact leg and
   inputs, not the entire route.
@@ -169,7 +253,8 @@ detached caller assertions are not an admissible production trust boundary.
 
 ## Implementation and follow-up
 
-The first implementation is the `deadcat-rfq-provider` library. It provides
+The first implementation is the `deadcat-rfq-provider` library. Its durable
+state layer provides
 provider/chain database binding, durable inventory import, atomic multi-input
 reservation, owner-scoped idempotency, bounded expiry and cancellation,
 fee-policy evaluation over future validator-derived facts, commit-before-sign
@@ -178,12 +263,21 @@ startup integrity validation, and an audit log. The safety-critical commit and
 signed-artifact transitions remain crate-internal until their validator and
 signer producers land.
 
-The next provider milestones are:
+Its wallet layer now provides validated confidential tree-less P2TR discovery,
+complete chain-anchored snapshots, atomic batch import followed by a
+reserve-time-rechecked fresh-availability intersection, confidential input
+openings kept only in redacted memory, destination and committed-job-only signer
+capability interfaces, explicit `SIGHASH_ALL` response shape, durable non-secret
+recovery locators, and adversarial restart, freshness, replacement, concurrency,
+and metadata-conflict coverage. Destination non-reuse and authoritative
+chain/mempool freshness are explicit backend obligations; the types cannot
+prove them. The crate deliberately supplies no concrete wallet backend.
 
-1. choose the wallet/signer and inventory-discovery boundary;
-2. add configurable inventory-aware quote construction;
-3. validate a concrete final Liquid PSET and derive its exact fee metrics;
-4. define a dedicated RFQ protocol, identity, and ALPN;
-5. persist relay and chain-reconciliation observations without ever reopening
+The remaining provider milestones are:
+
+1. add configurable inventory-aware quote construction;
+2. validate a concrete final Liquid PSET and derive its exact fee metrics;
+3. define a dedicated RFQ protocol, identity, and ALPN;
+4. persist relay and chain-reconciliation observations without ever reopening
    a committed outpoint; and
-6. pass process-kill, signer ambiguity, mempool, confirmation, and reorg gates.
+5. pass process-kill, signer ambiguity, mempool, confirmation, and reorg gates.
