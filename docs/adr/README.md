@@ -11,3 +11,4 @@ change after covenant CMRs or public wire formats exist.
 | [0004](0004-chain-state-and-reorgs.md) | Chain transactions apply atomically; confirmed-tip state rolls back two blocks |
 | [0005](0005-rt-blinding-schedule.md) | **Proposed:** complementary A/B RT engineering evidence and protocol-owner approval are complete; focused external review remains |
 | [0006](0006-rfq-first-liquidity-scope.md) | **Accepted:** production is market-only with separate noncustodial RFQ liquidity and client-owned routing |
+| [0007](0007-rfq-provider-state-machine.md) | **Accepted:** RFQ inputs commit durably before signing and never reopen after ambiguous authorization |

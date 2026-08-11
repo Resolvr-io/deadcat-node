@@ -164,7 +164,8 @@ The RFQ service is a separate inventory-bearing security principal. It:
 - reserves exact inputs for a short-lived quote;
 - contributes its exact inputs and outputs to a final PSET;
 - validates the complete transaction;
-- signs only while its reservation remains acceptable; and
+- durably accepts a signing intent only while its reservation remains live;
+- signs only the exact durably accepted transaction; and
 - returns its signature for the exact finalized transaction and may relay that
   same transaction immediately.
 
@@ -488,16 +489,21 @@ An RFQ deadline is enforced by service behavior:
 2. assemble and blind the final transaction;
 3. have the user authenticate the final transaction body and proof set under an
    explicitly approved sighash and proof-authentication profile;
-4. have the provider sign only while the reservation is live; and
-5. return the provider signature for that exact finalized transaction and
+4. while the reservation is live, have the provider durably commit its inputs
+   to the exact validated pre-sign transcript;
+5. have the provider sign only that persisted transcript, then durably store
+   the signed response; and
+6. return the provider signature for that exact finalized transaction and
    immediately relay it according to the quote policy.
 
 The provider commitment creates accountability and operational firmness, not a
 consensus guarantee that the provider cannot fail. Once created, a transaction
 signature has no service-level expiry while its inputs remain spendable. The
-provider must therefore refuse to sign after the deadline, mark the reserved
-inputs committed once it releases a signature, and never make them available
-again merely because a local timer elapsed. The client retains final
+provider must therefore refuse new durable acceptance after the deadline, mark
+the reserved inputs committed before it invokes the signer, and never make
+them available again merely because a local timer elapsed. Signing and relay
+may finish after the deadline when durable acceptance won beforehand. The
+client retains final
 verification and may relay the exact same transaction through any broadcaster.
 Ambiguous broadcast or deliberate conflict handling requires a documented
 state machine that checks the exact transaction and input outspends. An absolute
@@ -845,10 +851,11 @@ The client must distinguish:
 - broadcast ambiguity; and
 - confirmation followed by reorganization.
 
-Before any counterparty signature is released, failure can discard the
-transaction, release or expire RFQ reservations, refresh state, and reroute.
-After a provider releases a valid signature, the reservation is committed:
-local timeout alone is not enough to recycle its inputs.
+Before the provider durably accepts the exact signing transcript, failure can
+discard the transaction, release or expire RFQ reservations, refresh state,
+and reroute. After durable acceptance, the reservation is committed even if
+the signer or response later becomes ambiguous: local timeout alone is not
+enough to recycle its inputs.
 
 After ambiguous broadcast, the client first checks the exact transaction and
 its input outspends before constructing a conflicting replacement. After a
@@ -865,9 +872,10 @@ that an orphaned venue transition remains live.
 - The user's signature cannot authorize a different input/output transaction
   body, and omitted witness commitments are covered by the approved
   proof-authentication protocol.
-- The provider refuses to sign after the quote deadline, marks inputs committed
-  when it releases a signature, and immediately relays the exact transaction
-  according to policy.
+- The provider refuses new signing commitments at or after the quote deadline,
+  durably commits exact inputs and transcript before invoking the signer,
+  stores the exact signed response before external release, and immediately
+  relays only that transaction according to policy.
 - Reserved provider inputs cannot be double-allocated, including across process
   crashes, restarts, or ambiguous broadcast.
 - Collaborative blinding outputs remain spendable by their intended recipients.
@@ -947,8 +955,9 @@ three independently designed fragment layouts compose safely.
   trade privacy?
 - Which sighash profiles are supported for each input type, what fields does
   each profile commit, and how are omitted proofs or witnesses authenticated?
-- What exact reservation, signature-release, relay, ambiguous-broadcast, and
-  input-retirement state machine does an RFQ provider implement?
+- ADR 0007 resolves reservation, commit-before-sign, signature persistence, and
+  permanent input retirement. Exact relay, ambiguous-broadcast, and canonical
+  outspend reconciliation remain to be specified with the service layer.
 - Which chain and mempool evidence is required before a route is considered
   fresh enough to display or sign?
 - When should multiple RFQ signers be allowed in one transaction?

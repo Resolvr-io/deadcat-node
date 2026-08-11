@@ -970,6 +970,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "deadcat-rfq-provider"
+version = "0.1.0-alpha"
+dependencies = [
+ "elements",
+ "postcard",
+ "redb",
+ "serde",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "deadcat-rpc"
 version = "0.1.0-alpha"
 dependencies = [

@@ -5,7 +5,7 @@
 - Supersedes: ADR 0002's release-scope decision
 - Retires as historical: ADR 0003
 - Amends: ADR 0001's node-side advisory-routing responsibility
-- Implementation status updated: 2026-08-10
+- Implementation status updated: 2026-08-11
 
 ## Context
 
@@ -120,9 +120,10 @@ links apply only to that revision.
    changing version constants.
 3. **Completed in PR #25:** prove a two-wallet confidential RFQ settlement on
    liquidregtest before freezing a remote RFQ protocol.
-4. **Implemented as a provisional client-local API:** add exact-in/exact-out
+4. **Completed in PR #26 as a provisional client-local API:** add exact-in/exact-out
    aggregate intent, exact per-leg allocation, authenticated proposal binding,
    route-owned transaction composition, and no remote wire format.
-5. Build the RFQ provider as a separate inventory-bearing service.
+5. **Provider core implemented under ADR 0007:** complete the separate wallet,
+   quoting, transaction-validation, signer, relay, and remote-service layers.
 6. Add production-shaped process, crash-recovery, mutation, reorg, and
    operational acceptance gates.
