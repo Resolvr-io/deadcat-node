@@ -5,7 +5,7 @@
 - Supersedes: ADR 0002's release-scope decision
 - Retires as historical: ADR 0003
 - Amends: ADR 0001's node-side advisory-routing responsibility
-- Implementation status updated: 2026-07-30
+- Implementation status updated: 2026-08-10
 
 ## Context
 
@@ -118,10 +118,11 @@ links apply only to that revision.
 2. **Completed in PR #16:** remove `MakerOrderV1` through every active code,
    storage, wire, CLI, fixture, test, and normative-document surface without
    changing version constants.
-3. Prove a two-wallet confidential RFQ settlement on liquidregtest before
-   freezing a remote RFQ protocol.
-4. Add the smallest client-local exact-in/exact-out venue adapter and
-   transaction-composition seam.
+3. **Completed in PR #25:** prove a two-wallet confidential RFQ settlement on
+   liquidregtest before freezing a remote RFQ protocol.
+4. **Implemented as a provisional client-local API:** add exact-in/exact-out
+   aggregate intent, exact per-leg allocation, authenticated proposal binding,
+   route-owned transaction composition, and no remote wire format.
 5. Build the RFQ provider as a separate inventory-bearing service.
 6. Add production-shaped process, crash-recovery, mutation, reorg, and
    operational acceptance gates.

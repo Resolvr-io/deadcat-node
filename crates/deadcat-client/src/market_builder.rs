@@ -41,6 +41,11 @@ use rand::SeedableRng as _;
 use rand::rngs::StdRng;
 use thiserror::Error;
 
+use crate::composition::{
+    InputId, InputSequence, InputSpec, LockTimeConstraint, OutputId, OutputSpec,
+    TransactionContribution,
+};
+
 /// Network-known assets needed to verify a compact market recovery hint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MarketCreationContext {
@@ -455,6 +460,80 @@ impl BinaryMarketTransitionPlan {
             .collect()
     }
 
+    /// Convert a non-issuance lifecycle plan into one contiguous composer
+    /// contribution. The caller supplies authoritative witness UTXOs in the
+    /// plan's input-role order; this method verifies them before exposing the
+    /// narrow symbolic fragment.
+    ///
+    /// Issuance remains deliberately outside the first generic composer seam
+    /// because it requires typed reissuance fields, not a widened raw-PSET
+    /// adapter surface.
+    pub fn composition_contribution(
+        &self,
+        witness_utxos: Vec<TxOut>,
+    ) -> Result<TransactionContribution, MarketBuilderError> {
+        if matches!(
+            self.applied.transition,
+            BinaryMarketTransition::Issued { .. }
+        ) {
+            return Err(MarketBuilderError::CompositionIssuanceUnsupported);
+        }
+        let slots = self.input_slots();
+        if witness_utxos.len() != slots.len() {
+            return Err(MarketBuilderError::CompositionInputCountMismatch);
+        }
+        let compiled = compile(self.params)?;
+        let sequence = if matches!(
+            self.path(),
+            BinaryMarketPath::ActiveExpiry | BinaryMarketPath::DormantExpiry
+        ) {
+            InputSequence::LocktimeEnabled
+        } else {
+            InputSequence::Final
+        };
+        let mut scratch = PartiallySignedTransaction::new_v2();
+        let mut inputs = Vec::with_capacity(slots.len());
+        for (offset, (slot, witness_utxo)) in slots.iter().copied().zip(witness_utxos).enumerate() {
+            let outpoint = self.outpoint_for_slot(slot)?;
+            let mut pset_input = PsetInput::from_prevout(outpoint);
+            pset_input.witness_utxo = Some(witness_utxo.clone());
+            pset_input.sequence = Some(sequence.to_sequence());
+            scratch.add_input(pset_input);
+            inputs.push(InputSpec::new(
+                InputId::new(u64::try_from(offset).map_err(|_| MarketBuilderError::IndexOverflow)?),
+                outpoint,
+                witness_utxo,
+                sequence,
+            ));
+        }
+        self.verify_inputs(&compiled, &scratch, 0)?;
+
+        let outputs = self
+            .output_templates
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(offset, txout)| {
+                u64::try_from(offset)
+                    .map(OutputId::new)
+                    .map(|id| OutputSpec::covenant(id, txout))
+                    .map_err(|_| MarketBuilderError::IndexOverflow)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let locktime = if matches!(
+            self.path(),
+            BinaryMarketPath::ActiveExpiry | BinaryMarketPath::DormantExpiry
+        ) {
+            LockTimeConstraint::AtLeast(
+                LockTime::from_height(self.params.expiry_height)
+                    .map_err(|_| MarketBuilderError::InvalidExpiryHeight)?,
+            )
+        } else {
+            LockTimeConstraint::Unconstrained
+        };
+        Ok(TransactionContribution::new(inputs, outputs, locktime))
+    }
+
     /// Install the two exact explicit reissuances for an issuance plan.
     pub fn configure_reissuance_inputs(
         &self,
@@ -676,26 +755,7 @@ impl BinaryMarketTransitionPlan {
                 .inputs()
                 .get(index)
                 .ok_or(MarketBuilderError::InputIndexOutOfBounds)?;
-            let expected_outpoint = match slot {
-                BinaryMarketSlot::DormantYesRt | BinaryMarketSlot::UnresolvedYesRt => {
-                    self.live
-                        .yes_rt
-                        .as_ref()
-                        .ok_or(MarketBuilderError::MissingYesRt)?
-                        .outpoint
-                }
-                BinaryMarketSlot::DormantNoRt | BinaryMarketSlot::UnresolvedNoRt => {
-                    self.live
-                        .no_rt
-                        .as_ref()
-                        .ok_or(MarketBuilderError::MissingNoRt)?
-                        .outpoint
-                }
-                _ => self
-                    .live
-                    .collateral
-                    .ok_or(MarketBuilderError::MissingCollateral)?,
-            };
+            let expected_outpoint = self.outpoint_for_slot(slot)?;
             if pset_outpoint(input) != expected_outpoint {
                 return Err(MarketBuilderError::WrongContractInput);
             }
@@ -833,6 +893,27 @@ impl BinaryMarketTransitionPlan {
             .iter()
             .map(|role| role.slot())
             .collect()
+    }
+
+    fn outpoint_for_slot(&self, slot: BinaryMarketSlot) -> Result<OutPoint, MarketBuilderError> {
+        match slot {
+            BinaryMarketSlot::DormantYesRt | BinaryMarketSlot::UnresolvedYesRt => self
+                .live
+                .yes_rt
+                .as_ref()
+                .map(|input| input.outpoint)
+                .ok_or(MarketBuilderError::MissingYesRt),
+            BinaryMarketSlot::DormantNoRt | BinaryMarketSlot::UnresolvedNoRt => self
+                .live
+                .no_rt
+                .as_ref()
+                .map(|input| input.outpoint)
+                .ok_or(MarketBuilderError::MissingNoRt),
+            _ => self
+                .live
+                .collateral
+                .ok_or(MarketBuilderError::MissingCollateral),
+        }
     }
 
     fn contract_input_indices(&self, input_base: usize) -> Result<Vec<usize>, MarketBuilderError> {
@@ -1446,6 +1527,10 @@ pub enum MarketBuilderError {
     CommitmentMismatch,
     #[error("this operation is not an issuance path")]
     NotIssuancePath,
+    #[error("the first generic composer seam does not yet model issuance fields")]
+    CompositionIssuanceUnsupported,
+    #[error("composer witness UTXOs do not match the plan's input count")]
+    CompositionInputCountMismatch,
     #[error("this operation is not an expiry path")]
     NotExpiryPath,
     #[error("invalid v1 expiry height")]
@@ -1489,9 +1574,18 @@ mod tests {
     use elements::{Txid, confidential::AssetBlindingFactor};
 
     use super::*;
+    use crate::composition::{
+        CompositionError, CompositionLimits, NetworkFee, TransactionComposer,
+    };
 
     fn asset(byte: u8) -> AssetId {
         AssetId::from_slice(&[byte; 32]).expect("asset")
+    }
+
+    fn native_witness_script(byte: u8) -> Script {
+        let mut bytes = vec![0x00, 0x14];
+        bytes.extend([byte; 20]);
+        Script::from(bytes)
     }
 
     fn oracle_keypair() -> Keypair {
@@ -1773,6 +1867,150 @@ mod tests {
             pset.add_output(PsetOutput::from_txout(output));
         }
         pset
+    }
+
+    #[test]
+    fn non_issuance_market_plans_compose_and_finalize_at_nonzero_bases() {
+        let params = params();
+        let cases = [
+            (
+                BinaryMarketState::Trading {
+                    outstanding_pairs: 5,
+                },
+                BinaryMarketAction::Cancel { pairs: 2 },
+                false,
+                0x81,
+            ),
+            (
+                BinaryMarketState::Trading {
+                    outstanding_pairs: 3,
+                },
+                BinaryMarketAction::Expire,
+                true,
+                0x83,
+            ),
+        ];
+        for (before, action, is_expiry, wallet_tag) in cases {
+            let plan = BinaryMarketTransitionPlan::new(
+                params,
+                before,
+                action,
+                live_for_state(before),
+                None,
+            )
+            .expect("transition plan");
+            let standalone = pset_for_plan(&plan, 0, 0);
+            let witness_utxos = standalone
+                .inputs()
+                .iter()
+                .map(|input| input.witness_utxo.clone().expect("witness UTXO"))
+                .collect();
+            let market = plan
+                .composition_contribution(witness_utxos)
+                .expect("market contribution");
+            let market_input_count = market.inputs().len();
+
+            let policy_asset = params.collateral_asset_id;
+            let wallet = TransactionContribution::new(
+                vec![InputSpec::new(
+                    InputId::new(0),
+                    OutPoint::new(Txid::from_byte_array([wallet_tag; 32]), 0),
+                    explicit_txout(policy_asset, 1_000, native_witness_script(wallet_tag)),
+                    InputSequence::Final,
+                )],
+                vec![OutputSpec::explicit(
+                    OutputId::new(0),
+                    policy_asset,
+                    900,
+                    native_witness_script(wallet_tag.wrapping_add(1)),
+                )],
+                LockTimeConstraint::Unconstrained,
+            );
+            let mut composer = TransactionComposer::new(
+                CompositionLimits::default(),
+                NetworkFee::new(policy_asset, 100).expect("fee"),
+            );
+            composer.push(wallet).expect("wallet contribution");
+            let market_handle = composer.push(market).expect("market contribution");
+            let composed = composer.finish().expect("composition");
+            let placement = composed
+                .layout()
+                .placement(market_handle)
+                .expect("market placement");
+            assert!(placement.input_base() > 0);
+            assert!(placement.output_base() > 0);
+            if is_expiry {
+                assert_eq!(
+                    composed.manifest().locktime(),
+                    LockTime::from_height(params.expiry_height).expect("expiry height")
+                );
+                for input in &composed.pset().inputs()
+                    [placement.input_base()..placement.input_base() + market_input_count]
+                {
+                    assert_eq!(input.sequence, Some(Sequence(0xffff_fffe)));
+                }
+            }
+
+            let (mut pset, _, manifest) = composed.into_parts();
+            plan.finalize(
+                &mut pset,
+                placement.input_base(),
+                placement.output_base(),
+                &SimplicityNetwork::ElementsRegtest {
+                    policy_asset: params.collateral_asset_id,
+                },
+            )
+            .expect("finalize composed covenant");
+            manifest
+                .validate(&pset)
+                .expect("covenant finalization preserves structure");
+
+            let mut tampered = pset.clone();
+            tampered.outputs_mut()[placement.output_base()].script_pubkey =
+                native_witness_script(0x91);
+            assert_eq!(
+                manifest.validate(&tampered),
+                Err(CompositionError::OutputMismatch {
+                    index: placement.output_base(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn composer_conversion_rejects_issuance_and_wrong_witness_count() {
+        let params = params();
+        let issuance_state = BinaryMarketState::Trading {
+            outstanding_pairs: 0,
+        };
+        let issuance = BinaryMarketTransitionPlan::new(
+            params,
+            issuance_state,
+            BinaryMarketAction::Issue { pairs: 2 },
+            live_for_state(issuance_state),
+            None,
+        )
+        .expect("issuance plan");
+        assert!(matches!(
+            issuance.composition_contribution(Vec::new()),
+            Err(MarketBuilderError::CompositionIssuanceUnsupported)
+        ));
+
+        let cancellation_state = BinaryMarketState::Trading {
+            outstanding_pairs: 5,
+        };
+        let cancellation = BinaryMarketTransitionPlan::new(
+            params,
+            cancellation_state,
+            BinaryMarketAction::Cancel { pairs: 2 },
+            live_for_state(cancellation_state),
+            None,
+        )
+        .expect("cancellation plan");
+        assert!(matches!(
+            cancellation.composition_contribution(Vec::new()),
+            Err(MarketBuilderError::CompositionInputCountMismatch)
+        ));
     }
 
     #[test]

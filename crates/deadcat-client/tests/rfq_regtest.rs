@@ -4,14 +4,25 @@
 //! synthetic UTXOs. The ignored live test repeats it against liquidregtest,
 //! broadcasts the settlement, and spends both parties' received outputs.
 //!
-//! This is deliberately test-local. It proves the transaction and wallet
-//! primitives before Deadcat freezes a remote RFQ protocol or stable venue API.
+//! The wallet and collaborative-signing harness remains test-local, while the
+//! settlement body is built through Deadcat's provisional production venue and
+//! composition seam. No remote RFQ protocol or stable wire API is frozen here.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr as _;
 
 use bitcoincore_rpc::{Client, RpcApi};
+use deadcat_client::composition::{
+    BlinderRef, CompositionLayout, CompositionLimits, ContributionHandle, InputId, InputSequence,
+    InputSpec, LockTimeConstraint, NetworkFee, OutputId, OutputSpec, TransactionContribution,
+    UnblindedStructureManifest,
+};
+use deadcat_client::venue::{
+    AssetAmount, ConfidentialRecipient, ExactExecution, ExecutionError, ExecutionRequest, LegId,
+    LegPreparationRequest, ProposedLeg, RouteAuthorization, VenueAdapter, VenueContext,
+};
 use deadcat_contracts::SimplicityNetwork;
+use deadcat_types::{ChainIdentity, ContractId, LiquidNetwork};
 use elements::bitcoin::PublicKey as BitcoinPublicKey;
 use elements::confidential::{Asset, AssetBlindingFactor, Nonce, Value, ValueBlindingFactor};
 use elements::encode::{deserialize, serialize};
@@ -38,6 +49,15 @@ const USER_PAYMENT_INPUT_VALUE: u64 = 30_000;
 const PROVIDER_INVENTORY_VALUE: u64 = 5;
 const PROVIDER_PAYMENT_VALUE: u64 = 20_000;
 const USER_RECEIVE_VALUE: u64 = 2;
+
+const FEE_INPUT_ID: InputId = InputId::new(1);
+const PAYMENT_INPUT_ID: InputId = InputId::new(2);
+const INVENTORY_INPUT_ID: InputId = InputId::new(1);
+const FEE_CHANGE_OUTPUT_ID: OutputId = OutputId::new(1);
+const USER_PAYMENT_CHANGE_OUTPUT_ID: OutputId = OutputId::new(2);
+const PROVIDER_PAYMENT_OUTPUT_ID: OutputId = OutputId::new(1);
+const PROVIDER_INVENTORY_CHANGE_OUTPUT_ID: OutputId = OutputId::new(2);
+const USER_RECEIVE_OUTPUT_ID: OutputId = OutputId::new(3);
 
 #[derive(Clone, Copy)]
 struct SettlementAssets {
@@ -80,9 +100,13 @@ impl P2trWallet {
     fn input(&self, utxo: &OwnedUtxo) -> PsetInput {
         let mut input = PsetInput::from_prevout(utxo.outpoint);
         input.witness_utxo = Some(utxo.txout.clone());
+        self.configure_input(&mut input);
+        input
+    }
+
+    fn configure_input(&self, input: &mut PsetInput) {
         input.sighash_type = Some(SchnorrSighashType::All.into());
         input.tap_internal_key = Some(self.internal_key);
-        input
     }
 
     fn confidential_output(
@@ -100,6 +124,26 @@ impl P2trWallet {
         output.blinder_index =
             Some(u32::try_from(blinder_input_index).expect("test input index fits in a PSET u32"));
         output
+    }
+
+    fn confidential_output_spec(
+        &self,
+        id: OutputId,
+        amount: u64,
+        asset: AssetId,
+        blinder: BlinderRef,
+    ) -> OutputSpec {
+        OutputSpec::confidential(
+            id,
+            asset,
+            amount,
+            self.address.script_pubkey(),
+            self.address
+                .blinding_pubkey
+                .map(BitcoinPublicKey::new)
+                .expect("confidential address"),
+            blinder,
+        )
     }
 
     fn unblind(&self, txout: &TxOut) -> TxOutSecrets {
@@ -168,19 +212,37 @@ struct SettlementLayout {
 }
 
 impl SettlementLayout {
-    const fn composed() -> Self {
+    fn from_composition(
+        layout: &CompositionLayout,
+        wallet: ContributionHandle,
+        venue: ContributionHandle,
+    ) -> Self {
         Self {
-            // Input zero and output zero represent transaction-global wallet
-            // funding, so the RFQ leg is valid away from the first slots.
-            fee_input: 0,
-            payment_input: 1,
-            inventory_input: 2,
-            fee_change: 0,
-            provider_payment: 1,
-            provider_inventory_change: 2,
-            user_payment_change: 3,
-            user_receive: 4,
-            fee: 5,
+            fee_input: layout
+                .input_index(wallet, FEE_INPUT_ID)
+                .expect("fee input placement"),
+            payment_input: layout
+                .input_index(wallet, PAYMENT_INPUT_ID)
+                .expect("payment input placement"),
+            inventory_input: layout
+                .input_index(venue, INVENTORY_INPUT_ID)
+                .expect("inventory input placement"),
+            fee_change: layout
+                .output_index(wallet, FEE_CHANGE_OUTPUT_ID)
+                .expect("fee change placement"),
+            provider_payment: layout
+                .output_index(venue, PROVIDER_PAYMENT_OUTPUT_ID)
+                .expect("provider payment placement"),
+            provider_inventory_change: layout
+                .output_index(venue, PROVIDER_INVENTORY_CHANGE_OUTPUT_ID)
+                .expect("provider inventory change placement"),
+            user_payment_change: layout
+                .output_index(wallet, USER_PAYMENT_CHANGE_OUTPUT_ID)
+                .expect("user payment change placement"),
+            user_receive: layout
+                .output_index(venue, USER_RECEIVE_OUTPUT_ID)
+                .expect("user receive placement"),
+            fee: layout.fee_output_index(),
         }
     }
 }
@@ -188,6 +250,8 @@ impl SettlementLayout {
 #[derive(Clone)]
 struct SettlementFixture {
     pset: PartiallySignedTransaction,
+    manifest: UnblindedStructureManifest,
+    route_authorization: RouteAuthorization,
     layout: SettlementLayout,
     prevouts: Vec<TxOut>,
     user: P2trWallet,
@@ -242,6 +306,73 @@ fn add_fee_output(pset: &mut PartiallySignedTransaction, amount: u64, policy_ass
     pset.add_output(PsetOutput::from_txout(TxOut::new_fee(amount, policy_asset)));
 }
 
+#[derive(Clone)]
+struct TestRfqEvidence {
+    context: VenueContext,
+    provider: P2trWallet,
+    inventory_input: OwnedUtxo,
+    assets: SettlementAssets,
+}
+
+struct TestRfqAdapter;
+
+impl VenueAdapter for TestRfqAdapter {
+    type Evidence = TestRfqEvidence;
+    type Error = ExecutionError;
+
+    fn prepare(
+        &self,
+        request: &LegPreparationRequest,
+        evidence: &Self::Evidence,
+    ) -> Result<ProposedLeg, Self::Error> {
+        if request.context() != evidence.context {
+            return Err(ExecutionError::ContextMismatch);
+        }
+        let execution = ExactExecution::new(
+            AssetAmount::new(evidence.assets.payment, PROVIDER_PAYMENT_VALUE)?,
+            AssetAmount::new(evidence.assets.outcome, USER_RECEIVE_VALUE)?,
+        )?;
+        let contribution = TransactionContribution::new(
+            vec![InputSpec::new(
+                INVENTORY_INPUT_ID,
+                evidence.inventory_input.outpoint,
+                evidence.inventory_input.txout.clone(),
+                InputSequence::Final,
+            )],
+            vec![
+                evidence.provider.confidential_output_spec(
+                    PROVIDER_PAYMENT_OUTPUT_ID,
+                    PROVIDER_PAYMENT_VALUE,
+                    evidence.assets.payment,
+                    BlinderRef::External(request.payer_blinder()),
+                ),
+                evidence.provider.confidential_output_spec(
+                    PROVIDER_INVENTORY_CHANGE_OUTPUT_ID,
+                    PROVIDER_INVENTORY_VALUE - USER_RECEIVE_VALUE,
+                    evidence.assets.outcome,
+                    BlinderRef::Local(INVENTORY_INPUT_ID),
+                ),
+                OutputSpec::confidential(
+                    USER_RECEIVE_OUTPUT_ID,
+                    evidence.assets.outcome,
+                    USER_RECEIVE_VALUE,
+                    request.recipient().script_pubkey().clone(),
+                    request.recipient().blinding_key(),
+                    BlinderRef::Local(INVENTORY_INPUT_ID),
+                ),
+            ],
+            LockTimeConstraint::Unconstrained,
+        );
+        ProposedLeg::new(
+            execution,
+            BTreeMap::new(),
+            contribution,
+            PROVIDER_PAYMENT_OUTPUT_ID,
+            USER_RECEIVE_OUTPUT_ID,
+        )
+    }
+}
+
 fn build_settlement(
     user: P2trWallet,
     provider: P2trWallet,
@@ -249,47 +380,133 @@ fn build_settlement(
     payment_input: OwnedUtxo,
     inventory_input: OwnedUtxo,
     assets: SettlementAssets,
+    genesis_hash: BlockHash,
 ) -> SettlementFixture {
-    let layout = SettlementLayout::composed();
-    let prevouts = vec![
-        fee_input.txout.clone(),
-        payment_input.txout.clone(),
-        inventory_input.txout.clone(),
-    ];
-    let mut pset = PartiallySignedTransaction::new_v2();
-    pset.add_input(user.input(&fee_input));
-    pset.add_input(user.input(&payment_input));
-    pset.add_input(provider.input(&inventory_input));
-
-    pset.add_output(user.confidential_output(
-        USER_FEE_INPUT_VALUE - NETWORK_FEE,
-        assets.policy,
-        layout.fee_input,
-    ));
-    pset.add_output(provider.confidential_output(
-        PROVIDER_PAYMENT_VALUE,
-        assets.payment,
-        layout.payment_input,
-    ));
-    pset.add_output(provider.confidential_output(
-        PROVIDER_INVENTORY_VALUE - USER_RECEIVE_VALUE,
+    let context = VenueContext {
+        chain: ChainIdentity {
+            network: LiquidNetwork::ElementsRegtest,
+            genesis_hash,
+        },
+        market: ContractId::new(inventory_input.outpoint),
+        policy_asset: assets.policy,
+    };
+    let network_fee = NetworkFee::new(assets.policy, NETWORK_FEE).expect("network fee");
+    let recipient = ConfidentialRecipient::new(
+        user.address.script_pubkey(),
+        user.address
+            .blinding_pubkey
+            .map(BitcoinPublicKey::new)
+            .expect("confidential user address"),
+    )
+    .expect("user recipient");
+    let request = ExecutionRequest::exact_in(
+        context,
+        AssetAmount::new(assets.payment, PROVIDER_PAYMENT_VALUE).expect("exact input"),
         assets.outcome,
-        layout.inventory_input,
-    ));
-    pset.add_output(user.confidential_output(
-        USER_PAYMENT_INPUT_VALUE - PROVIDER_PAYMENT_VALUE,
-        assets.payment,
-        layout.payment_input,
-    ));
-    pset.add_output(user.confidential_output(
         USER_RECEIVE_VALUE,
-        assets.outcome,
-        layout.inventory_input,
-    ));
-    add_fee_output(&mut pset, NETWORK_FEE, assets.policy);
+        recipient,
+        BTreeMap::new(),
+        NETWORK_FEE,
+    )
+    .expect("exact-in request");
+    let evidence = TestRfqEvidence {
+        context,
+        provider: provider.clone(),
+        inventory_input: inventory_input.clone(),
+        assets,
+    };
+    let leg_request = request
+        .exact_in_leg(
+            LegId::new(1),
+            PROVIDER_PAYMENT_VALUE,
+            payment_input.outpoint,
+        )
+        .expect("single-leg allocation");
+    let proposal = TestRfqAdapter
+        .prepare(&leg_request, &evidence)
+        .expect("client-local RFQ adapter");
+    let leg = leg_request
+        .authorize(proposal)
+        .expect("proposal matches exact allocation and recipient");
+    let route = request
+        .validate_route(vec![leg], network_fee)
+        .expect("prepared leg satisfies exact-in intent");
+
+    let wallet = TransactionContribution::new(
+        vec![
+            InputSpec::new(
+                FEE_INPUT_ID,
+                fee_input.outpoint,
+                fee_input.txout.clone(),
+                InputSequence::Final,
+            ),
+            InputSpec::new(
+                PAYMENT_INPUT_ID,
+                payment_input.outpoint,
+                payment_input.txout.clone(),
+                InputSequence::Final,
+            ),
+        ],
+        vec![
+            user.confidential_output_spec(
+                FEE_CHANGE_OUTPUT_ID,
+                USER_FEE_INPUT_VALUE - NETWORK_FEE,
+                assets.policy,
+                BlinderRef::Local(FEE_INPUT_ID),
+            ),
+            user.confidential_output_spec(
+                USER_PAYMENT_CHANGE_OUTPUT_ID,
+                USER_PAYMENT_INPUT_VALUE - PROVIDER_PAYMENT_VALUE,
+                assets.payment,
+                BlinderRef::Local(PAYMENT_INPUT_ID),
+            ),
+        ],
+        LockTimeConstraint::Unconstrained,
+    );
+    let composed_route = route
+        .compose(CompositionLimits::default(), wallet)
+        .expect("complete route composition");
+    let wallet_handle = composed_route.layout().wallet();
+    let venue_handle = composed_route
+        .layout()
+        .leg(LegId::new(1))
+        .expect("RFQ placement");
+    let (composed, route_authorization) = composed_route.into_parts();
+    assert_eq!(
+        composed
+            .layout()
+            .placement(wallet_handle)
+            .expect("wallet placement")
+            .input_base(),
+        0
+    );
+    assert!(
+        composed
+            .layout()
+            .placement(venue_handle)
+            .expect("venue placement")
+            .input_base()
+            > 0,
+        "the venue contribution must not rely on global input zero"
+    );
+    let layout = SettlementLayout::from_composition(composed.layout(), wallet_handle, venue_handle);
+    let (mut pset, _, manifest) = composed.into_parts();
+    user.configure_input(&mut pset.inputs_mut()[layout.fee_input]);
+    user.configure_input(&mut pset.inputs_mut()[layout.payment_input]);
+    provider.configure_input(&mut pset.inputs_mut()[layout.inventory_input]);
+    manifest
+        .validate(&pset)
+        .expect("signing metadata preserves the frozen manifest");
+    let prevouts = pset
+        .inputs()
+        .iter()
+        .map(|input| input.witness_utxo.clone().expect("composed prevout"))
+        .collect();
 
     SettlementFixture {
         pset,
+        manifest,
+        route_authorization,
         layout,
         prevouts,
         user,
@@ -390,17 +607,51 @@ fn expect_output(
     if output.amount != Some(amount) {
         return Err(format!("wrong amount at output {index}"));
     }
+    if output.redeem_script.is_some()
+        || output.witness_script.is_some()
+        || !output.bip32_derivation.is_empty()
+        || output.tap_internal_key.is_some()
+        || output.tap_tree.is_some()
+        || !output.tap_key_origins.is_empty()
+        || !output.proprietary.is_empty()
+        || !output.unknown.is_empty()
+    {
+        return Err(format!("unexpected wallet metadata at output {index}"));
+    }
     Ok(())
 }
 
 fn validate_settlement_intent(fixture: &SettlementFixture) -> Result<(), String> {
     let pset = &fixture.pset;
     let layout = fixture.layout;
+    let route_summary = fixture.route_authorization.summary();
+    fixture
+        .manifest
+        .validate(pset)
+        .map_err(|error| error.to_string())?;
+    if route_summary.execution().input()
+        != AssetAmount::new(fixture.assets.payment, PROVIDER_PAYMENT_VALUE)
+            .map_err(|error| error.to_string())?
+        || route_summary.execution().output()
+            != AssetAmount::new(fixture.assets.outcome, USER_RECEIVE_VALUE)
+                .map_err(|error| error.to_string())?
+        || !route_summary.venue_fees().is_empty()
+        || route_summary.network_fee().policy_asset() != fixture.assets.policy
+        || route_summary.network_fee().amount() != NETWORK_FEE
+    {
+        return Err("normalized route summary no longer matches settlement intent".into());
+    }
     if pset.inputs().len() != 3 || pset.outputs().len() != 6 {
         return Err("unexpected input or output count".into());
     }
     if pset.global.version != 2 || pset.global.tx_data.version != 2 {
         return Err("unexpected PSET or transaction version".into());
+    }
+    if !pset.global.xpub.is_empty()
+        || !pset.global.proprietary.is_empty()
+        || !pset.global.unknown.is_empty()
+    {
+        return Err("unexpected global wallet metadata".into());
     }
     let expected_inputs = [
         (layout.fee_input, &fixture.fee_input, &fixture.user),
@@ -423,6 +674,7 @@ fn validate_settlement_intent(fixture: &SettlementFixture) -> Result<(), String>
             .witness_utxo
             .as_ref()
             .is_some_and(|actual| same_prevout_body(actual, &expected.txout))
+            || input.in_utxo_rangeproof != expected.txout.witness.rangeproof
         {
             return Err(format!("wrong witness UTXO at input {index}"));
         }
@@ -431,9 +683,19 @@ fn validate_settlement_intent(fixture: &SettlementFixture) -> Result<(), String>
             || input.tap_merkle_root.is_some()
             || !input.tap_script_sigs.is_empty()
             || !input.tap_scripts.is_empty()
+            || !input.tap_key_origins.is_empty()
+            || input.non_witness_utxo.is_some()
+            || !input.partial_sigs.is_empty()
+            || !input.bip32_derivation.is_empty()
+            || !input.ripemd160_preimages.is_empty()
+            || !input.sha256_preimages.is_empty()
+            || !input.hash160_preimages.is_empty()
+            || !input.hash256_preimages.is_empty()
             || input.final_script_sig.is_some()
             || input.redeem_script.is_some()
             || input.witness_script.is_some()
+            || !input.proprietary.is_empty()
+            || !input.unknown.is_empty()
         {
             return Err(format!("wrong Taproot signing policy at input {index}"));
         }
@@ -541,6 +803,14 @@ fn validate_settlement_intent(fixture: &SettlementFixture) -> Result<(), String>
         || fee.blinder_index.is_some()
         || fee.value_rangeproof.is_some()
         || fee.asset_surjection_proof.is_some()
+        || fee.redeem_script.is_some()
+        || fee.witness_script.is_some()
+        || !fee.bip32_derivation.is_empty()
+        || fee.tap_internal_key.is_some()
+        || fee.tap_tree.is_some()
+        || !fee.tap_key_origins.is_empty()
+        || !fee.proprietary.is_empty()
+        || !fee.unknown.is_empty()
     {
         return Err("fee output is not exact and explicit".into());
     }
@@ -758,6 +1028,7 @@ fn offline_fixture() -> SettlementFixture {
             payment: payment_asset,
             outcome: outcome_asset,
         },
+        BlockHash::from_byte_array([0x71; 32]),
     )
 }
 
@@ -1058,6 +1329,18 @@ fn settlement_intent_and_disclosure_validation_fail_closed() {
     let fixture = offline_fixture();
     validate_settlement_intent(&fixture).expect("baseline intent");
 
+    let round_trip: PartiallySignedTransaction =
+        deserialize(&serialize(&fixture.pset)).expect("PSET round trip");
+    assert_eq!(
+        round_trip.inputs()[fixture.layout.payment_input].in_utxo_rangeproof,
+        fixture.payment_input.txout.witness.rangeproof,
+        "a confidential input rangeproof must survive a PSET handoff"
+    );
+    fixture
+        .manifest
+        .validate(&round_trip)
+        .expect("round-tripped input proof remains authorized");
+
     let mut mutated = fixture.clone();
     mutated.pset.global.tx_data.version = 3;
     assert!(validate_settlement_intent(&mutated).is_err());
@@ -1102,6 +1385,10 @@ fn settlement_intent_and_disclosure_validation_fail_closed() {
     mutated = fixture.clone();
     mutated.pset.inputs_mut()[mutated.layout.payment_input].witness_utxo =
         Some(mutated.inventory_input.txout.clone());
+    assert!(validate_settlement_intent(&mutated).is_err());
+
+    mutated = fixture.clone();
+    mutated.pset.inputs_mut()[mutated.layout.payment_input].in_utxo_rangeproof = None;
     assert!(validate_settlement_intent(&mutated).is_err());
 
     mutated = fixture.clone();
@@ -1354,6 +1641,7 @@ fn two_wallet_confidential_p2tr_rfq_settlement_is_accepted_and_spendable() {
             payment: payment_asset,
             outcome: outcome_asset,
         },
+        genesis_hash,
     );
     validate_settlement_intent(&fixture).expect("exact RFQ intent before blinding");
     blind_settlement(&mut fixture);
