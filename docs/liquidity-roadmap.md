@@ -414,6 +414,10 @@ ExecutableLeg {
 }
 ```
 
+The provisional ordinary-output API uses the narrower name `PreparedLeg`: its
+economics and output claims are authorized, but venue-specific completion and
+the final signer checks still have to succeed before it is executable on chain.
+
 For an RFQ leg, preparation reserves exact provider inventory and returns a
 signed short-lived commitment.
 
@@ -569,14 +573,44 @@ interface proposed here:
   separate authority boundary from node indexing.
 - The [live multi-market fixture](../crates/deadcat-client/tests/market_regtest.rs)
   composes two market transitions and proves transaction-atomic behavior.
+- The [confidential RFQ fixture](../crates/deadcat-client/tests/rfq_regtest.rs)
+  proves two-wallet P2TR settlement, collaborative blinding, exact
+  whole-transaction validation, and spendable recipient outputs on
+  liquidregtest.
+- The provisional client-local [venue model](../crates/deadcat-client/src/venue.rs)
+  and [transaction composer](../crates/deadcat-client/src/composition.rs)
+  separate aggregate user intent from exact per-leg allocation, bind an
+  authenticated venue proposal to real payment/receipt outputs and the user's
+  exact confidential destination, and allocate contribution-local symbolic
+  fragments without defining a remote wire format. A validated route owns the
+  exact legs and network fee consumed by composition, so validation and
+  assembly cannot silently diverge. This route validation does not infer wallet
+  change, validate ancillary-output net effects or per-asset transaction
+  balance, or authorize signing; each participant's final whole-transaction
+  validator remains a separate boundary.
+- Cross-contribution blinding roles refer to exact outpoints rather than a
+  shared numeric namespace. A venue may assign only its claimed payment output
+  to the payer's external blinder; its user receipt and ancillary confidential
+  outputs remain assigned to inputs local to that venue contribution.
+- The composer's `UnblindedStructureManifest` is intentionally not signing
+  authorization. It freezes transaction-body fields and clear output intent,
+  while participant-specific validation must still authorize sighash and spend
+  policy, verify confidential commitments and proofs, and rewind owned outputs.
+- The initial generic venue binding supports ordinary confidential exclusive
+  payment and receipt outputs. Trusted client-local covenant builders have a
+  separate private template path; a non-issuance binary-market transition is
+  tested at nonzero composer offsets. Issuance fields and future AMM/DLOB
+  economic-delta bindings remain deliberately deferred.
 - The retired
   [`MakerFillPlan`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-client/src/maker_builder.rs)
   and
   [heterogeneous live fixture](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-client/tests/market_regtest.rs)
   remain historical composition evidence, not production interfaces.
 
-Phase 1 should extract and test the smallest generic plan/composer seam from
-these patterns instead of making the router depend on maker-specific types.
+Phase 1 has extracted and tested the smallest generic plan/composer seam from
+these patterns without making the router depend on maker-specific types. The
+API remains provisional until real remote RFQ evidence and a production signer
+exercise it.
 
 ### Symbolic transaction contributions
 
@@ -590,10 +624,11 @@ Each venue adapter instead contributes a symbolic fragment containing:
 - input ordering or adjacency constraints;
 - mandatory output templates;
 - output ordering or adjacency constraints;
-- net asset deltas;
+- gross unsigned user spends and receives, with fees itemized separately;
 - explicit or confidential output policy;
 - global locktime and sequence requirements;
-- mergeability rules for user-facing outputs;
+- an exclusive output-claim policy; any future aggregation requires explicit
+  compatibility and a proven collaborative-blinding construction;
 - a local covenant finalizer or remote signer role; and
 - a conservative resource estimate.
 

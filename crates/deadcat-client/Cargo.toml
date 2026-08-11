@@ -1,6 +1,6 @@
 [package]
 name = "deadcat-client"
-description = "Client-side Deadcat evidence verification and market transaction construction."
+description = "Client-side Deadcat evidence verification, venue normalization, and transaction construction."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
