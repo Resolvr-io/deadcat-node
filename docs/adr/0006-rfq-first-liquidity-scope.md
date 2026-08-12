@@ -123,7 +123,8 @@ links apply only to that revision.
 4. **Completed in PR #26 as a provisional client-local API:** add exact-in/exact-out
    aggregate intent, exact per-leg allocation, authenticated proposal binding,
    route-owned transaction composition, and no remote wire format.
-5. **Provider core implemented under ADR 0007:** complete the separate wallet,
-   quoting, transaction-validation, signer, relay, and remote-service layers.
+5. **Provider state core and wallet capability boundary implemented under ADR
+   0007:** complete the concrete wallet backend, quoting,
+   transaction-validation, signer adapter, relay, and remote-service layers.
 6. Add production-shaped process, crash-recovery, mutation, reorg, and
    operational acceptance gates.

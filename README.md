@@ -5,9 +5,11 @@ prediction-market protocol on Liquid. It owns the canonical SimplicityHL
 contract, interprets confirmed chain state, indexes that state in redb, and
 serves independently verifiable evidence over Iroh.
 
-The node is deliberately not a wallet or trading venue. Keys, wallet discovery,
-PSET construction, confidential-transaction blinding, intent validation, venue
-selection, and signing stay on the client.
+The node is deliberately not a wallet or trading venue. End-user keys, wallet
+discovery, PSET construction, intent validation, venue selection, and signing
+stay on the client. The separate RFQ-provider library defines interfaces for
+provider-owned inventory, confidential blinding, and signing, but no provider
+wallet backend or key material runs in `deadcat-node`.
 
 ## Current scope
 
@@ -30,12 +32,13 @@ service, with a client-side router responsible for quote validation and
 transaction construction. A future AMM or decentralized limit-order book can
 implement the same venue boundary. [ADR 0007](docs/adr/0007-rfq-provider-state-machine.md)
 defines the provider's durable reservation and commit-before-sign boundary.
-The transport-free provider state core is implemented, while its wallet,
-pricing, transaction validator, signer adapter, remote service, and relay
-layers remain future work. Until the validator and signer adapter land, the
-safety-critical commit and signed-result transitions are intentionally
-crate-internal. The RFQ provider remains separate from `deadcat-node`; future
-AMM and DLOB protocols are not implemented by this repository today.
+The transport-free provider state core and backend-neutral wallet capability
+boundary are implemented. A production wallet/RPC/HSM backend, pricing,
+transaction validator, signer adapter, remote service, and relay remain future
+work. Until the validator and signer adapter land, the safety-critical commit
+and signed-result transitions are intentionally crate-internal. The RFQ
+provider remains separate from `deadcat-node`; future AMM and DLOB protocols
+are not implemented by this repository today.
 
 ## Assurance
 

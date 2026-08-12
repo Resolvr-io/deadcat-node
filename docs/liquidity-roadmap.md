@@ -583,6 +583,17 @@ interface proposed here:
   proves two-wallet P2TR settlement, collaborative blinding, exact
   whole-transaction validation, and spendable recipient outputs on
   liquidregtest.
+- The transport-free
+  [`deadcat-rfq-provider`](../crates/deadcat-rfq-provider/src/lib.rs) core
+  durably allocates exact inventory and enforces commit-before-sign recovery.
+  Its backend-neutral wallet boundary admits only authenticated confidential
+  tree-less P2TR inventory, intersects complete time-bounded wallet scans with
+  durable availability, retains confidential input openings only in redacted
+  memory for collaborative blinding, defines typed confidential receive/change
+  destination capabilities, and gives signers only exact durable jobs with
+  explicit `SIGHASH_ALL` targets. Destination non-reuse and authoritative scan
+  freshness are backend obligations. It intentionally does not choose a
+  production wallet, RPC, descriptor, or HSM backend.
 - The provisional client-local [venue model](../crates/deadcat-client/src/venue.rs)
   and [transaction composer](../crates/deadcat-client/src/composition.rs)
   separate aggregate user intent from exact per-leg allocation, bind an
@@ -614,8 +625,10 @@ interface proposed here:
   remain historical composition evidence, not production interfaces.
 
 Phase 1 has extracted and tested the smallest generic plan/composer seam from
-these patterns without making the router depend on maker-specific types. The
-API remains provisional until real remote RFQ evidence and a production signer
+these patterns without making the router depend on maker-specific types, and
+has added the provider's durable state plus wallet-capability boundary. The API
+remains provisional until configurable quote construction, concrete final-PSET
+validation, real remote RFQ evidence, and a production wallet/signer backend
 exercise it.
 
 ### Symbolic transaction contributions
@@ -953,8 +966,10 @@ three independently designed fragment layouts compose safely.
   network representation?
 - How are signed RFQ executions published without unnecessarily sacrificing
   trade privacy?
-- Which sighash profiles are supported for each input type, what fields does
-  each profile commit, and how are omitted proofs or witnesses authenticated?
+- Which sighash profiles are supported for future covenant venue inputs, what
+  fields does each profile commit, and how are omitted proofs or witnesses
+  authenticated? RFQ provider inventory version one is fixed to tree-less P2TR
+  key path with explicit `SIGHASH_ALL`.
 - ADR 0007 resolves reservation, commit-before-sign, signature persistence, and
   permanent input retirement. Exact relay, ambiguous-broadcast, and canonical
   outspend reconciliation remain to be specified with the service layer.

@@ -2,6 +2,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use elements::hashes::Hash as _;
+use elements::secp256k1_zkp::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
 use elements::{AssetId, BlockHash, OutPoint, Txid};
 use tempfile::TempDir;
 
@@ -43,7 +44,24 @@ fn transaction_fee(identity: ProviderIdentity, amount: u64) -> TransactionFee {
 }
 
 fn inventory(marker: u8) -> InventoryItem {
-    InventoryItem::new(outpoint(marker, 0), asset(2), 10_000).expect("inventory")
+    inventory_variant(marker, marker)
+}
+
+fn inventory_variant(outpoint_marker: u8, metadata_marker: u8) -> InventoryItem {
+    let secp = Secp256k1::new();
+    let metadata_marker = metadata_marker.max(1);
+    let secret_key = SecretKey::from_slice(&[metadata_marker; 32]).expect("secret key");
+    let keypair = Keypair::from_secret_key(&secp, &secret_key);
+    let (internal_key, _) = XOnlyPublicKey::from_keypair(&keypair);
+    InventoryItem::new(
+        outpoint(outpoint_marker, 0),
+        asset(2),
+        10_000,
+        WalletKeyLocator::new([metadata_marker; 32]).expect("wallet locator"),
+        internal_key,
+        InventoryBinding::new([metadata_marker.wrapping_add(1); 32]),
+    )
+    .expect("inventory")
 }
 
 fn owner(marker: u8) -> OwnerId {
@@ -124,6 +142,51 @@ fn fee_policy_uses_checked_ceiling_and_both_parties_bounds() {
         policy.validate(wrong_asset),
         Err(FeePolicyViolation::WrongPolicyAsset { .. })
     ));
+}
+
+#[test]
+fn wallet_inventory_batch_is_atomic_and_exact_rediscovery_is_idempotent() {
+    let directory = TempDir::new().expect("tempdir");
+    let identity = identity(81);
+    let book = open_book(&directory, identity);
+    let existing = inventory(120);
+    let new_item = inventory(121);
+    let now = UnixMillis::new(100);
+    assert_eq!(
+        book.import_inventory_batch(&[existing], &now)
+            .expect("first import"),
+        1
+    );
+    assert_eq!(
+        book.import_inventory_batch(&[existing], &now)
+            .expect("exact retry"),
+        0
+    );
+
+    let conflict = inventory_variant(120, 122);
+    assert!(matches!(
+        book.import_inventory_batch(&[new_item, conflict], &UnixMillis::new(101)),
+        Err(ProviderError::InventoryMetadataConflict { outpoint: actual })
+            if actual == existing.outpoint()
+    ));
+    assert!(
+        book.inventory(new_item.outpoint())
+            .expect("new inventory query")
+            .is_none(),
+        "a later conflict must roll back the entire discovery batch"
+    );
+    assert_eq!(book.audit_log().expect("audit").len(), 1);
+
+    assert!(matches!(
+        book.import_inventory_batch(&[new_item, new_item], &UnixMillis::new(102)),
+        Err(ProviderError::DuplicateInventoryOutpoint(actual))
+            if actual == new_item.outpoint()
+    ));
+    assert!(
+        book.inventory(new_item.outpoint())
+            .expect("duplicate inventory query")
+            .is_none()
+    );
 }
 
 #[test]
@@ -566,6 +629,60 @@ fn fee_policy_is_rechecked_before_the_irreversible_transition() {
 }
 
 #[test]
+fn signing_commitment_covers_every_durable_wallet_target_field() {
+    let identity = identity(18);
+    let request = plan(identity, owner(1), 1, 2, vec![outpoint(30, 0)], 1_000);
+    let reservation = StoredReservation {
+        id: derive_reservation_id(request.owner(), request.idempotency_key()).to_bytes(),
+        owner: request.owner().to_bytes(),
+        idempotency_key: request.idempotency_key().to_bytes(),
+        request_digest: request_digest(identity, &request).expect("request digest"),
+        quote_commitment: request.quote_commitment().to_bytes(),
+        outpoints: request.outpoints().to_vec(),
+        created_at: 100,
+        accept_before: request.accept_before().value(),
+        fee_policy: StoredFeePolicy::from(request.fee_policy()),
+        state: StoredReservationState::Reserved,
+    };
+    let base =
+        StoredSigningTarget::from_inventory(StoredInventoryItem::from(inventory_variant(30, 30)));
+    let alternate =
+        StoredSigningTarget::from_inventory(StoredInventoryItem::from(inventory_variant(31, 31)));
+    let expected = signing_commitment(
+        &reservation,
+        &[1, 2, 3],
+        transaction_fee(identity, 200),
+        &[base],
+    )
+    .expect("base commitment");
+
+    let mut changed_outpoint = base;
+    changed_outpoint.outpoint = alternate.outpoint;
+    let mut changed_locator = base;
+    changed_locator.wallet_locator = alternate.wallet_locator;
+    let mut changed_key = base;
+    changed_key.internal_key = alternate.internal_key;
+    let mut changed_binding = base;
+    changed_binding.inventory_binding = alternate.inventory_binding;
+
+    for (field, target) in [
+        ("outpoint", changed_outpoint),
+        ("wallet locator", changed_locator),
+        ("internal key", changed_key),
+        ("inventory binding", changed_binding),
+    ] {
+        let actual = signing_commitment(
+            &reservation,
+            &[1, 2, 3],
+            transaction_fee(identity, 200),
+            &[target],
+        )
+        .expect("changed commitment");
+        assert_ne!(expected, actual, "target {field} must be committed");
+    }
+}
+
+#[test]
 fn committed_outpoints_never_reopen_after_deadline_cancel_or_restart() {
     let directory = TempDir::new().expect("tempdir");
     let identity = identity(16);
@@ -618,6 +735,11 @@ fn committed_outpoints_never_reopen_after_deadline_cancel_or_restart() {
             if job.reservation_id() == reservation_id
                 && job.commitment() == commitment
                 && job.pre_sign_payload() == [9, 8, 7]
+                && job.targets().len() == 1
+                && job.targets()[0].outpoint() == item.outpoint()
+                && job.targets()[0].wallet_locator() == item.wallet_locator()
+                && job.targets()[0].internal_key() == item.internal_key()
+                && job.targets()[0].inventory_binding() == item.binding()
     ));
     assert!(matches!(
         reopened.reserve(
