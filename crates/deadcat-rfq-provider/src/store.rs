@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use elements::hashes::Hash as _;
-use elements::secp256k1_zkp::XOnlyPublicKey;
+use elements::secp256k1_zkp::{Secp256k1, XOnlyPublicKey};
 use elements::{AssetId, BlockHash, OutPoint};
 use redb::{
     Database, Durability, ReadableDatabase as _, ReadableTable as _, TableDefinition,
@@ -23,6 +23,13 @@ use crate::model::{
     ReservationView, SignedArtifact, SignedArtifactDigest, SigningCommitment, SigningJob,
     SigningTarget, TransactionFee, UnixMillis, WalletKeyLocator,
 };
+use crate::quote::{
+    FirmQuote, FirmQuoteDraft, FirmQuoteOutcome, FirmQuoteRequest, PricingDecision,
+    QuoteContribution, QuoteEnginePolicy, QuoteExecution, QuoteOutputRole, QuoteSnapshotEvidence,
+    QuotedProviderInput, finalize_quote, quote_from_stored_parts, quote_outcome,
+    recompute_quote_commitment, recovery_metadata_commitment,
+};
+use crate::wallet::recompute_inventory_binding;
 
 pub const SCHEMA_VERSION: u32 = 1;
 /// Maximum number of unrelated expirations one explicit sweep may mutate in a
@@ -36,12 +43,15 @@ const ALLOCATIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("allocat
 const RESERVATIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("reservations");
 const REQUEST_KEYS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("request_keys");
 const EXPIRATIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("expirations");
+const LIVE_QUOTES_BY_OWNER: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("live_quotes_by_owner");
 const AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
 
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 const PROVIDER_IDENTITY_KEY: &str = "provider_identity";
 const LAST_OBSERVED_TIME_KEY: &str = "last_observed_unix_millis";
 const AUDIT_SEQUENCE_KEY: &str = "audit_sequence";
+const ALLOCATION_REVISION_KEY: &str = "allocation_revision";
 
 const RESERVATION_ID_DOMAIN: &[u8] = b"deadcat/rfq/reservation-id/v1";
 const REQUEST_DOMAIN: &[u8] = b"deadcat/rfq/reservation-request/v1";
@@ -232,23 +242,299 @@ impl ReservationBook {
         Ok(Some(InventoryView::new(item.to_domain()?, state)))
     }
 
-    pub(crate) fn inventory_all(&self) -> Result<Vec<InventoryView>, ProviderError> {
+    /// Read only the requested durable inventory records and the allocation
+    /// CAS token from one database snapshot.
+    ///
+    /// Durable inventory history is append-only, while a wallet snapshot is
+    /// explicitly bounded. Point-reading the current snapshot prevents quote
+    /// admission cost from growing with the provider's lifetime output history.
+    pub(crate) fn inventory_state_for(
+        &self,
+        outpoints: &[OutPoint],
+    ) -> Result<(Vec<InventoryView>, u64), ProviderError> {
         self.ensure_healthy()?;
+        if outpoints.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(ProviderError::CorruptState(
+                "inventory-state lookup outpoints are not strictly sorted".to_owned(),
+            ));
+        }
         let read = self.database.begin_read()?;
         let inventory = read.open_table(INVENTORY)?;
         let allocations = read.open_table(ALLOCATIONS)?;
-        let mut result = Vec::new();
-        for entry in inventory.iter()? {
-            let (key, item) = entry?;
+        let mut result = Vec::with_capacity(outpoints.len());
+        for outpoint in outpoints {
+            let key = outpoint_key(*outpoint);
+            let item = inventory.get(key.as_slice())?.ok_or_else(|| {
+                ProviderError::CorruptState(format!(
+                    "published wallet output {outpoint:?} has no durable inventory record"
+                ))
+            })?;
             let item: StoredInventoryItem = decode_record(item.value())?;
+            let domain = item.to_domain()?;
+            if domain.outpoint() != *outpoint {
+                return Err(ProviderError::CorruptState(format!(
+                    "inventory key does not match requested outpoint {outpoint:?}"
+                )));
+            }
             let state = allocations
-                .get(key.value())?
+                .get(key.as_slice())?
                 .map(|allocation| decode_record::<StoredAllocation>(allocation.value()))
                 .transpose()?
                 .map_or(InventoryState::Available, StoredAllocation::to_view);
-            result.push(InventoryView::new(item.to_domain()?, state));
+            result.push(InventoryView::new(domain, state));
         }
-        Ok(result)
+        let meta = read.open_table(META)?;
+        let revision = meta
+            .get(ALLOCATION_REVISION_KEY)?
+            .ok_or(ProviderError::MissingMetadata(ALLOCATION_REVISION_KEY))?;
+        let revision =
+            decode_u64(revision.value()).map_err(|()| ProviderError::CorruptAllocationRevision)?;
+        Ok((result, revision))
+    }
+
+    /// Replay an exact request or preflight capacity before any pricing,
+    /// inventory selection, or destination generation occurs.
+    ///
+    /// The bounded expiry cleanup is committed even when the caller is still
+    /// over quota. That makes a backlog monotonically drain under ordinary
+    /// quote traffic instead of rolling cleanup back with an admission error.
+    pub(crate) fn preflight_firm_quote<C: Clock>(
+        &self,
+        owner: OwnerId,
+        key: IdempotencyKey,
+        request_digest: crate::model::QuoteRequestDigest,
+        policy: QuoteEnginePolicy,
+        clock: &C,
+    ) -> Result<Option<FirmQuoteOutcome>, ProviderError> {
+        let (_operation_guard, write, now) = self.begin_timed_write(clock)?;
+        if let Some(binding) = read_request_binding(&write, owner, key)? {
+            if binding.semantic_request_digest != request_digest.to_bytes() {
+                return Err(ProviderError::IdempotencyConflict { owner, key });
+            }
+            let record = replay_binding_in_write(&write, binding, now)?;
+            let outcome = record.to_firm_quote_outcome(self.identity, false)?;
+            self.commit_write(write)?;
+            return Ok(Some(outcome));
+        }
+
+        expire_due_in_write(&write, now, MAX_EXPIRATION_BATCH)?;
+        match enforce_live_quote_limits(&write, owner, policy, now) {
+            Ok(()) => {
+                self.commit_write(write)?;
+                Ok(None)
+            }
+            Err(
+                error @ (ProviderError::OwnerLiveQuoteLimit { .. }
+                | ProviderError::GlobalLiveQuoteLimit { .. }),
+            ) => {
+                self.commit_write(write)?;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Replay a request that may have won after quote preflight but before the
+    /// caller acquired the inventory-snapshot lock.
+    pub(crate) fn replay_firm_quote<C: Clock>(
+        &self,
+        owner: OwnerId,
+        key: IdempotencyKey,
+        request_digest: crate::model::QuoteRequestDigest,
+        clock: &C,
+    ) -> Result<Option<FirmQuoteOutcome>, ProviderError> {
+        let (_operation_guard, write, now) = self.begin_timed_write(clock)?;
+        let Some(binding) = read_request_binding(&write, owner, key)? else {
+            self.commit_write(write)?;
+            return Ok(None);
+        };
+        if binding.semantic_request_digest != request_digest.to_bytes() {
+            return Err(ProviderError::IdempotencyConflict { owner, key });
+        }
+        let record = replay_binding_in_write(&write, binding, now)?;
+        let outcome = record.to_firm_quote_outcome(self.identity, false)?;
+        self.commit_write(write)?;
+        Ok(Some(outcome))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reserve_firm_quote_from_snapshot<C: Clock>(
+        &self,
+        owner: OwnerId,
+        key: IdempotencyKey,
+        semantic_request_digest: crate::model::QuoteRequestDigest,
+        draft: &FirmQuoteDraft,
+        policy: QuoteEnginePolicy,
+        snapshot_observed_at: UnixMillis,
+        maximum_snapshot_age_millis: u64,
+        clock: &C,
+    ) -> Result<FirmQuoteOutcome, ProviderError> {
+        if policy.fee_policy().policy_asset() != self.identity.policy_asset() {
+            return Err(ProviderError::WrongPolicyAsset {
+                expected: self.identity.policy_asset(),
+                actual: policy.fee_policy().policy_asset(),
+            });
+        }
+        let reservation_id = derive_reservation_id(owner, key);
+        let (_operation_guard, write, now) = self.begin_timed_write(clock)?;
+        if let Some(binding) = read_request_binding(&write, owner, key)? {
+            if binding.semantic_request_digest != semantic_request_digest.to_bytes() {
+                return Err(ProviderError::IdempotencyConflict { owner, key });
+            }
+            let record = replay_binding_in_write(&write, binding, now)?;
+            let outcome = record.to_firm_quote_outcome(self.identity, false)?;
+            self.commit_write(write)?;
+            return Ok(outcome);
+        }
+        if now < snapshot_observed_at {
+            self.commit_write(write)?;
+            return Err(ProviderError::InventorySnapshotObservedInFuture {
+                observed_at: snapshot_observed_at,
+                now,
+            });
+        }
+        if now.value() - snapshot_observed_at.value() >= maximum_snapshot_age_millis {
+            self.commit_write(write)?;
+            return Err(ProviderError::InventorySnapshotStale {
+                observed_at: snapshot_observed_at,
+                now,
+                maximum_age_millis: maximum_snapshot_age_millis,
+            });
+        }
+        let current_allocation_revision = allocation_revision(&write)?;
+        if current_allocation_revision != draft.snapshot.allocation_revision() {
+            return Err(ProviderError::EligibleInventoryChanged);
+        }
+        let accept_before = UnixMillis::new(
+            now.value()
+                .checked_add(policy.quote_lifetime_millis())
+                .ok_or(ProviderError::QuoteDeadlineOverflow)?,
+        );
+        let derived_request_digest =
+            crate::quote::quote_request_digest(self.identity, owner, key, &draft.request)?;
+        if derived_request_digest != semantic_request_digest {
+            return Err(ProviderError::FirmQuoteRequestDigestMismatch);
+        }
+        let outpoints = draft.selected_outpoints();
+        if read_reservation_from_write(&write, reservation_id)?.is_some() {
+            return Err(ProviderError::ReservationIdCollision(reservation_id));
+        }
+        for outpoint in &outpoints {
+            let key = outpoint_key(*outpoint);
+            let item = read_record_from_write::<StoredInventoryItem>(&write, INVENTORY, &key)?
+                .ok_or(ProviderError::UnknownInventory(*outpoint))?;
+            let quoted_input = draft
+                .contribution
+                .inputs()
+                .iter()
+                .find(|input| input.outpoint() == *outpoint)
+                .ok_or(ProviderError::FirmQuoteInventoryMismatch(*outpoint))?;
+            if item.asset != draft.selected_asset
+                || item.binding != quoted_input.inventory_binding().to_bytes()
+            {
+                return Err(ProviderError::FirmQuoteInventoryMismatch(*outpoint));
+            }
+            if let Some(allocation) =
+                read_record_from_write::<StoredAllocation>(&write, ALLOCATIONS, &key)?
+            {
+                return Err(ProviderError::OutpointUnavailable {
+                    outpoint: *outpoint,
+                    state: allocation.to_view(),
+                });
+            }
+        }
+        if let Err(error) = enforce_live_quote_limits(&write, owner, policy, now) {
+            // Preflight is advisory: another request may consume the final
+            // slot before this authoritative allocation. Preserve bounded
+            // expiry progress even when that race loses at the quota gate.
+            if matches!(
+                error,
+                ProviderError::OwnerLiveQuoteLimit { .. }
+                    | ProviderError::GlobalLiveQuoteLimit { .. }
+            ) {
+                self.commit_write(write)?;
+            }
+            return Err(error);
+        }
+        let quote = finalize_quote(
+            self.identity,
+            owner,
+            key,
+            semantic_request_digest,
+            reservation_id,
+            draft,
+            now,
+            accept_before,
+            policy.fee_policy(),
+        )?;
+        let plan = ReservationPlan::with_request_digest(
+            owner,
+            key,
+            semantic_request_digest,
+            quote.commitment(),
+            outpoints,
+            accept_before,
+            policy.fee_policy(),
+        )
+        .map_err(|error| {
+            ProviderError::CorruptState(format!(
+                "firm quote produced an invalid reservation plan: {error}"
+            ))
+        })?;
+        let request_digest = request_digest(self.identity, &plan)?;
+        let record = StoredReservation {
+            id: reservation_id.to_bytes(),
+            owner: owner.to_bytes(),
+            idempotency_key: key.to_bytes(),
+            semantic_request_digest: semantic_request_digest.to_bytes(),
+            request_digest,
+            quote_commitment: quote.commitment().to_bytes(),
+            quote: Some(StoredFirmQuote::from_domain(&quote, draft)),
+            outpoints: plan.outpoints().to_vec(),
+            created_at: now.value(),
+            accept_before: accept_before.value(),
+            fee_policy: StoredFeePolicy::from(policy.fee_policy()),
+            state: StoredReservationState::Reserved,
+        };
+        // Validate the exact durable representation before exposing a quote.
+        // Replay and startup perform the same check, but doing it before the
+        // first commit prevents an internal construction regression from
+        // returning a quote that would make the database unreopenable.
+        record.validate()?;
+        let persisted_quote = record
+            .quote
+            .as_ref()
+            .ok_or(ProviderError::FirmQuoteDraftInvalid)?;
+        let validated_quote = persisted_quote.to_domain(self.identity, &record)?;
+        let mut validated_selected_amount = 0_u64;
+        for quoted_input in validated_quote.contribution().inputs() {
+            let item = read_record_from_write::<StoredInventoryItem>(
+                &write,
+                INVENTORY,
+                &outpoint_key(quoted_input.outpoint()),
+            )?
+            .ok_or(ProviderError::UnknownInventory(quoted_input.outpoint()))?;
+            let domain_item = item.to_domain()?;
+            if item.asset != persisted_quote.selected_asset
+                || item.binding != quoted_input.inventory_binding().to_bytes()
+                || recompute_inventory_binding(domain_item, quoted_input.witness_utxo())
+                    != quoted_input.inventory_binding()
+            {
+                return Err(ProviderError::FirmQuoteInventoryMismatch(
+                    quoted_input.outpoint(),
+                ));
+            }
+            validated_selected_amount = validated_selected_amount
+                .checked_add(item.amount)
+                .ok_or(ProviderError::FirmQuoteDraftInvalid)?;
+        }
+        if validated_selected_amount != persisted_quote.selected_amount {
+            return Err(ProviderError::FirmQuoteDraftInvalid);
+        }
+        persist_new_reservation(&write, &record)?;
+        let reservation = record.to_view()?;
+        self.commit_write(write)?;
+        Ok(quote_outcome(quote, reservation, true))
     }
 
     /// Whether this exact authenticated request already has a durable binding.
@@ -257,6 +543,7 @@ impl ReservationBook {
     /// retries even when the discovery snapshot used by the original request
     /// has since been superseded. A positive result must still be passed to
     /// [`Self::reserve`] so deadline expiry and state replay happen atomically.
+    #[cfg(test)]
     pub(crate) fn has_matching_request(
         &self,
         plan: &ReservationPlan,
@@ -268,7 +555,6 @@ impl ReservationBook {
                 actual: plan.fee_policy().policy_asset(),
             });
         }
-        let expected_digest = request_digest(self.identity, plan)?;
         let read = self.database.begin_read()?;
         let request_keys = read.open_table(REQUEST_KEYS)?;
         let key = request_key(plan.owner(), plan.idempotency_key());
@@ -276,6 +562,7 @@ impl ReservationBook {
             return Ok(false);
         };
         let binding: StoredRequestBinding = decode_record(binding.value())?;
+        let expected_digest = request_digest(self.identity, plan)?;
         if binding.request_digest != expected_digest {
             return Err(ProviderError::IdempotencyConflict {
                 owner: plan.owner(),
@@ -305,6 +592,7 @@ impl ReservationBook {
     ///
     /// The clock is sampled after acquiring redb's serial writer, so a request
     /// queued behind another writer cannot commit using a stale pre-lock time.
+    #[cfg(test)]
     pub(crate) fn reserve<C: Clock>(
         &self,
         plan: &ReservationPlan,
@@ -316,6 +604,7 @@ impl ReservationBook {
     /// Reserve from one wallet snapshot, rechecking its exclusive freshness
     /// deadline using the same post-writer-lock observation as the quote
     /// deadline and durable allocation.
+    #[cfg(test)]
     pub(crate) fn reserve_from_snapshot<C: Clock>(
         &self,
         plan: &ReservationPlan,
@@ -330,6 +619,7 @@ impl ReservationBook {
         )
     }
 
+    #[cfg(test)]
     fn reserve_inner<C: Clock>(
         &self,
         plan: &ReservationPlan,
@@ -411,8 +701,10 @@ impl ReservationBook {
             id: reservation_id.to_bytes(),
             owner: plan.owner().to_bytes(),
             idempotency_key: plan.idempotency_key().to_bytes(),
+            semantic_request_digest: plan.request_digest().to_bytes(),
             request_digest,
             quote_commitment: plan.quote_commitment().to_bytes(),
+            quote: None,
             outpoints: plan.outpoints().to_vec(),
             created_at: now.value(),
             accept_before: plan.accept_before().value(),
@@ -424,6 +716,7 @@ impl ReservationBook {
         mutation_failpoints::hit(mutation_failpoints::RESERVE_AFTER_RECORD)?;
         let binding = StoredRequestBinding {
             reservation_id: reservation_id.to_bytes(),
+            semantic_request_digest: plan.request_digest().to_bytes(),
             request_digest,
         };
         write_record(
@@ -446,6 +739,7 @@ impl ReservationBook {
             #[cfg(test)]
             mutation_failpoints::hit(mutation_failpoints::RESERVE_AFTER_ALLOCATION)?;
         }
+        advance_allocation_revision(&write)?;
         let expiration_key = expiration_key(plan.accept_before(), reservation_id);
         let empty: &[u8] = &[];
         write
@@ -684,6 +978,7 @@ impl ReservationBook {
             #[cfg(test)]
             mutation_failpoints::hit(mutation_failpoints::COMMIT_AFTER_ALLOCATION)?;
         }
+        advance_allocation_revision(&write)?;
         let expiration_key = expiration_key(UnixMillis::new(record.accept_before), record.id());
         let removed_expiration = {
             let mut expirations = write.open_table(EXPIRATIONS)?;
@@ -694,6 +989,7 @@ impl ReservationBook {
                 "reserved reservation has no expiration index entry".to_owned(),
             ));
         }
+        remove_live_quote_index(&write, &record)?;
         #[cfg(test)]
         mutation_failpoints::hit(mutation_failpoints::COMMIT_AFTER_EXPIRATION)?;
         record.state = StoredReservationState::Committed {
@@ -884,6 +1180,9 @@ impl ReservationBook {
                 if meta.get(AUDIT_SEQUENCE_KEY)?.is_none() {
                     return Err(ProviderError::MissingMetadata(AUDIT_SEQUENCE_KEY));
                 }
+                if meta.get(ALLOCATION_REVISION_KEY)?.is_none() {
+                    return Err(ProviderError::MissingMetadata(ALLOCATION_REVISION_KEY));
+                }
             }
             None => {
                 if provider_tables_are_nonempty(&write)? {
@@ -896,6 +1195,7 @@ impl ReservationBook {
                 let identity = encode_record(&StoredProviderIdentity::from(self.identity))?;
                 meta.insert(PROVIDER_IDENTITY_KEY, identity.as_slice())?;
                 meta.insert(AUDIT_SEQUENCE_KEY, 0_u64.to_be_bytes().as_slice())?;
+                meta.insert(ALLOCATION_REVISION_KEY, 0_u64.to_be_bytes().as_slice())?;
             }
         }
         validate_store_integrity(&write, self.identity)?;
@@ -956,22 +1256,42 @@ impl ReservationBook {
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(crate) fn poison_inventory_record_for_test(
+        &self,
+        outpoint: OutPoint,
+    ) -> Result<(), ProviderError> {
+        let _operation_guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| ProviderError::OperationLockPoisoned)?;
+        let write = self.begin_immediate_write()?;
+        {
+            let mut inventory = write.open_table(INVENTORY)?;
+            let key = outpoint_key(outpoint);
+            inventory.insert(key.as_slice(), &[0xff_u8][..])?;
+        }
+        self.commit_write(write)
+    }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReserveOutcome {
+pub(crate) struct ReserveOutcome {
     reservation: ReservationView,
     created: bool,
 }
 
+#[cfg(test)]
 impl ReserveOutcome {
     #[must_use]
-    pub const fn reservation(&self) -> &ReservationView {
+    pub(crate) const fn reservation(&self) -> &ReservationView {
         &self.reservation
     }
 
     #[must_use]
-    pub const fn created(&self) -> bool {
+    pub(crate) const fn created(&self) -> bool {
         self.created
     }
 }
@@ -1105,6 +1425,7 @@ fn expire_due_in_write(
 /// keeps the hot path bounded by the request and reservation input limits;
 /// the service is responsible for draining unrelated expirations through
 /// [`ReservationBook::expire_due`] with an explicit batch size.
+#[cfg(test)]
 fn expire_requested_in_write(
     write: &WriteTransaction,
     now: UnixMillis,
@@ -1182,6 +1503,7 @@ fn release_reserved(
         #[cfg(test)]
         mutation_failpoints::hit(mutation_failpoints::RELEASE_AFTER_ALLOCATION)?;
     }
+    advance_allocation_revision(write)?;
     let expiration_key = expiration_key(UnixMillis::new(record.accept_before), record.id());
     let removed_expiration = {
         let mut expirations = write.open_table(EXPIRATIONS)?;
@@ -1192,6 +1514,7 @@ fn release_reserved(
             "reserved reservation has no expiration index entry".to_owned(),
         ));
     }
+    remove_live_quote_index(write, record)?;
     #[cfg(test)]
     mutation_failpoints::hit(mutation_failpoints::RELEASE_AFTER_EXPIRATION)?;
     record.state = StoredReservationState::Released {
@@ -1211,6 +1534,34 @@ fn release_reserved(
     )?;
     #[cfg(test)]
     mutation_failpoints::hit(mutation_failpoints::RELEASE_AFTER_AUDIT)?;
+    Ok(())
+}
+
+fn remove_live_quote_index(
+    write: &WriteTransaction,
+    record: &StoredReservation,
+) -> Result<(), ProviderError> {
+    let removed = write
+        .open_table(LIVE_QUOTES_BY_OWNER)?
+        .remove(
+            live_quote_key(
+                UnixMillis::new(record.accept_before),
+                OwnerId::new(record.owner),
+                record.id(),
+            )
+            .as_slice(),
+        )?
+        .is_some();
+    if record.quote.is_some() && !removed {
+        return Err(ProviderError::CorruptState(
+            "reserved firm quote has no owner live-quote index entry".to_owned(),
+        ));
+    }
+    if record.quote.is_none() && removed {
+        return Err(ProviderError::CorruptState(
+            "legacy reservation unexpectedly owns a firm-quote live index entry".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -1256,6 +1607,146 @@ fn read_request_binding(
     key: IdempotencyKey,
 ) -> Result<Option<StoredRequestBinding>, ProviderError> {
     read_record_from_write(write, REQUEST_KEYS, &request_key(owner, key))
+}
+
+fn replay_binding_in_write(
+    write: &WriteTransaction,
+    binding: StoredRequestBinding,
+    now: UnixMillis,
+) -> Result<StoredReservation, ProviderError> {
+    let mut record =
+        read_reservation_from_write(write, ReservationId::new(binding.reservation_id))?
+            .ok_or_else(|| {
+                ProviderError::CorruptState(
+                    "idempotency binding references a missing reservation".to_owned(),
+                )
+            })?;
+    if record.id != binding.reservation_id
+        || record.semantic_request_digest != binding.semantic_request_digest
+        || record.request_digest != binding.request_digest
+    {
+        return Err(ProviderError::CorruptState(
+            "idempotency binding disagrees with its reservation".to_owned(),
+        ));
+    }
+    if matches!(record.state, StoredReservationState::Reserved)
+        && now >= UnixMillis::new(record.accept_before)
+    {
+        release_reserved(write, &mut record, ReleaseReason::Expired, now)?;
+    }
+    Ok(record)
+}
+
+fn enforce_live_quote_limits(
+    write: &WriteTransaction,
+    owner: OwnerId,
+    policy: QuoteEnginePolicy,
+    now: UnixMillis,
+) -> Result<(), ProviderError> {
+    let live = write.open_table(LIVE_QUOTES_BY_OWNER)?;
+    let Some(first_deadline) = now.value().checked_add(1) else {
+        return Ok(());
+    };
+    let first = live_quote_key(
+        UnixMillis::new(first_deadline),
+        OwnerId::new([0; 32]),
+        ReservationId::new([0; 32]),
+    );
+    let mut global_live = 0_usize;
+    let mut owner_live = 0_usize;
+    for entry in live.range(first.as_slice()..)? {
+        let (key, value) = entry?;
+        let (deadline, indexed_owner, _) = decode_live_quote_key(key.value())?;
+        if deadline <= now || !value.value().is_empty() {
+            return Err(ProviderError::CorruptState(
+                "owner live-quote index contains an invalid entry".to_owned(),
+            ));
+        }
+        global_live = global_live
+            .checked_add(1)
+            .ok_or(ProviderError::LiveQuoteCountOverflow)?;
+        if indexed_owner == owner {
+            owner_live = owner_live
+                .checked_add(1)
+                .ok_or(ProviderError::LiveQuoteCountOverflow)?;
+            if owner_live >= policy.maximum_live_quotes_per_owner() {
+                return Err(ProviderError::OwnerLiveQuoteLimit {
+                    owner,
+                    maximum: policy.maximum_live_quotes_per_owner(),
+                });
+            }
+        }
+        if global_live >= policy.maximum_live_quotes_global() {
+            return Err(ProviderError::GlobalLiveQuoteLimit {
+                maximum: policy.maximum_live_quotes_global(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn persist_new_reservation(
+    write: &WriteTransaction,
+    record: &StoredReservation,
+) -> Result<(), ProviderError> {
+    write_record(write, RESERVATIONS, &record.id, record)?;
+    #[cfg(test)]
+    mutation_failpoints::hit(mutation_failpoints::RESERVE_AFTER_RECORD)?;
+    write_record(
+        write,
+        REQUEST_KEYS,
+        &request_key(
+            OwnerId::new(record.owner),
+            IdempotencyKey::new(record.idempotency_key),
+        ),
+        &StoredRequestBinding {
+            reservation_id: record.id,
+            semantic_request_digest: record.semantic_request_digest,
+            request_digest: record.request_digest,
+        },
+    )?;
+    #[cfg(test)]
+    mutation_failpoints::hit(mutation_failpoints::RESERVE_AFTER_REQUEST_KEY)?;
+    for outpoint in &record.outpoints {
+        write_record(
+            write,
+            ALLOCATIONS,
+            &outpoint_key(*outpoint),
+            &StoredAllocation::Reserved {
+                reservation_id: record.id,
+            },
+        )?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::RESERVE_AFTER_ALLOCATION)?;
+    }
+    advance_allocation_revision(write)?;
+    let empty: &[u8] = &[];
+    write.open_table(EXPIRATIONS)?.insert(
+        expiration_key(UnixMillis::new(record.accept_before), record.id()).as_slice(),
+        empty,
+    )?;
+    write.open_table(LIVE_QUOTES_BY_OWNER)?.insert(
+        live_quote_key(
+            UnixMillis::new(record.accept_before),
+            OwnerId::new(record.owner),
+            record.id(),
+        )
+        .as_slice(),
+        empty,
+    )?;
+    #[cfg(test)]
+    mutation_failpoints::hit(mutation_failpoints::RESERVE_AFTER_EXPIRATION)?;
+    append_audit(
+        write,
+        UnixMillis::new(record.created_at),
+        StoredAuditEvent::ReservationCreated {
+            reservation_id: record.id,
+            outpoints: record.outpoints.clone(),
+        },
+    )?;
+    #[cfg(test)]
+    mutation_failpoints::hit(mutation_failpoints::RESERVE_AFTER_AUDIT)?;
+    Ok(())
 }
 
 fn signing_targets_for_reservation(
@@ -1318,6 +1809,7 @@ fn request_digest(
         identity: StoredProviderIdentity::from(identity),
         owner: plan.owner().to_bytes(),
         idempotency_key: plan.idempotency_key().to_bytes(),
+        semantic_request_digest: plan.request_digest().to_bytes(),
         quote_commitment: plan.quote_commitment().to_bytes(),
         outpoints: plan.outpoints(),
         accept_before: plan.accept_before().value(),
@@ -1334,6 +1826,7 @@ fn stored_request_digest(
         identity: StoredProviderIdentity::from(identity),
         owner: reservation.owner,
         idempotency_key: reservation.idempotency_key,
+        semantic_request_digest: reservation.semantic_request_digest,
         quote_commitment: reservation.quote_commitment,
         outpoints: &reservation.outpoints,
         accept_before: reservation.accept_before,
@@ -1404,6 +1897,25 @@ fn append_audit(
     Ok(())
 }
 
+fn allocation_revision(write: &WriteTransaction) -> Result<u64, ProviderError> {
+    let meta = write.open_table(META)?;
+    let revision = meta
+        .get(ALLOCATION_REVISION_KEY)?
+        .ok_or(ProviderError::MissingMetadata(ALLOCATION_REVISION_KEY))?;
+    decode_u64(revision.value()).map_err(|()| ProviderError::CorruptAllocationRevision)
+}
+
+fn advance_allocation_revision(write: &WriteTransaction) -> Result<u64, ProviderError> {
+    let current = allocation_revision(write)?;
+    let next = current
+        .checked_add(1)
+        .ok_or(ProviderError::AllocationRevisionOverflow)?;
+    write
+        .open_table(META)?
+        .insert(ALLOCATION_REVISION_KEY, next.to_be_bytes().as_slice())?;
+    Ok(next)
+}
+
 fn provider_tables_are_nonempty(write: &WriteTransaction) -> Result<bool, ProviderError> {
     {
         let table = write.open_table(META)?;
@@ -1417,6 +1929,7 @@ fn provider_tables_are_nonempty(write: &WriteTransaction) -> Result<bool, Provid
         RESERVATIONS,
         REQUEST_KEYS,
         EXPIRATIONS,
+        LIVE_QUOTES_BY_OWNER,
     ] {
         let table = write.open_table(definition)?;
         if table.iter()?.next().transpose()?.is_some() {
@@ -1435,7 +1948,7 @@ fn validate_store_integrity(
     write: &WriteTransaction,
     identity: ProviderIdentity,
 ) -> Result<(), ProviderError> {
-    let (audit_sequence, last_observed_time) = {
+    let (audit_sequence, last_observed_time, _allocation_revision) = {
         let meta = write.open_table(META)?;
         let audit_sequence = meta
             .get(AUDIT_SEQUENCE_KEY)?
@@ -1448,7 +1961,12 @@ fn validate_store_integrity(
                 decode_u64(value.value()).map_err(|()| ProviderError::CorruptTimeHighWatermark)
             })
             .transpose()?;
-        (audit_sequence, last_observed_time)
+        let allocation_revision = meta
+            .get(ALLOCATION_REVISION_KEY)?
+            .ok_or(ProviderError::MissingMetadata(ALLOCATION_REVISION_KEY))?;
+        let allocation_revision = decode_u64(allocation_revision.value())
+            .map_err(|()| ProviderError::CorruptAllocationRevision)?;
+        (audit_sequence, last_observed_time, allocation_revision)
     };
 
     let inventory = {
@@ -1497,6 +2015,46 @@ fn validate_store_integrity(
                 )));
             }
             validate_reservation_times(&record, last_observed_time)?;
+            if let Some(quote) = &record.quote {
+                let domain = quote.to_domain(identity, &record)?;
+                let mut selected_amount = 0_u64;
+                for quoted_input in domain.contribution().inputs() {
+                    let item = inventory
+                        .get(&outpoint_key(quoted_input.outpoint()))
+                        .ok_or_else(|| {
+                            ProviderError::CorruptState(
+                                "firm quote references missing durable inventory".to_owned(),
+                            )
+                        })?;
+                    if item.asset != quote.selected_asset
+                        || item.binding != quoted_input.inventory_binding().to_bytes()
+                    {
+                        return Err(ProviderError::CorruptState(
+                            "firm quote input disagrees with durable inventory".to_owned(),
+                        ));
+                    }
+                    let domain_item = item.to_domain()?;
+                    if recompute_inventory_binding(domain_item, quoted_input.witness_utxo())
+                        != quoted_input.inventory_binding()
+                    {
+                        return Err(ProviderError::CorruptState(
+                            "firm quote input binding does not match durable recovery metadata"
+                                .to_owned(),
+                        ));
+                    }
+                    selected_amount =
+                        selected_amount.checked_add(item.amount).ok_or_else(|| {
+                            ProviderError::CorruptState(
+                                "firm quote selected amount overflowed".to_owned(),
+                            )
+                        })?;
+                }
+                if selected_amount != quote.selected_amount {
+                    return Err(ProviderError::CorruptState(
+                        "firm quote selected amount disagrees with durable inventory".to_owned(),
+                    ));
+                }
+            }
             records.insert(key, record);
         }
         records
@@ -1542,6 +2100,22 @@ fn validate_store_integrity(
         keys
     };
 
+    let live_quotes = {
+        let table = write.open_table(LIVE_QUOTES_BY_OWNER)?;
+        let mut keys = BTreeSet::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            let key = decode_table_key::<72>("owner live quote", key.value())?;
+            if !value.value().is_empty() {
+                return Err(ProviderError::CorruptState(
+                    "owner live-quote index value is not empty".to_owned(),
+                ));
+            }
+            keys.insert(key);
+        }
+        keys
+    };
+
     for record in reservations.values() {
         let expected_request_key = request_key(
             OwnerId::new(record.owner),
@@ -1553,7 +2127,10 @@ fn validate_store_integrity(
                 record.id()
             ))
         })?;
-        if binding.reservation_id != record.id || binding.request_digest != record.request_digest {
+        if binding.reservation_id != record.id
+            || binding.semantic_request_digest != record.semantic_request_digest
+            || binding.request_digest != record.request_digest
+        {
             return Err(ProviderError::CorruptState(format!(
                 "reservation {:?} request-key binding disagrees with its record",
                 record.id()
@@ -1563,11 +2140,23 @@ fn validate_store_integrity(
         let expected_expiration =
             expiration_key(UnixMillis::new(record.accept_before), record.id());
         let has_expiration = expirations.contains(&expected_expiration);
+        let expected_live_quote = live_quote_key(
+            UnixMillis::new(record.accept_before),
+            OwnerId::new(record.owner),
+            record.id(),
+        );
+        let has_live_quote = live_quotes.contains(&expected_live_quote);
         match &record.state {
             StoredReservationState::Reserved => {
                 if !has_expiration {
                     return Err(ProviderError::CorruptState(format!(
                         "reserved reservation {:?} has no expiration index entry",
+                        record.id()
+                    )));
+                }
+                if has_live_quote != record.quote.is_some() {
+                    return Err(ProviderError::CorruptState(format!(
+                        "reserved reservation {:?} has inconsistent live-quote indexing",
                         record.id()
                     )));
                 }
@@ -1578,6 +2167,12 @@ fn validate_store_integrity(
                 if has_expiration {
                     return Err(ProviderError::CorruptState(format!(
                         "terminal reservation {:?} still has an expiration index entry",
+                        record.id()
+                    )));
+                }
+                if has_live_quote {
+                    return Err(ProviderError::CorruptState(format!(
+                        "terminal reservation {:?} still has a live-quote index entry",
                         record.id()
                     )));
                 }
@@ -1655,7 +2250,10 @@ fn validate_store_integrity(
             OwnerId::new(record.owner),
             IdempotencyKey::new(record.idempotency_key),
         );
-        if *key != expected_key || binding.request_digest != record.request_digest {
+        if *key != expected_key
+            || binding.semantic_request_digest != record.semantic_request_digest
+            || binding.request_digest != record.request_digest
+        {
             return Err(ProviderError::CorruptState(format!(
                 "request-key binding for reservation {:?} has inconsistent key or digest",
                 record.id()
@@ -1713,6 +2311,31 @@ fn validate_store_integrity(
         {
             return Err(ProviderError::CorruptState(format!(
                 "expiration index disagrees with reservation {:?}",
+                record.id()
+            )));
+        }
+    }
+
+    for key in &live_quotes {
+        let deadline = UnixMillis::new(u64::from_be_bytes(
+            key[..8].try_into().expect("fixed slice"),
+        ));
+        let owner = OwnerId::new(key[8..40].try_into().expect("fixed slice"));
+        let reservation_id = ReservationId::new(key[40..].try_into().expect("fixed slice"));
+        let record = reservations
+            .get(&reservation_id.to_bytes())
+            .ok_or_else(|| {
+                ProviderError::CorruptState(
+                    "owner live-quote index references a missing reservation".to_owned(),
+                )
+            })?;
+        if deadline != UnixMillis::new(record.accept_before)
+            || owner != OwnerId::new(record.owner)
+            || record.quote.is_none()
+            || !matches!(record.state, StoredReservationState::Reserved)
+        {
+            return Err(ProviderError::CorruptState(format!(
+                "owner live-quote index disagrees with reservation {:?}",
                 record.id()
             )));
         }
@@ -2019,6 +2642,7 @@ fn create_tables(write: &WriteTransaction) -> Result<(), ProviderError> {
     write.open_table(RESERVATIONS)?;
     write.open_table(REQUEST_KEYS)?;
     write.open_table(EXPIRATIONS)?;
+    write.open_table(LIVE_QUOTES_BY_OWNER)?;
     write.open_table(AUDIT)?;
     Ok(())
 }
@@ -2084,6 +2708,31 @@ fn request_key(owner: OwnerId, key: IdempotencyKey) -> [u8; 64] {
     encoded
 }
 
+fn live_quote_key(deadline: UnixMillis, owner: OwnerId, reservation_id: ReservationId) -> [u8; 72] {
+    let mut encoded = [0_u8; 72];
+    encoded[..8].copy_from_slice(&deadline.value().to_be_bytes());
+    encoded[8..40].copy_from_slice(&owner.to_bytes());
+    encoded[40..].copy_from_slice(&reservation_id.to_bytes());
+    encoded
+}
+
+fn decode_live_quote_key(
+    bytes: &[u8],
+) -> Result<(UnixMillis, OwnerId, ReservationId), ProviderError> {
+    let encoded = decode_table_key::<72>("owner live quote", bytes)?;
+    let mut deadline = [0_u8; 8];
+    deadline.copy_from_slice(&encoded[..8]);
+    let mut owner = [0_u8; 32];
+    owner.copy_from_slice(&encoded[8..40]);
+    let mut reservation_id = [0_u8; 32];
+    reservation_id.copy_from_slice(&encoded[40..]);
+    Ok((
+        UnixMillis::new(u64::from_be_bytes(deadline)),
+        OwnerId::new(owner),
+        ReservationId::new(reservation_id),
+    ))
+}
+
 fn expiration_key(deadline: UnixMillis, reservation_id: ReservationId) -> [u8; 40] {
     let mut key = [0_u8; 40];
     key[..8].copy_from_slice(&deadline.value().to_be_bytes());
@@ -2138,7 +2787,7 @@ impl StoredProviderIdentity {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredInventoryItem {
     outpoint: OutPoint,
     asset: AssetId,
@@ -2146,6 +2795,20 @@ struct StoredInventoryItem {
     wallet_locator: [u8; 32],
     internal_key: [u8; 32],
     binding: [u8; 32],
+}
+
+impl std::fmt::Debug for StoredInventoryItem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredInventoryItem")
+            .field("outpoint", &self.outpoint)
+            .field("asset", &self.asset)
+            .field("amount", &self.amount)
+            .field("wallet_locator", &"[opaque]")
+            .field("internal_key", &self.internal_key)
+            .field("binding", &self.binding)
+            .finish()
+    }
 }
 
 impl From<InventoryItem> for StoredInventoryItem {
@@ -2336,12 +2999,24 @@ impl StoredReleaseReason {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredSigningTarget {
     outpoint: OutPoint,
     wallet_locator: [u8; 32],
     internal_key: [u8; 32],
     inventory_binding: [u8; 32],
+}
+
+impl std::fmt::Debug for StoredSigningTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredSigningTarget")
+            .field("outpoint", &self.outpoint)
+            .field("wallet_locator", &"[opaque]")
+            .field("internal_key", &self.internal_key)
+            .field("inventory_binding", &self.inventory_binding)
+            .finish()
+    }
 }
 
 impl StoredSigningTarget {
@@ -2446,13 +3121,443 @@ enum StoredReservationState {
     },
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredFirmQuote {
+    request: FirmQuoteRequest,
+    execution: QuoteExecution,
+    pricing: PricingDecision,
+    snapshot: QuoteSnapshotEvidence,
+    contribution: QuoteContribution,
+    provider_receive_internal_key: [u8; 32],
+    provider_receive_wallet_locator: [u8; 32],
+    provider_change_internal_key: Option<[u8; 32]>,
+    provider_change_wallet_locator: Option<[u8; 32]>,
+    selected_asset: AssetId,
+    selected_amount: u64,
+}
+
+impl std::fmt::Debug for StoredFirmQuote {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Wallet locators are opaque recovery capabilities. Keep them—and the
+        // internal recovery keys that accompany them—out of diagnostics.
+        formatter
+            .debug_struct("StoredFirmQuote")
+            .field("request", &self.request)
+            .field("execution", &self.execution)
+            .field("pricing", &self.pricing)
+            .field("snapshot", &self.snapshot)
+            .field("contribution", &self.contribution)
+            .field("selected_asset", &self.selected_asset)
+            .field("selected_amount", &self.selected_amount)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StoredFirmQuote {
+    fn from_domain(quote: &FirmQuote, draft: &FirmQuoteDraft) -> Self {
+        Self {
+            request: quote.request().clone(),
+            execution: quote.execution(),
+            pricing: quote.pricing(),
+            snapshot: quote.snapshot(),
+            contribution: quote.contribution().clone(),
+            provider_receive_internal_key: draft.provider_receive_recovery.internal_key,
+            provider_receive_wallet_locator: draft.provider_receive_recovery.wallet_locator,
+            provider_change_internal_key: draft
+                .provider_change_recovery
+                .map(|recovery| recovery.internal_key),
+            provider_change_wallet_locator: draft
+                .provider_change_recovery
+                .map(|recovery| recovery.wallet_locator),
+            selected_asset: draft.selected_asset,
+            selected_amount: draft.selected_amount,
+        }
+    }
+
+    fn to_domain(
+        &self,
+        provider: ProviderIdentity,
+        reservation: &StoredReservation,
+    ) -> Result<FirmQuote, ProviderError> {
+        let quote = quote_from_stored_parts(
+            reservation.id(),
+            provider,
+            self.request.clone(),
+            self.execution,
+            self.pricing,
+            self.snapshot,
+            self.contribution.clone(),
+            UnixMillis::new(reservation.created_at),
+            UnixMillis::new(reservation.accept_before),
+            reservation.fee_policy.to_domain()?,
+            recovery_metadata_commitment(
+                provider,
+                reservation.id(),
+                crate::quote::DestinationRecovery {
+                    internal_key: self.provider_receive_internal_key,
+                    wallet_locator: self.provider_receive_wallet_locator,
+                },
+                self.provider_change_internal_key,
+                self.provider_change_wallet_locator,
+            )?,
+            QuoteCommitment::new(reservation.quote_commitment),
+        );
+        let expected = recompute_quote_commitment(
+            OwnerId::new(reservation.owner),
+            IdempotencyKey::new(reservation.idempotency_key),
+            crate::model::QuoteRequestDigest::new(reservation.semantic_request_digest),
+            &quote,
+        )?;
+        if expected != quote.commitment() {
+            return Err(ProviderError::CorruptState(
+                "persisted firm quote commitment does not match its transcript".to_owned(),
+            ));
+        }
+        self.validate(provider, reservation, &quote)?;
+        Ok(quote)
+    }
+
+    fn validate(
+        &self,
+        provider: ProviderIdentity,
+        reservation: &StoredReservation,
+        quote: &FirmQuote,
+    ) -> Result<(), ProviderError> {
+        if self.request.context().chain().genesis_hash != provider.genesis_hash()
+            || self.request.context().policy_asset() != provider.policy_asset()
+            || self.request.context().market().creation_anchor().is_null()
+        {
+            return Err(ProviderError::CorruptState(
+                "persisted firm quote context disagrees with provider identity".to_owned(),
+            ));
+        }
+        let request_digest = crate::quote::quote_request_digest(
+            provider,
+            OwnerId::new(reservation.owner),
+            IdempotencyKey::new(reservation.idempotency_key),
+            &self.request,
+        )?;
+        if request_digest.to_bytes() != reservation.semantic_request_digest {
+            return Err(ProviderError::CorruptState(
+                "persisted firm quote request digest does not match its semantics".to_owned(),
+            ));
+        }
+        let outpoints = quote
+            .contribution()
+            .inputs()
+            .iter()
+            .map(QuotedProviderInput::outpoint)
+            .collect::<Vec<_>>();
+        if outpoints != reservation.outpoints {
+            return Err(ProviderError::CorruptState(
+                "persisted firm quote inputs do not match reservation outpoints".to_owned(),
+            ));
+        }
+        validate_firm_quote_shape(quote)?;
+        let normalized_rate = crate::quote::RationalRate::new(
+            self.pricing.rate().numerator(),
+            self.pricing.rate().denominator(),
+        )
+        .map_err(|error| {
+            ProviderError::CorruptState(format!(
+                "persisted firm quote has an invalid rate: {error}"
+            ))
+        })?;
+        if normalized_rate != self.pricing.rate() {
+            return Err(ProviderError::CorruptState(
+                "persisted firm quote rate is not normalized".to_owned(),
+            ));
+        }
+        let (request_input_asset, request_output_asset) = self.request.kind().pair();
+        if request_input_asset == request_output_asset
+            || self.execution.input().asset() != request_input_asset
+            || self.execution.output().asset() != request_output_asset
+        {
+            return Err(ProviderError::CorruptState(
+                "persisted firm quote pair is inconsistent".to_owned(),
+            ));
+        }
+        let recipient_script = self.request.recipient().script_pubkey();
+        if recipient_script.is_empty()
+            || recipient_script.is_provably_unspendable()
+            || recipient_script.len() > crate::quote::MAX_QUOTE_RECIPIENT_SCRIPT_BYTES
+        {
+            return Err(ProviderError::CorruptState(
+                "persisted firm quote recipient is invalid".to_owned(),
+            ));
+        }
+        if self.selected_amount == 0 || self.selected_asset != quote.execution().output().asset() {
+            return Err(ProviderError::CorruptState(
+                "persisted firm quote selected inventory is invalid".to_owned(),
+            ));
+        }
+        let expected_execution = match self.request.kind() {
+            crate::quote::QuoteKind::ExactIn {
+                input,
+                output_asset,
+                minimum_output,
+            } => {
+                if input.amount() == 0 || minimum_output == 0 {
+                    return Err(ProviderError::CorruptState(
+                        "persisted exact-input quote contains a zero amount".to_owned(),
+                    ));
+                }
+                let priced_input = input
+                    .amount()
+                    .checked_sub(self.pricing.input_asset_venue_fee())
+                    .filter(|amount| *amount != 0)
+                    .ok_or_else(|| {
+                        ProviderError::CorruptState(
+                            "persisted firm quote fee consumes exact input".to_owned(),
+                        )
+                    })?;
+                let output = u128::from(priced_input)
+                    .checked_mul(u128::from(self.pricing.rate().numerator()))
+                    .ok_or_else(|| {
+                        ProviderError::CorruptState(
+                            "persisted firm quote pricing overflowed".to_owned(),
+                        )
+                    })?
+                    / u128::from(self.pricing.rate().denominator());
+                let output = u64::try_from(output).map_err(|_| {
+                    ProviderError::CorruptState("persisted firm quote output overflowed".to_owned())
+                })?;
+                if output == 0
+                    || output < minimum_output
+                    || self.execution.input() != input
+                    || self.execution.output().asset() != output_asset
+                    || self.execution.output().amount() != output
+                {
+                    return Err(ProviderError::CorruptState(
+                        "persisted exact-input quote has inconsistent pricing".to_owned(),
+                    ));
+                }
+                self.execution
+            }
+            crate::quote::QuoteKind::ExactOut {
+                input_asset,
+                maximum_input,
+                output,
+            } => {
+                if maximum_input == 0 || output.amount() == 0 {
+                    return Err(ProviderError::CorruptState(
+                        "persisted exact-output quote contains a zero amount".to_owned(),
+                    ));
+                }
+                let product =
+                    u128::from(output.amount()) * u128::from(self.pricing.rate().denominator());
+                let divisor = u128::from(self.pricing.rate().numerator());
+                if divisor == 0 {
+                    return Err(ProviderError::CorruptState(
+                        "persisted firm quote has a zero rate".to_owned(),
+                    ));
+                }
+                let priced_input = product / divisor + u128::from(!product.is_multiple_of(divisor));
+                let gross_input = u64::try_from(priced_input)
+                    .ok()
+                    .and_then(|amount| amount.checked_add(self.pricing.input_asset_venue_fee()))
+                    .ok_or_else(|| {
+                        ProviderError::CorruptState(
+                            "persisted exact-output quote input overflowed".to_owned(),
+                        )
+                    })?;
+                if gross_input == 0
+                    || gross_input > maximum_input
+                    || self.execution.input().asset() != input_asset
+                    || self.execution.input().amount() != gross_input
+                    || self.execution.output() != output
+                {
+                    return Err(ProviderError::CorruptState(
+                        "persisted exact-output quote has inconsistent pricing".to_owned(),
+                    ));
+                }
+                self.execution
+            }
+        };
+        if expected_execution.input_asset_venue_fee() > self.request.maximum_input_asset_venue_fee()
+        {
+            return Err(ProviderError::CorruptState(
+                "persisted firm quote exceeds its venue-fee bound".to_owned(),
+            ));
+        }
+        let change = self
+            .selected_amount
+            .checked_sub(quote.execution().output().amount())
+            .ok_or_else(|| {
+                ProviderError::CorruptState(
+                    "persisted firm quote inventory does not cover output".to_owned(),
+                )
+            })?;
+        let change_outputs = quote
+            .contribution()
+            .outputs()
+            .iter()
+            .filter(|output| output.role() == QuoteOutputRole::ProviderChange)
+            .collect::<Vec<_>>();
+        if (change == 0 && !change_outputs.is_empty())
+            || (change != 0
+                && !matches!(change_outputs.as_slice(), [output]
+                    if output.asset() == self.selected_asset && output.amount() == change))
+        {
+            return Err(ProviderError::CorruptState(
+                "persisted firm quote change is inconsistent".to_owned(),
+            ));
+        }
+        let has_change_recovery = self.provider_change_internal_key.is_some()
+            && self.provider_change_wallet_locator.is_some();
+        if has_change_recovery != (change != 0)
+            || self.provider_change_internal_key.is_some()
+                != self.provider_change_wallet_locator.is_some()
+        {
+            return Err(ProviderError::CorruptState(
+                "persisted firm quote change recovery is inconsistent".to_owned(),
+            ));
+        }
+        WalletKeyLocator::new(self.provider_receive_wallet_locator).map_err(|error| {
+            ProviderError::CorruptState(format!(
+                "invalid persisted provider receive recovery: {error}"
+            ))
+        })?;
+        let receive_key =
+            XOnlyPublicKey::from_slice(&self.provider_receive_internal_key).map_err(|error| {
+                ProviderError::CorruptState(format!(
+                    "invalid persisted provider receive recovery: {error}"
+                ))
+            })?;
+        let provider_payment = quote
+            .contribution()
+            .outputs()
+            .iter()
+            .find(|output| output.role() == QuoteOutputRole::ProviderPayment)
+            .ok_or_else(|| {
+                ProviderError::CorruptState(
+                    "persisted firm quote has no provider payment".to_owned(),
+                )
+            })?;
+        if provider_payment.destination().script_pubkey()
+            != &elements::Script::new_v1_p2tr(&Secp256k1::new(), receive_key, None)
+        {
+            return Err(ProviderError::CorruptState(
+                "provider receive recovery key does not match the quoted script".to_owned(),
+            ));
+        }
+        if let (Some(locator), Some(key)) = (
+            self.provider_change_wallet_locator,
+            self.provider_change_internal_key,
+        ) {
+            WalletKeyLocator::new(locator).map_err(|error| {
+                ProviderError::CorruptState(format!(
+                    "invalid persisted provider change recovery: {error}"
+                ))
+            })?;
+            let change_key = XOnlyPublicKey::from_slice(&key).map_err(|error| {
+                ProviderError::CorruptState(format!(
+                    "invalid persisted provider change recovery: {error}"
+                ))
+            })?;
+            let provider_change = change_outputs.first().ok_or_else(|| {
+                ProviderError::CorruptState(
+                    "provider change recovery has no quoted change output".to_owned(),
+                )
+            })?;
+            if provider_change.destination().script_pubkey()
+                != &elements::Script::new_v1_p2tr(&Secp256k1::new(), change_key, None)
+            {
+                return Err(ProviderError::CorruptState(
+                    "provider change recovery key does not match the quoted script".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_firm_quote_shape(quote: &FirmQuote) -> Result<(), ProviderError> {
+    let inputs = quote.contribution().inputs();
+    if inputs.is_empty() || inputs.len() > MAX_RESERVATION_INPUTS {
+        return Err(ProviderError::CorruptState(
+            "persisted firm quote has an invalid input count".to_owned(),
+        ));
+    }
+    for (index, input) in inputs.iter().enumerate() {
+        let expected_id = u16::try_from(index + 1).map_err(|_| {
+            ProviderError::CorruptState("persisted firm quote has too many inputs".to_owned())
+        })?;
+        if input.id().value() != expected_id
+            || !input.witness_utxo().asset.is_confidential()
+            || !input.witness_utxo().value.is_confidential()
+            || !input.witness_utxo().nonce.is_confidential()
+            || input.witness_utxo().witness.surjection_proof.is_none()
+            || input.witness_utxo().witness.rangeproof.is_none()
+        {
+            return Err(ProviderError::CorruptState(
+                "persisted firm quote has an invalid provider input".to_owned(),
+            ));
+        }
+    }
+
+    let outputs = quote.contribution().outputs();
+    let expected_roles = if outputs.len() == 2 {
+        &[
+            QuoteOutputRole::ProviderPayment,
+            QuoteOutputRole::TakerReceive,
+        ][..]
+    } else if outputs.len() == 3 {
+        &[
+            QuoteOutputRole::ProviderPayment,
+            QuoteOutputRole::TakerReceive,
+            QuoteOutputRole::ProviderChange,
+        ][..]
+    } else {
+        return Err(ProviderError::CorruptState(
+            "persisted firm quote has an invalid output count".to_owned(),
+        ));
+    };
+    let provider_blinder = crate::quote::QuoteBlinderRole::ProviderInput(inputs[0].id());
+    for (index, (output, expected_role)) in outputs.iter().zip(expected_roles).enumerate() {
+        let expected_id = u16::try_from(index + 1).expect("firm quote has at most three outputs");
+        let expected_blinder = if *expected_role == QuoteOutputRole::ProviderPayment {
+            crate::quote::QuoteBlinderRole::TakerPaymentInput
+        } else {
+            provider_blinder
+        };
+        if output.id().value() != expected_id
+            || output.role() != *expected_role
+            || output.amount() == 0
+            || output.blinder() != expected_blinder
+        {
+            return Err(ProviderError::CorruptState(
+                "persisted firm quote has an invalid output shape".to_owned(),
+            ));
+        }
+    }
+
+    let execution = quote.execution();
+    let payment = &outputs[0];
+    let receive = &outputs[1];
+    if payment.asset() != execution.input().asset()
+        || payment.amount() != execution.input().amount()
+        || receive.asset() != execution.output().asset()
+        || receive.amount() != execution.output().amount()
+        || receive.destination() != quote.request().recipient()
+        || execution.input_asset_venue_fee() != quote.pricing().input_asset_venue_fee()
+    {
+        return Err(ProviderError::CorruptState(
+            "persisted firm quote contribution disagrees with its economics".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredReservation {
     id: [u8; 32],
     owner: [u8; 32],
     idempotency_key: [u8; 32],
+    semantic_request_digest: [u8; 32],
     request_digest: [u8; 32],
     quote_commitment: [u8; 32],
+    quote: Option<StoredFirmQuote>,
     outpoints: Vec<OutPoint>,
     created_at: u64,
     accept_before: u64,
@@ -2499,6 +3604,11 @@ impl StoredReservation {
             ));
         }
         let policy = self.fee_policy.to_domain()?;
+        if self.quote.is_none() && self.semantic_request_digest != self.quote_commitment {
+            return Err(ProviderError::CorruptState(
+                "legacy reservation semantic request digest is inconsistent".to_owned(),
+            ));
+        }
         match &self.state {
             StoredReservationState::Committed { intent }
             | StoredReservationState::Signed { intent, .. } => {
@@ -2543,6 +3653,20 @@ impl StoredReservation {
         Ok(())
     }
 
+    fn to_firm_quote_outcome(
+        &self,
+        provider: ProviderIdentity,
+        created: bool,
+    ) -> Result<FirmQuoteOutcome, ProviderError> {
+        let stored = self.quote.as_ref().ok_or_else(|| {
+            ProviderError::CorruptState(
+                "reservation was not created by the firm quote engine".to_owned(),
+            )
+        })?;
+        let quote = stored.to_domain(provider, self)?;
+        Ok(quote_outcome(quote, self.to_view()?, created))
+    }
+
     fn to_view(&self) -> Result<ReservationView, ProviderError> {
         self.validate()?;
         let fee_policy = self.fee_policy.to_domain()?;
@@ -2579,6 +3703,7 @@ impl StoredReservation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredRequestBinding {
     reservation_id: [u8; 32],
+    semantic_request_digest: [u8; 32],
     request_digest: [u8; 32],
 }
 
@@ -2587,6 +3712,7 @@ struct StoredRequestFingerprint<'a> {
     identity: StoredProviderIdentity,
     owner: [u8; 32],
     idempotency_key: [u8; 32],
+    semantic_request_digest: [u8; 32],
     quote_commitment: [u8; 32],
     outpoints: &'a [OutPoint],
     accept_before: u64,
@@ -2747,6 +3873,10 @@ pub enum ProviderError {
     CorruptAuditSequence,
     #[error("audit sequence overflowed")]
     AuditSequenceOverflow,
+    #[error("persisted allocation revision is corrupt")]
+    CorruptAllocationRevision,
+    #[error("allocation revision overflowed")]
+    AllocationRevisionOverflow,
     #[error("expiration index key has length {0}, expected 40")]
     CorruptExpirationKey(usize),
     #[error("provider state is internally inconsistent: {0}")]
@@ -2766,6 +3896,16 @@ pub enum ProviderError {
     },
     #[error("idempotency key {key:?} for owner {owner:?} was reused with different terms")]
     IdempotencyConflict { owner: OwnerId, key: IdempotencyKey },
+    #[error("firm quote request digest disagrees with its semantic request")]
+    FirmQuoteRequestDigestMismatch,
+    #[error("firm quote snapshot evidence disagrees with the current eligible inventory")]
+    FirmQuoteSnapshotMismatch,
+    #[error("eligible inventory changed while the firm quote was being constructed; retry")]
+    EligibleInventoryChanged,
+    #[error("firm quote input disagrees with fresh wallet inventory at {0:?}")]
+    FirmQuoteInventoryMismatch(OutPoint),
+    #[error("firm quote draft is internally inconsistent")]
+    FirmQuoteDraftInvalid,
     #[error("derived reservation ID collided: {0:?}")]
     ReservationIdCollision(ReservationId),
     #[error("reservation deadline {accept_before:?} elapsed at {now:?}")]
@@ -2773,6 +3913,14 @@ pub enum ProviderError {
         accept_before: UnixMillis,
         now: UnixMillis,
     },
+    #[error("firm quote deadline calculation overflowed")]
+    QuoteDeadlineOverflow,
+    #[error("live quote count overflowed")]
+    LiveQuoteCountOverflow,
+    #[error("owner {owner:?} reached the live quote limit of {maximum}")]
+    OwnerLiveQuoteLimit { owner: OwnerId, maximum: usize },
+    #[error("provider reached the global live quote limit of {maximum}")]
+    GlobalLiveQuoteLimit { maximum: usize },
     #[error("reservation not found: {0:?}")]
     ReservationNotFound(ReservationId),
     #[error("reservation owner authentication failed: {0:?}")]

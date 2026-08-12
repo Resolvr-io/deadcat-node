@@ -284,6 +284,11 @@ pub struct InventorySnapshotCommitment([u8; 32]);
 
 impl InventorySnapshotCommitment {
     #[must_use]
+    pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
     pub const fn to_bytes(self) -> [u8; 32] {
         self.0
     }
@@ -432,7 +437,7 @@ impl fmt::Debug for ConfidentialDestination {
             .field("script_pubkey", &self.script_pubkey)
             .field("blinding_public_key", &self.blinding_public_key)
             .field("internal_key", &self.internal_key)
-            .field("wallet_locator", &self.wallet_locator)
+            .field("wallet_locator", &"[opaque]")
             .finish()
     }
 }
@@ -441,10 +446,14 @@ impl fmt::Debug for ConfidentialDestination {
 pub trait DestinationSource {
     type Error: Error + Send + Sync + 'static;
 
-    /// Return a destination never previously issued for this purpose.
+    /// Return a globally fresh destination whose recovery metadata remains
+    /// usable after the caller durably persists it and the process restarts.
     ///
-    /// Non-reuse is a required backend guarantee; this interface cannot infer
-    /// wallet derivation history and therefore cannot enforce it itself.
+    /// The destination must never have been returned for either purpose. A
+    /// caller may permanently burn an issued destination when a concurrent
+    /// idempotent request wins or a database mutation rolls back; the backend
+    /// must never recycle it. Global non-reuse and durable recoverability are
+    /// backend guarantees that this interface cannot infer or enforce.
     fn fresh_confidential_destination(
         &self,
         purpose: DestinationPurpose,
@@ -622,6 +631,19 @@ fn output_binding(
     hash_frame(&mut hasher, &internal_key.serialize());
     hash_frame(&mut hasher, &wallet_locator.to_bytes());
     InventoryBinding::new(hasher.finalize().into())
+}
+
+/// Recompute a durable inventory binding when the full public prevout is
+/// available (for example inside a persisted firm quote).
+pub(crate) fn recompute_inventory_binding(item: InventoryItem, txout: &TxOut) -> InventoryBinding {
+    output_binding(
+        item.outpoint(),
+        txout,
+        item.asset(),
+        item.amount(),
+        item.internal_key(),
+        item.wallet_locator(),
+    )
 }
 
 fn snapshot_commitment(

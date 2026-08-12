@@ -33,12 +33,27 @@ transaction construction. A future AMM or decentralized limit-order book can
 implement the same venue boundary. [ADR 0007](docs/adr/0007-rfq-provider-state-machine.md)
 defines the provider's durable reservation and commit-before-sign boundary.
 The transport-free provider state core and backend-neutral wallet capability
-boundary are implemented. A production wallet/RPC/HSM backend, pricing,
-transaction validator, signer adapter, remote service, and relay remain future
-work. Until the validator and signer adapter land, the safety-critical commit
-and signed-result transitions are intentionally crate-internal. The RFQ
-provider remains separate from `deadcat-node`; future AMM and DLOB protocols
-are not implemented by this repository today.
+boundary are implemented, along with configurable, inventory-aware firm-quote
+construction for exact-in and exact-out trades. The quote engine applies exact
+integer pricing, deterministically selects fresh available inventory, reserves
+its exact outpoints, and durably replays the same symbolic transaction
+contribution for an idempotent request. Its `FirmQuote` is an internal,
+unauthenticated artifact, not yet a provider-signed network quote. A production
+wallet/RPC/HSM backend, market-data pricing source, transaction validator,
+signer adapter, authenticated remote protocol, and relay remain future work.
+The eventual service must derive market assets from chain-validated canonical
+parameters and add authenticated-owner rate limits plus bounded history
+retention; the library's live-quote quotas only cap concurrent reservations.
+Until the validator and signer adapter land, the safety-critical commit and
+signed-result transitions are intentionally crate-internal. The RFQ provider
+remains separate from `deadcat-node`; future AMM and DLOB protocols are not
+implemented by this repository today.
+
+The RFQ provider database is still clean-slate preproduction state. Its schema
+and private record-layout versions intentionally remain `1` while the provider
+core evolves; local databases created by earlier alpha builds must be deleted
+and recreated rather than migrated. This exception must end before any provider
+database is treated as production data.
 
 ## Assurance
 

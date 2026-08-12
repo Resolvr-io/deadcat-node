@@ -190,6 +190,39 @@ fn wallet_inventory_batch_is_atomic_and_exact_rediscovery_is_idempotent() {
 }
 
 #[test]
+fn inventory_state_lookup_does_not_decode_unrelated_history() {
+    let directory = TempDir::new().expect("tempdir");
+    let identity = identity(82);
+    let book = open_book(&directory, identity);
+    let requested = inventory(122);
+    let unrelated = inventory(123);
+    let now = UnixMillis::new(100);
+    book.import_inventory_batch(&[requested, unrelated], &now)
+        .expect("inventory import");
+
+    // Poison an unrelated historical row after startup. A bounded snapshot
+    // lookup must point-read only the requested outpoints; decoding the entire
+    // append-only inventory table would encounter this row and fail.
+    let write = book.database.begin_write().expect("raw write");
+    {
+        let mut inventory = write.open_table(INVENTORY).expect("inventory");
+        let key = outpoint_key(unrelated.outpoint());
+        inventory
+            .insert(key.as_slice(), &[0xff_u8][..])
+            .expect("poison unrelated inventory row");
+    }
+    write.commit().expect("commit fixture");
+
+    let (views, allocation_revision) = book
+        .inventory_state_for(&[requested.outpoint()])
+        .expect("bounded inventory lookup");
+    assert_eq!(allocation_revision, 0);
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].item(), requested);
+    assert_eq!(views[0].state(), InventoryState::Available);
+}
+
+#[test]
 fn reservation_is_atomic_idempotent_and_owner_authenticated() {
     let directory = TempDir::new().expect("tempdir");
     let identity = identity(11);
@@ -636,8 +669,10 @@ fn signing_commitment_covers_every_durable_wallet_target_field() {
         id: derive_reservation_id(request.owner(), request.idempotency_key()).to_bytes(),
         owner: request.owner().to_bytes(),
         idempotency_key: request.idempotency_key().to_bytes(),
+        semantic_request_digest: request.request_digest().to_bytes(),
         request_digest: request_digest(identity, &request).expect("request digest"),
         quote_commitment: request.quote_commitment().to_bytes(),
+        quote: None,
         outpoints: request.outpoints().to_vec(),
         created_at: 100,
         accept_before: request.accept_before().value(),
@@ -1419,7 +1454,8 @@ fn missing_schema_metadata_cannot_reinitialize_a_nonempty_database() {
 fn strict_record_codec_rejects_wrong_versions_and_trailing_bytes() {
     let encoded = encode_record(&StoredRequestBinding {
         reservation_id: [1; 32],
-        request_digest: [2; 32],
+        semantic_request_digest: [2; 32],
+        request_digest: [3; 32],
     })
     .expect("encode");
     let mut wrong_version = encoded.clone();

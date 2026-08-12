@@ -35,6 +35,14 @@ The initial provider core is transport-free. Its persistence types are private
 versioned records, not wire DTOs. It does not extend the node RPC, reuse the
 `deadcat/1` ALPN, or make a network compatibility promise.
 
+This remains clean-slate preproduction storage. The provider schema version and
+private record-layout version intentionally remain `1` while firm-quote records
+and indexes are added. A local provider database created by an earlier alpha
+build must be deleted and recreated; there is no migration or compatibility
+decoder. Keeping version `1` is acceptable only because no provider database
+has reached testnet, mainnet, or production, and a compatibility policy must be
+chosen before that changes.
+
 ### Monotonic inventory states
 
 Each provider outpoint has one authoritative allocation:
@@ -239,17 +247,22 @@ validator/signer-adapter layer.
   replay.
 - Immediate provider relay and optional provider-funded CPFP reduce the time
   committed inventory remains unavailable; cooperative RBF is deferred.
-- The persistence core stores no private keys and implements no pricing,
+- The persistence core stores no private keys. The transport-free quote engine
+  owns exact arithmetic, inventory selection, and an injected pricing-policy
+  boundary, with a static rational policy supplied for configuration and
+  deterministic tests. It implements no production market-data source,
   transaction validation, signing, networking, relay, mempool, or reorg policy.
   Backend-neutral discovery and signer capabilities surround it, but a concrete
   wallet/RPC/HSM backend remains a separate security principal.
 - Multiple interactive RFQ signers remain deferred. Future AMM and DLOB legs
   may coexist because a reservation covers only the provider's exact leg and
   inputs, not the entire route.
-- Reservation requests lazily expire only reservations blocking their requested
-  outpoints. A service worker drains unrelated expirations through explicitly
-  bounded batches (capped by the state core), so an accumulated expiry backlog
-  cannot make one request's write transaction unbounded.
+- Firm-quote admission drains all due reservations through explicitly bounded
+  batches (capped by the state core) before selecting inventory. The lower-level
+  reservation primitive used by state-core tests still reclaims only expirations
+  blocking its requested outpoints, and an explicit sweep remains available to
+  service maintenance. No single write transaction grows with an accumulated
+  expiry backlog.
 
 ## Implementation and follow-up
 
@@ -273,11 +286,31 @@ and metadata-conflict coverage. Destination non-reuse and authoritative
 chain/mempool freshness are explicit backend obligations; the types cannot
 prove them. The crate deliberately supplies no concrete wallet backend.
 
+Its quote layer now provides configured collateral-to-outcome and
+outcome-to-collateral directions, exact-in and exact-out arithmetic with
+direction-appropriate rounding and taker bounds, an injected pricing-policy
+interface, deterministic bounded inventory selection, confidential provider
+receive and change destinations, a symbolic contribution compatible with the
+client's venue model, live-quote admission limits, and durable exact replay
+across restart. Quote construction and reservation are one fail-closed path
+over a fresh snapshot. The resulting `FirmQuote` is deliberately an internal,
+unauthenticated artifact: it is neither a signed provider attestation nor a
+wire response, and clients must not treat it as either until the dedicated
+authenticated RFQ protocol lands.
+
+Market quote configuration is likewise not chain evidence. The service must
+derive each configured contract ID and collateral/YES/NO asset tuple from an
+independently validated canonical market view, rather than trusting operator or
+remote asset labels. The remote service must also authenticate the owner,
+rate-limit quote churn, and choose a bounded durable-retention/compaction policy
+before exposing this engine publicly. Live-reservation quotas bound concurrent
+inventory pressure; they do not by themselves bound terminal quote history.
+
 The remaining provider milestones are:
 
-1. add configurable inventory-aware quote construction;
-2. validate a concrete final Liquid PSET and derive its exact fee metrics;
-3. define a dedicated RFQ protocol, identity, and ALPN;
-4. persist relay and chain-reconciliation observations without ever reopening
+1. validate a concrete final Liquid PSET and derive its exact fee metrics;
+2. define a dedicated authenticated RFQ protocol, signed quote envelope,
+   identity, and ALPN;
+3. persist relay and chain-reconciliation observations without ever reopening
    a committed outpoint; and
-5. pass process-kill, signer ambiguity, mempool, confirmation, and reorg gates.
+4. pass process-kill, signer ambiguity, mempool, confirmation, and reorg gates.

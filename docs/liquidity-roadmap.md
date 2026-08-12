@@ -419,8 +419,11 @@ The provisional ordinary-output API uses the narrower name `PreparedLeg`: its
 economics and output claims are authorized, but venue-specific completion and
 the final signer checks still have to succeed before it is executable on chain.
 
-For an RFQ leg, preparation reserves exact provider inventory and returns a
-signed short-lived commitment.
+For an RFQ leg, preparation reserves exact provider inventory. The eventual
+remote protocol returns a signed short-lived commitment. The current
+transport-free provider engine instead returns an internal, unauthenticated
+`FirmQuote`; it proves construction and durable replay semantics but is not a
+network quote or provider attestation.
 
 For a DLOB or AMM leg, preparation refreshes and pins exact public state. It does
 not reserve that state against another valid transaction.
@@ -594,6 +597,14 @@ interface proposed here:
   explicit `SIGHASH_ALL` targets. Destination non-reuse and authoritative scan
   freshness are backend obligations. It intentionally does not choose a
   production wallet, RPC, descriptor, or HSM backend.
+- Its inventory-aware quote engine now supports configured
+  collateral-to-YES/NO and YES/NO-to-collateral directions, exact-in and
+  exact-out integer arithmetic, injected pricing policy, deterministic bounded
+  inventory selection, confidential provider receive/change outputs, live
+  quote admission limits, and exact idempotent replay across restart. It emits
+  a symbolic provider contribution and is covered by a conformance test against
+  the client venue authorization model. The returned `FirmQuote` remains an
+  internal unauthenticated artifact until the signed remote protocol exists.
 - The provisional client-local [venue model](../crates/deadcat-client/src/venue.rs)
   and [transaction composer](../crates/deadcat-client/src/composition.rs)
   separate aggregate user intent from exact per-leg allocation, bind an
@@ -626,10 +637,16 @@ interface proposed here:
 
 Phase 1 has extracted and tested the smallest generic plan/composer seam from
 these patterns without making the router depend on maker-specific types, and
-has added the provider's durable state plus wallet-capability boundary. The API
-remains provisional until configurable quote construction, concrete final-PSET
-validation, real remote RFQ evidence, and a production wallet/signer backend
-exercise it.
+has added the provider's durable state, wallet-capability boundary, and
+transport-free inventory-aware quote construction. The API remains provisional
+until concrete final-PSET validation, authenticated signed remote RFQ evidence,
+and a production wallet/signer backend exercise it.
+
+The provider database remains disposable preproduction state during this
+work. Its schema and private record-layout versions intentionally stay at `1`;
+local provider databases created by earlier alpha builds must be deleted and
+recreated, not migrated. A real compatibility and migration policy is required
+before any provider database is deployed or treated as production data.
 
 ### Symbolic transaction contributions
 

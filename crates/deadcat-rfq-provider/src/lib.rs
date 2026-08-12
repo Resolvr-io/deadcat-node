@@ -20,6 +20,7 @@
 
 mod inventory;
 mod model;
+mod quote;
 mod store;
 mod wallet;
 
@@ -32,13 +33,25 @@ pub use model::{
     AuditEntry, AuditEvent, Clock, FeePolicy, FeePolicyViolation, FeeSizeMetric, IdempotencyKey,
     InventoryBinding, InventoryItem, InventoryState, InventoryView, MAX_RESERVATION_INPUTS,
     MAX_SETTLEMENT_BYTES, ModelError, OwnerId, ProviderId, ProviderIdentity, QuoteCommitment,
-    RecoveryAction, ReleaseReason, ReservationAccess, ReservationId, ReservationPlan,
+    QuoteRequestDigest, RecoveryAction, ReleaseReason, ReservationAccess, ReservationId,
     ReservationState, ReservationView, SignedArtifact, SignedArtifactDigest, SigningCommitment,
     SigningJob, SigningTarget, TransactionFee, UnixMillis, WalletKeyLocator,
 };
+pub use quote::{
+    AmountRange, AssetAmount, BinaryMarketAssets, DEFAULT_MAX_LIVE_QUOTES_PER_OWNER,
+    DEFAULT_MAX_QUOTE_INPUTS, DEFAULT_QUOTE_LIFETIME_MILLIS, DEFAULT_SELECTION_SEARCH_NODE_BUDGET,
+    FirmQuote, FirmQuoteOutcome, FirmQuoteRequest, InventorySummary,
+    MAX_QUOTE_RECIPIENT_SCRIPT_BYTES, MarketQuoteConfig, PairLimits, PairRule, PricingDecision,
+    PricingPolicy, PricingPolicyId, PricingRequest, PricingRevision, PricingSide,
+    QuoteAdmissionError, QuoteBlinderRole, QuoteConfigurationError, QuoteContext,
+    QuoteContribution, QuoteEngine, QuoteEngineError, QuoteEnginePolicy, QuoteExecution,
+    QuoteInputId, QuoteKind, QuoteModelError, QuoteOutputId, QuoteOutputRole, QuoteRecipient,
+    QuoteSnapshotEvidence, QuotedOutput, QuotedProviderInput, RationalRate, StaticPricingError,
+    StaticRateRule, StaticRationalPricing,
+};
 pub use store::{
-    CommitOutcome, MAX_EXPIRATION_BATCH, ProviderError, ReservationBook, ReserveOutcome,
-    SCHEMA_VERSION, SignedOutcome,
+    CommitOutcome, MAX_EXPIRATION_BATCH, ProviderError, ReservationBook, SCHEMA_VERSION,
+    SignedOutcome,
 };
 pub use wallet::{
     ConfidentialDestination, DestinationPurpose, DestinationSource, InventorySnapshot,
