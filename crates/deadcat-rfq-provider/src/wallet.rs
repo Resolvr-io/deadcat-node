@@ -19,7 +19,9 @@ use elements::confidential::{Asset, Value};
 use elements::encode::serialize;
 use elements::hashes::Hash as _;
 use elements::secp256k1_zkp::{PublicKey, Secp256k1, XOnlyPublicKey};
-use elements::{BlockHash, OutPoint, SchnorrSig, SchnorrSighashType, Script, TxOut, TxOutSecrets};
+use elements::{
+    AssetId, BlockHash, OutPoint, SchnorrSig, SchnorrSighashType, Script, TxOut, TxOutSecrets,
+};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
@@ -460,6 +462,41 @@ pub trait DestinationSource {
     ) -> Result<ConfidentialDestination, Self::Error>;
 }
 
+/// Trusted provider-wallet capability for validating settlement outputs.
+///
+/// Output recovery belongs behind the wallet boundary because it requires the
+/// destination's confidential blinding secret. Public proof verification is
+/// not enough: an implementation must resolve the durable
+/// [`WalletKeyLocator`], derive the ECDH nonce encoded by the output's
+/// confidential nonce, and rewind the rangeproof. The blinding key, ECDH
+/// shared secret, asset blinding factor, and value blinding factor must remain
+/// internal to the wallet implementation.
+pub trait ProviderOutputRecovery {
+    type Error: Error + Send + Sync + 'static;
+
+    /// Validate that `wallet_locator` resolves to `expected_internal_key`,
+    /// that this tree-less key controls `txout`, and that the output is
+    /// recoverable and opens to exactly `expected_asset` and
+    /// `expected_amount`.
+    ///
+    /// The implementation must require confidential asset, value, and nonce
+    /// commitments and use the wallet's own durable locator state; PSET
+    /// blinding-key metadata is not evidence of ownership or recoverability.
+    /// It must return an error if the locator does not recover the expected
+    /// spend key, the script is not its tree-less P2TR output, ECDH nonce
+    /// derivation or rangeproof rewind fails, or the recovered asset or amount
+    /// differs. Success exposes no [`TxOutSecrets`] or other secret material to
+    /// the caller.
+    fn validate_confidential_output(
+        &self,
+        wallet_locator: WalletKeyLocator,
+        expected_internal_key: XOnlyPublicKey,
+        txout: &TxOut,
+        expected_asset: AssetId,
+        expected_amount: u64,
+    ) -> Result<(), Self::Error>;
+}
+
 /// One explicit-`SIGHASH_ALL` P2TR key-path signature for a provider input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProviderInputSignature {
@@ -516,8 +553,9 @@ pub struct SigningResponse {
 impl SigningResponse {
     /// Bind signatures to the exact ordered target list of `job`.
     ///
-    /// Cryptographic signature verification belongs to the concrete PSET
-    /// validator because it requires the final transaction and every prevout.
+    /// Cryptographic signature verification and insertion belong to the
+    /// concrete signer/finalizer adapter because they require the exact
+    /// committed transaction and every authoritative prevout.
     pub fn new(
         job: &SigningJob,
         signatures: Vec<ProviderInputSignature>,

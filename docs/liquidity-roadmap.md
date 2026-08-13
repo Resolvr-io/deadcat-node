@@ -637,10 +637,19 @@ interface proposed here:
 
 Phase 1 has extracted and tested the smallest generic plan/composer seam from
 these patterns without making the router depend on maker-specific types, and
-has added the provider's durable state, wallet-capability boundary, and
-transport-free inventory-aware quote construction. The API remains provisional
-until concrete final-PSET validation, authenticated signed remote RFQ evidence,
-and a production wallet/signer backend exercise it.
+has added the provider's durable state, wallet-capability boundary,
+transport-free inventory-aware quote construction, and concrete final-PSET
+validation. The validator binds the RFQ contribution inside a venue-neutral
+transaction, checks authoritative prevouts, taker-first P2TR signatures,
+confidential proofs/balance and provider output recovery, derives exact fee
+metrics with projected provider witnesses, and exposes only an opaque one-shot
+capability for the durable commit. The API remains provisional until
+authenticated signed remote RFQ evidence and a production wallet/signer/chain
+backend exercise it end to end.
+The initial profile verifies every non-provider input as a finalized tree-less
+P2TR key-path `SIGHASH_ALL` spend. Simplicity covenant inputs and more than one
+interactive RFQ signer remain later router/venue-verification work; they are
+not accepted merely because they carry a witness.
 
 The provider database remains disposable preproduction state during this
 work. Its schema and private record-layout versions intentionally stay at `1`;

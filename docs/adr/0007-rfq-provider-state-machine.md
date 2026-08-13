@@ -149,11 +149,11 @@ overpayment while the provider rejects transactions likely to strand shared
 inventory. CPFP is a provider-operated recovery mechanism, not a substitute
 for initial fee admission and not a cost silently imposed on later traders.
 
-The durable state layer models and persists those validator-derived facts, but
-deliberately does not expose its commit or signed-artifact recording transitions
-as externally callable service APIs. They remain crate-internal until the
-concrete PSET validator and signer adapter can construct their inputs; detached
-caller assertions are not an admissible production trust boundary.
+The durable state layer models and persists those validator-derived facts. Its
+commit transition is reachable only by consuming the final-PSET validator's
+opaque one-shot intent; its signed-artifact recording transition remains
+crate-internal until the signer adapter can construct and verify that input.
+Detached caller assertions are not an admissible production trust boundary.
 
 ### Wallet capability and quote-eligibility boundary
 
@@ -234,14 +234,23 @@ require a new authenticated wallet scan to recover the opening in memory.
 The signer interface accepts only an unforgeable durable signing job. It cannot
 be asked through this boundary to sign detached caller bytes or a
 caller-selected sighash policy, and it returns exactly one ordered explicit
-`SIGHASH_ALL` signature per durable provider target. Cryptographic signature
-verification and insertion into the exact PSET remain duties of the next
-validator/signer-adapter layer.
+`SIGHASH_ALL` signature per durable provider target. Cryptographic provider-
+signature verification and insertion into the exact committed PSET remain
+duties of the signer/finalizer adapter.
 
 ## Consequences
 
 - The provider may strand inventory after an ambiguous signing failure, but it
   cannot silently double-allocate that inventory.
+- A hostile taker may conflict-spend one of its own inputs after the provider's
+  authoritative unspent check. The resulting settlement cannot confirm, but
+  the already-committed provider outpoints still do not return to `Available`:
+  there is no atomic bridge between a chain read and the redb commitment, and
+  treating a transient or mistaken conflict as proof that reuse is safe would
+  reintroduce double-signing risk. The remote service must reduce this
+  availability exposure with authenticated-owner abuse controls, short quote
+  windows, bounded outstanding inventory per owner, immediate signing/relay,
+  and operational inventory fragmentation.
 - A client timeout after submitting its signature means status unknown, not
   automatic cancellation. The later protocol must expose idempotent status and
   replay.
@@ -251,7 +260,8 @@ validator/signer-adapter layer.
   owns exact arithmetic, inventory selection, and an injected pricing-policy
   boundary, with a static rational policy supplied for configuration and
   deterministic tests. It implements no production market-data source,
-  transaction validation, signing, networking, relay, mempool, or reorg policy.
+  signing, networking, relay, mempool, or reorg policy beyond the implemented
+  pre-sign final-PSET validation boundary.
   Backend-neutral discovery and signer capabilities surround it, but a concrete
   wallet/RPC/HSM backend remains a separate security principal.
 - Multiple interactive RFQ signers remain deferred. Future AMM and DLOB legs
@@ -272,9 +282,9 @@ provider/chain database binding, durable inventory import, atomic multi-input
 reservation, owner-scoped idempotency, bounded expiry and cancellation,
 fee-policy evaluation over future validator-derived facts, commit-before-sign
 recovery state, signed-response persistence state, clock rollback protection,
-startup integrity validation, and an audit log. The safety-critical commit and
-signed-artifact transitions remain crate-internal until their validator and
-signer producers land.
+startup integrity validation, and an audit log. The safety-critical commit is
+now gated by the validator's opaque intent; signed-artifact recording remains
+crate-internal until its signer/finalizer producer lands.
 
 Its wallet layer now provides validated confidential tree-less P2TR discovery,
 complete chain-anchored snapshots, atomic batch import followed by a
@@ -306,9 +316,17 @@ rate-limit quote churn, and choose a bounded durable-retention/compaction policy
 before exposing this engine publicly. Live-reservation quotas bound concurrent
 inventory pressure; they do not by themselves bound terminal quote history.
 
+The initial final-PSET profile treats every non-provider input as an already
+finalized tree-less P2TR key-path `SIGHASH_ALL` spend. It therefore supports
+ordinary wallet contributions around one interactive RFQ provider, but not yet
+Simplicity covenant inputs or a second interactive provider. Those require an
+authenticated venue/script verification seam; merely accepting an arbitrary
+nonempty witness would not be participant authorization.
+
 The remaining provider milestones are:
 
-1. validate a concrete final Liquid PSET and derive its exact fee metrics;
+1. connect the implemented final-PSET validator to a concrete wallet/signer
+   adapter and production chain backend;
 2. define a dedicated authenticated RFQ protocol, signed quote envelope,
    identity, and ALPN;
 3. persist relay and chain-reconciliation observations without ever reopening
