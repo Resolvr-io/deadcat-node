@@ -8,7 +8,7 @@
 //! test to accidentally update both the untrusted claim and its authority.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use deadcat_client::composition::{
     BlinderRef, CompositionLimits, InputId, InputSequence, InputSpec, LockTimeConstraint,
@@ -303,15 +303,23 @@ impl FixtureUtxo {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct FixtureInventorySource {
-    snapshots: Mutex<VecDeque<InventorySnapshot>>,
+    snapshots: Arc<Mutex<VecDeque<InventorySnapshot>>>,
 }
 
 impl FixtureInventorySource {
     fn new(snapshot: InventorySnapshot) -> Self {
         Self {
-            snapshots: Mutex::new(VecDeque::from([snapshot])),
+            snapshots: Arc::new(Mutex::new(VecDeque::from([snapshot]))),
         }
+    }
+
+    pub(super) fn push(&self, snapshot: InventorySnapshot) {
+        self.snapshots
+            .lock()
+            .expect("inventory fixture lock")
+            .push_back(snapshot);
     }
 }
 
@@ -491,7 +499,9 @@ pub(super) struct SettlementFixture {
     pub(super) reservation: ReservationView,
     pub(super) manifest: UnblindedStructureManifest,
     pub(super) route_authorization: RouteAuthorization,
+    pub(super) unblinded_pset: PartiallySignedTransaction,
     pub(super) baseline: FixtureSubmission,
+    pub(super) inventory_source: FixtureInventorySource,
     pub(super) provider_inventory_wallet: FixtureWallet,
     pub(super) provider_receive: FixtureDestination,
     pub(super) provider_change: FixtureDestination,
@@ -557,9 +567,10 @@ impl SettlementFixture {
         .expect("inventory snapshot");
         let book = ReservationBook::open(directory.path().join("provider.redb"), identity)
             .expect("reservation book");
+        let inventory_source = FixtureInventorySource::new(snapshot);
         let inventory = InventoryCoordinator::new(
             book,
-            FixtureInventorySource::new(snapshot),
+            inventory_source.clone(),
             InventoryFreshnessPolicy::new(10_000, 32).expect("inventory policy"),
         );
         let destinations = FixtureDestinationSource::new([
@@ -763,6 +774,7 @@ impl SettlementFixture {
         manifest
             .validate(&pset)
             .expect("configured PSET preserves manifest");
+        let unblinded_pset = pset.clone();
 
         let mut provider_secrets = HashMap::new();
         for input in quote.contribution().inputs() {
@@ -822,7 +834,9 @@ impl SettlementFixture {
             reservation,
             manifest,
             route_authorization,
+            unblinded_pset,
             baseline,
+            inventory_source,
             provider_inventory_wallet,
             provider_receive,
             provider_change,

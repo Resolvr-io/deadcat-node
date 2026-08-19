@@ -9,6 +9,7 @@ members = [
     "crates/deadcat-node",
     "crates/deadcat-cli",
     "crates/deadcat-rfq-provider",
+    "crates/deadcat-rfq-wallet",
 ]
 
 [workspace.package]
@@ -18,10 +19,14 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1"
+argon2 = "0.5"
 async-trait = "0.1"
+bip39 = { version = "2", features = ["rand", "zeroize"] }
+chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive"] }
 elements = { version = "0.25", features = ["serde"] }
 hex = { version = "0.4", features = ["serde"] }
+hmac = "0.12"
 iroh = "1"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 rand = "0.8"
@@ -30,11 +35,13 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+subtle = "2"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+zeroize = { version = "1", features = ["derive"] }
 
 # Internal crates. These are implementation boundaries, not public artifacts.
 deadcat-types = { path = "crates/deadcat-types" }
@@ -43,6 +50,7 @@ deadcat-client = { path = "crates/deadcat-client" }
 deadcat-rpc = { path = "crates/deadcat-rpc" }
 deadcat-iroh = { path = "crates/deadcat-iroh" }
 deadcat-rfq-provider = { path = "crates/deadcat-rfq-provider" }
+deadcat-rfq-wallet = { path = "crates/deadcat-rfq-wallet" }
 
 # The CLI and Rust libraries must remain on the exact same smplx release.
 # smplx 0.0.9 caps simplicityhl at 0.6.x; Cargo.lock pins the newest

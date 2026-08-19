@@ -35,8 +35,10 @@ use crate::quote::{
 };
 use crate::wallet::ProviderOutputRecovery;
 
+mod blinding;
 mod finalization;
 
+pub use blinding::{ProviderBlindedPset, ProviderBlindingCoordinator, ProviderBlindingError};
 pub use finalization::{ProviderSigningCoordinator, SigningFinalizationError};
 
 /// Default whole-transaction input bound, aligned with the client composer.

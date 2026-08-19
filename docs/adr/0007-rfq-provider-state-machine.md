@@ -3,6 +3,8 @@
 - Status: Accepted
 - Date: 2026-08-11
 - Extends: [ADR 0006](0006-rfq-first-liquidity-scope.md)
+- Extended by: [ADR 0008](0008-rfq-service-owned-wallet.md), which selects the
+  first concrete provider wallet boundary
 
 ## Context
 
@@ -264,9 +266,9 @@ encoding loses to and replays the first durable artifact.
   boundary, with a static rational policy supplied for configuration and
   deterministic tests. The signing coordinator implements transport-free exact
   signing/finalization and durable replay, but no production market-data
-  source, wallet backend, networking, relay, mempool, or reorg policy.
-  Backend-neutral discovery and signer capabilities surround it, but a concrete
-  wallet/RPC/HSM backend remains a separate security principal.
+  source, networking, relay, mempool, or reorg policy. ADR 0008 selects a narrow
+  service-owned hot-wallet implementation in a separate crate; neither the
+  provider core nor `deadcat-node` gains direct key access.
 - Multiple interactive RFQ signers remain deferred. Future AMM and DLOB legs
   may coexist because a reservation covers only the provider's exact leg and
   inputs, not the entire route.
@@ -290,15 +292,26 @@ gated by the validator's opaque intent, and signed-artifact recording accepts
 only the signing coordinator's private cryptographically verified PSET
 capability.
 
-Its wallet layer now provides validated confidential tree-less P2TR discovery,
-complete chain-anchored snapshots, atomic batch import followed by a
+Its backend-neutral wallet layer provides validated confidential tree-less P2TR
+discovery, complete chain-anchored snapshots, atomic batch import followed by a
 reserve-time-rechecked fresh-availability intersection, confidential input
 openings kept only in redacted memory, destination and committed-job-only signer
 capability interfaces, explicit `SIGHASH_ALL` response shape, durable non-secret
 recovery locators, and adversarial restart, freshness, replacement, concurrency,
 and metadata-conflict coverage. Destination non-reuse and authoritative
 chain/mempool freshness are explicit backend obligations; the types cannot
-prove them. The crate deliberately supplies no concrete wallet backend.
+prove them. The provider crate deliberately supplies no concrete wallet
+backend. ADR 0008's adjacent `deadcat-rfq-wallet` crate implements destination,
+output-recovery, and durable-job signing capabilities using an encrypted,
+in-memory-unlocked provider seed. Filesystem/passphrase operations,
+authoritative inventory scanning, and runtime integration remain separate work.
+
+The settlement layer also implements the provider's non-last collaborative
+blinding stage. It binds the complete unblinded PSET to the exact live reserved
+contribution, permits provider input blinders only on declared provider outputs,
+uses confidential openings only from the current in-memory wallet view, and
+proves that no unrelated PSET field changed. It neither exposes blinding factors
+nor crosses the durable point of no return.
 
 Its quote layer now provides configured collateral-to-outcome and
 outcome-to-collateral directions, exact-in and exact-out arithmetic with
@@ -329,8 +342,10 @@ nonempty witness would not be participant authorization.
 
 The remaining provider milestones are:
 
-1. connect the implemented final-PSET validator and signing coordinator to a
-   concrete wallet/signer adapter and production chain backend;
+1. add the authoritative Elements-backed inventory/chain adapter, filesystem
+   durability, passphrase and backup/recovery operations, and RFQ-daemon
+   integration for the implemented custom wallet, blinding, validator, and
+   signer capabilities;
 2. define a dedicated authenticated RFQ protocol, signed quote envelope,
    identity, and ALPN;
 3. persist relay and chain-reconciliation observations without ever reopening
