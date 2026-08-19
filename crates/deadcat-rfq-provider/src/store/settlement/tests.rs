@@ -7,7 +7,7 @@
 //! view. Keeping those three inputs separate makes it difficult for a negative
 //! test to accidentally update both the untrusted claim and its authority.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Mutex;
 
 use deadcat_client::composition::{
@@ -58,7 +58,7 @@ use crate::wallet::{
 use super::{
     AuthoritativePrevout, CommitOutcome, ProviderSettlementValidator, SettlementChainSource,
     SettlementInputPlacement, SettlementLayout, SettlementLayoutError, SettlementOutputPlacement,
-    SettlementValidationError,
+    SettlementValidationError, project_finalized_pset,
 };
 
 pub(super) const QUOTE_TIME: UnixMillis = UnixMillis::new(101);
@@ -499,7 +499,7 @@ pub(super) struct SettlementFixture {
     pub(super) taker_wallet: FixtureWallet,
     pub(super) fee_input: FixtureUtxo,
     pub(super) payment_input: FixtureUtxo,
-    pub(super) inventory_input: FixtureUtxo,
+    pub(super) inventory_inputs: Vec<FixtureUtxo>,
 }
 
 impl SettlementFixture {
@@ -507,7 +507,23 @@ impl SettlementFixture {
         Self::with_fee_policy(1, 1_000_000)
     }
 
+    pub(super) fn with_multiple_provider_inputs() -> Self {
+        Self::with_fee_policy_and_inventory(1, 1_000_000, &[(63, 64, 30), (66, 67, 35)])
+    }
+
     fn with_fee_policy(minimum_absolute_fee: u64, maximum_transaction_weight: u64) -> Self {
+        Self::with_fee_policy_and_inventory(
+            minimum_absolute_fee,
+            maximum_transaction_weight,
+            &[(63, 64, PROVIDER_INVENTORY_VALUE)],
+        )
+    }
+
+    fn with_fee_policy_and_inventory(
+        minimum_absolute_fee: u64,
+        maximum_transaction_weight: u64,
+        inventory_specs: &[(u8, u8, u64)],
+    ) -> Self {
         let directory = TempDir::new().expect("fixture directory");
         let identity = identity(20);
         let owner = OwnerId::new([21; 32]);
@@ -520,14 +536,23 @@ impl SettlementFixture {
         let fee_input = taker_wallet.owned_utxo(61, identity.policy_asset(), TAKER_FEE_INPUT_VALUE);
         let payment_input =
             taker_wallet.owned_utxo(62, identity.policy_asset(), TAKER_PAYMENT_INPUT_VALUE);
-        let inventory_input =
-            provider_inventory_wallet.owned_utxo(63, asset(YES_MARKER), PROVIDER_INVENTORY_VALUE);
-        let wallet_owned_inventory =
-            inventory_input.as_wallet_owned(&provider_inventory_wallet, 64);
+        let inventory_inputs = inventory_specs
+            .iter()
+            .map(|(outpoint_marker, _, amount)| {
+                provider_inventory_wallet.owned_utxo(*outpoint_marker, asset(YES_MARKER), *amount)
+            })
+            .collect::<Vec<_>>();
+        let wallet_owned_inventory = inventory_specs
+            .iter()
+            .zip(&inventory_inputs)
+            .map(|((_, locator_marker, _), input)| {
+                input.as_wallet_owned(&provider_inventory_wallet, *locator_marker)
+            })
+            .collect();
         let snapshot = InventorySnapshot::new(
             identity,
             WalletScanAnchor::new(BlockHash::from_byte_array([65; 32]), 65),
-            vec![wallet_owned_inventory],
+            wallet_owned_inventory,
         )
         .expect("inventory snapshot");
         let book = ReservationBook::open(directory.path().join("provider.redb"), identity)
@@ -740,10 +765,13 @@ impl SettlementFixture {
             .expect("configured PSET preserves manifest");
 
         let mut provider_secrets = HashMap::new();
-        provider_secrets.insert(
-            layout.provider_input(quote.contribution().inputs()[0].id()),
-            inventory_input.secrets,
-        );
+        for input in quote.contribution().inputs() {
+            let inventory = inventory_inputs
+                .iter()
+                .find(|inventory| inventory.outpoint == input.outpoint())
+                .expect("quoted input belongs to fixture inventory");
+            provider_secrets.insert(layout.provider_input(input.id()), inventory.secrets);
+        }
         pset.blind_non_last(&mut thread_rng(), &Secp256k1::new(), &provider_secrets)
             .expect("provider non-last blinding");
         pset = deserialize(&serialize(&pset)).expect("provider PSET handoff");
@@ -763,8 +791,9 @@ impl SettlementFixture {
         // Build authority from the wallet-discovered outputs, not from the
         // submitter-controlled PSET. In particular, these copies retain the
         // original input witnesses that PSET serializes into separate fields.
-        let entries = [&fee_input, &payment_input, &inventory_input]
+        let entries = [&fee_input, &payment_input]
             .into_iter()
+            .chain(inventory_inputs.iter())
             .map(|input| {
                 (
                     input.outpoint,
@@ -801,7 +830,7 @@ impl SettlementFixture {
             taker_wallet,
             fee_input,
             payment_input,
-            inventory_input,
+            inventory_inputs,
         };
         fixture.assert_baseline();
         fixture
@@ -809,6 +838,23 @@ impl SettlementFixture {
 
     pub(super) fn book(&self) -> &ReservationBook {
         self.engine.inventory().reservation_book()
+    }
+
+    fn inventory_input(&self) -> &FixtureUtxo {
+        self.inventory_inputs
+            .first()
+            .expect("fixture has provider inventory")
+    }
+
+    pub(super) fn close_book(self) -> (TempDir, ProviderIdentity) {
+        let Self {
+            _directory,
+            engine,
+            identity,
+            ..
+        } = self;
+        drop(engine);
+        (_directory, identity)
     }
 
     pub(super) fn submission(&self) -> FixtureSubmission {
@@ -881,7 +927,11 @@ impl SettlementFixture {
         assert_eq!(change_opening.asset, asset(YES_MARKER));
         assert_eq!(
             change_opening.value,
-            PROVIDER_INVENTORY_VALUE - QUOTED_RECEIVE_VALUE
+            self.inventory_inputs
+                .iter()
+                .map(|input| input.secrets.value)
+                .sum::<u64>()
+                - QUOTED_RECEIVE_VALUE
         );
         let taker_opening = self
             .taker_wallet
@@ -1310,11 +1360,10 @@ fn baseline_final_pset_validates_and_commits_the_exact_canonical_payload() {
     let submission = fixture.submission();
     assert_eq!(fixture.reservation.owner(), fixture.owner);
     assert_eq!(fixture.route_authorization.legs().len(), 1);
-    for utxo in [
-        &fixture.fee_input,
-        &fixture.payment_input,
-        &fixture.inventory_input,
-    ] {
+    for utxo in [&fixture.fee_input, &fixture.payment_input]
+        .into_iter()
+        .chain(&fixture.inventory_inputs)
+    {
         let authority = submission
             .chain
             .entry(utxo.outpoint)
@@ -1412,7 +1461,7 @@ fn cancellation_after_validation_wins_before_the_point_of_no_return() {
     assert!(matches!(
         fixture
             .book()
-            .inventory(fixture.inventory_input.outpoint)
+            .inventory(fixture.inventory_input().outpoint)
             .expect("inventory lookup")
             .expect("inventory")
             .state(),
@@ -1449,7 +1498,7 @@ fn validated_intent_is_bound_to_its_provider_book() {
     assert!(matches!(
         fixture
             .book()
-            .inventory(fixture.inventory_input.outpoint)
+            .inventory(fixture.inventory_input().outpoint)
             .expect("inventory lookup")
             .expect("inventory")
             .state(),
@@ -1483,7 +1532,7 @@ fn durable_commit_rechecks_the_exclusive_quote_deadline() {
     assert!(matches!(
         fixture
             .book()
-            .inventory(fixture.inventory_input.outpoint)
+            .inventory(fixture.inventory_input().outpoint)
             .expect("inventory lookup")
             .expect("inventory")
             .state(),
@@ -1530,12 +1579,48 @@ fn malformed_unbounded_and_unauthorized_submissions_fail_before_commitment() {
     assert!(matches!(
         fixture
             .book()
-            .inventory(fixture.inventory_input.outpoint)
+            .inventory(fixture.inventory_input().outpoint)
             .expect("inventory lookup")
             .expect("inventory")
             .state(),
         InventoryState::Reserved { .. }
     ));
+}
+
+#[test]
+fn validation_reserves_space_for_the_provider_pset_signature_fields() {
+    let fixture = SettlementFixture::new();
+    let submission = fixture.submission();
+    let provider_indexes = submission
+        .layout
+        .provider_inputs
+        .values()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let placeholder = submission.pset.inputs()[submission.layout.taker_payment_input]
+        .tap_key_sig
+        .expect("finalized taker signature");
+    let pre_sign_bytes = submission.canonical_pset_bytes().len();
+
+    let error = project_finalized_pset(
+        &submission.pset,
+        &provider_indexes,
+        placeholder,
+        pre_sign_bytes,
+    )
+    .expect_err("provider signature fields must increase the persisted PSET size");
+    assert!(matches!(
+        error,
+        SettlementValidationError::FinalizedPayloadTooLarge { maximum, actual }
+            if maximum == pre_sign_bytes && actual > maximum
+    ));
+    project_finalized_pset(
+        &submission.pset,
+        &provider_indexes,
+        placeholder,
+        crate::model::MAX_SETTLEMENT_BYTES,
+    )
+    .expect("ordinary settlement has enough final artifact capacity");
 }
 
 #[test]

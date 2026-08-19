@@ -33,7 +33,11 @@ use crate::quote::{
     DestinationRecovery, FirmQuote, QuoteBlinderRole, QuoteInputId, QuoteOutputId, QuoteOutputRole,
     QuotedOutput,
 };
-use crate::wallet::{P2TR_SIGHASH_ALL_SIGNATURE_BYTES, ProviderOutputRecovery};
+use crate::wallet::ProviderOutputRecovery;
+
+mod finalization;
+
+pub use finalization::{ProviderSigningCoordinator, SigningFinalizationError};
 
 /// Default whole-transaction input bound, aligned with the client composer.
 pub const DEFAULT_MAX_SETTLEMENT_INPUTS: usize = 32;
@@ -524,11 +528,21 @@ where
             .verify_tx_amt_proofs(&Secp256k1::new(), &prevouts)
             .map_err(|error| SettlementValidationError::ConfidentialProofs(error.to_string()))?;
 
-        let mut projected = transaction;
-        for index in provider_indexes {
-            projected.input[index].witness.script_witness =
-                vec![vec![0_u8; P2TR_SIGHASH_ALL_SIGNATURE_BYTES]];
-        }
+        let placeholder_signature = pset.inputs()[layout.taker_payment_input]
+            .tap_key_sig
+            .ok_or(SettlementValidationError::InvalidTakerInput {
+                index: layout.taker_payment_input,
+                reason: "missing finalized Taproot signature",
+            })?;
+        let projected_pset = project_finalized_pset(
+            pset,
+            &provider_indexes,
+            placeholder_signature,
+            MAX_SETTLEMENT_BYTES,
+        )?;
+        let projected = projected_pset
+            .extract_tx()
+            .map_err(|error| SettlementValidationError::InvalidPset(error.to_string()))?;
         let fee = TransactionFee::new(
             context.provider.policy_asset(),
             fee_amount,
@@ -571,6 +585,28 @@ fn canonical_pset(bytes: &[u8]) -> Result<Vec<u8>, SettlementValidationError> {
         return Err(SettlementValidationError::NonCanonicalPset);
     }
     Ok(canonical)
+}
+
+fn project_finalized_pset(
+    pset: &PartiallySignedTransaction,
+    provider_indexes: &BTreeSet<usize>,
+    placeholder_signature: SchnorrSig,
+    maximum_bytes: usize,
+) -> Result<PartiallySignedTransaction, SettlementValidationError> {
+    let mut projected = pset.clone();
+    for index in provider_indexes {
+        let input = &mut projected.inputs_mut()[*index];
+        input.tap_key_sig = Some(placeholder_signature);
+        input.final_script_witness = Some(vec![placeholder_signature.to_vec()]);
+    }
+    let actual = serialize(&projected).len();
+    if actual > maximum_bytes {
+        return Err(SettlementValidationError::FinalizedPayloadTooLarge {
+            maximum: maximum_bytes,
+            actual,
+        });
+    }
+    Ok(projected)
 }
 
 fn validate_global(
@@ -1118,6 +1154,8 @@ pub enum SettlementValidationError {
     EmptyPayload,
     #[error("settlement payload has {actual} bytes; maximum is {maximum}")]
     PayloadTooLarge { maximum: usize, actual: usize },
+    #[error("signed settlement would have {actual} bytes; maximum is {maximum}")]
+    FinalizedPayloadTooLarge { maximum: usize, actual: usize },
     #[error("invalid PSET: {0}")]
     InvalidPset(String),
     #[error("PSET is not in the canonical encoding committed by the provider")]

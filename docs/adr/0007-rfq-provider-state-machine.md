@@ -151,9 +151,9 @@ for initial fee admission and not a cost silently imposed on later traders.
 
 The durable state layer models and persists those validator-derived facts. Its
 commit transition is reachable only by consuming the final-PSET validator's
-opaque one-shot intent; its signed-artifact recording transition remains
-crate-internal until the signer adapter can construct and verify that input.
-Detached caller assertions are not an admissible production trust boundary.
+opaque one-shot intent; its signed-artifact recording transition accepts only
+the signing coordinator's private verified-PSET capability. Detached caller
+assertions are not an admissible production trust boundary.
 
 ### Wallet capability and quote-eligibility boundary
 
@@ -234,9 +234,12 @@ require a new authenticated wallet scan to recover the opening in memory.
 The signer interface accepts only an unforgeable durable signing job. It cannot
 be asked through this boundary to sign detached caller bytes or a
 caller-selected sighash policy, and it returns exactly one ordered explicit
-`SIGHASH_ALL` signature per durable provider target. Cryptographic provider-
-signature verification and insertion into the exact committed PSET remain
-duties of the signer/finalizer adapter.
+`SIGHASH_ALL` signature per durable provider target. The transport-free signing
+coordinator exact-matches the job against durable state before invoking that
+capability, verifies every returned signature, inserts only the provider
+signature fields, revalidates the completed PSET and fee facts, and persists
+one canonical signed PSET before exposing it. A concurrent valid Schnorr
+encoding loses to and replays the first durable artifact.
 
 ## Consequences
 
@@ -259,9 +262,9 @@ duties of the signer/finalizer adapter.
 - The persistence core stores no private keys. The transport-free quote engine
   owns exact arithmetic, inventory selection, and an injected pricing-policy
   boundary, with a static rational policy supplied for configuration and
-  deterministic tests. It implements no production market-data source,
-  signing, networking, relay, mempool, or reorg policy beyond the implemented
-  pre-sign final-PSET validation boundary.
+  deterministic tests. The signing coordinator implements transport-free exact
+  signing/finalization and durable replay, but no production market-data
+  source, wallet backend, networking, relay, mempool, or reorg policy.
   Backend-neutral discovery and signer capabilities surround it, but a concrete
   wallet/RPC/HSM backend remains a separate security principal.
 - Multiple interactive RFQ signers remain deferred. Future AMM and DLOB legs
@@ -283,8 +286,9 @@ reservation, owner-scoped idempotency, bounded expiry and cancellation,
 fee-policy evaluation over future validator-derived facts, commit-before-sign
 recovery state, signed-response persistence state, clock rollback protection,
 startup integrity validation, and an audit log. The safety-critical commit is
-now gated by the validator's opaque intent; signed-artifact recording remains
-crate-internal until its signer/finalizer producer lands.
+gated by the validator's opaque intent, and signed-artifact recording accepts
+only the signing coordinator's private cryptographically verified PSET
+capability.
 
 Its wallet layer now provides validated confidential tree-less P2TR discovery,
 complete chain-anchored snapshots, atomic batch import followed by a
@@ -325,8 +329,8 @@ nonempty witness would not be participant authorization.
 
 The remaining provider milestones are:
 
-1. connect the implemented final-PSET validator to a concrete wallet/signer
-   adapter and production chain backend;
+1. connect the implemented final-PSET validator and signing coordinator to a
+   concrete wallet/signer adapter and production chain backend;
 2. define a dedicated authenticated RFQ protocol, signed quote envelope,
    identity, and ALPN;
 3. persist relay and chain-reconciliation observations without ever reopening

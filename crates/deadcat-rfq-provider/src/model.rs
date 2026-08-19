@@ -651,13 +651,26 @@ impl InventoryView {
 }
 
 /// Exact durable work item that a signer may consume.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SigningJob {
     pub(crate) reservation_id: ReservationId,
     pub(crate) commitment: SigningCommitment,
     pub(crate) pre_sign_payload: Vec<u8>,
     pub(crate) fee: TransactionFee,
     pub(crate) targets: Vec<SigningTarget>,
+}
+
+impl fmt::Debug for SigningJob {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SigningJob")
+            .field("reservation_id", &self.reservation_id)
+            .field("commitment", &self.commitment)
+            .field("pre_sign_payload_bytes", &self.pre_sign_payload.len())
+            .field("fee", &self.fee)
+            .field("target_count", &self.targets.len())
+            .finish()
+    }
 }
 
 impl SigningJob {
@@ -724,12 +737,24 @@ impl SigningTarget {
 }
 
 /// Exact signed bytes persisted before any response or relay attempt.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SignedArtifact {
     pub(crate) reservation_id: ReservationId,
     pub(crate) commitment: SigningCommitment,
     pub(crate) digest: SignedArtifactDigest,
     pub(crate) bytes: Vec<u8>,
+}
+
+impl fmt::Debug for SignedArtifact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SignedArtifact")
+            .field("reservation_id", &self.reservation_id)
+            .field("commitment", &self.commitment)
+            .field("digest", &self.digest)
+            .field("signed_payload_bytes", &self.bytes.len())
+            .finish()
+    }
 }
 
 impl SignedArtifact {
