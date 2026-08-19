@@ -50,6 +50,10 @@ fixed_id!(
     QuoteCommitment
 );
 fixed_id!(
+    /// Commitment to the normalized semantic firm-quote request.
+    QuoteRequestDigest
+);
+fixed_id!(
     /// Domain-separated commitment to the exact durable pre-sign transcript.
     SigningCommitment
 );
@@ -396,9 +400,10 @@ impl TransactionFee {
 
 /// Exact inventory allocation requested by one authenticated client operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReservationPlan {
+pub(crate) struct ReservationPlan {
     owner: OwnerId,
     idempotency_key: IdempotencyKey,
+    request_digest: QuoteRequestDigest,
     quote_commitment: QuoteCommitment,
     outpoints: Vec<OutPoint>,
     accept_before: UnixMillis,
@@ -406,9 +411,30 @@ pub struct ReservationPlan {
 }
 
 impl ReservationPlan {
-    pub fn new(
+    #[cfg(test)]
+    pub(crate) fn new(
         owner: OwnerId,
         idempotency_key: IdempotencyKey,
+        quote_commitment: QuoteCommitment,
+        outpoints: Vec<OutPoint>,
+        accept_before: UnixMillis,
+        fee_policy: FeePolicy,
+    ) -> Result<Self, ModelError> {
+        Self::with_request_digest(
+            owner,
+            idempotency_key,
+            QuoteRequestDigest::new(quote_commitment.to_bytes()),
+            quote_commitment,
+            outpoints,
+            accept_before,
+            fee_policy,
+        )
+    }
+
+    pub(crate) fn with_request_digest(
+        owner: OwnerId,
+        idempotency_key: IdempotencyKey,
+        request_digest: QuoteRequestDigest,
         quote_commitment: QuoteCommitment,
         mut outpoints: Vec<OutPoint>,
         accept_before: UnixMillis,
@@ -433,6 +459,7 @@ impl ReservationPlan {
         Ok(Self {
             owner,
             idempotency_key,
+            request_digest,
             quote_commitment,
             outpoints,
             accept_before,
@@ -441,32 +468,37 @@ impl ReservationPlan {
     }
 
     #[must_use]
-    pub const fn owner(&self) -> OwnerId {
+    pub(crate) const fn owner(&self) -> OwnerId {
         self.owner
     }
 
     #[must_use]
-    pub const fn idempotency_key(&self) -> IdempotencyKey {
+    pub(crate) const fn idempotency_key(&self) -> IdempotencyKey {
         self.idempotency_key
     }
 
     #[must_use]
-    pub const fn quote_commitment(&self) -> QuoteCommitment {
+    pub(crate) const fn request_digest(&self) -> QuoteRequestDigest {
+        self.request_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn quote_commitment(&self) -> QuoteCommitment {
         self.quote_commitment
     }
 
     #[must_use]
-    pub fn outpoints(&self) -> &[OutPoint] {
+    pub(crate) fn outpoints(&self) -> &[OutPoint] {
         &self.outpoints
     }
 
     #[must_use]
-    pub const fn accept_before(&self) -> UnixMillis {
+    pub(crate) const fn accept_before(&self) -> UnixMillis {
         self.accept_before
     }
 
     #[must_use]
-    pub const fn fee_policy(&self) -> FeePolicy {
+    pub(crate) const fn fee_policy(&self) -> FeePolicy {
         self.fee_policy
     }
 }

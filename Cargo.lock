@@ -973,6 +973,8 @@ dependencies = [
 name = "deadcat-rfq-provider"
 version = "0.1.0-alpha"
 dependencies = [
+ "deadcat-client",
+ "deadcat-types",
  "elements",
  "postcard",
  "redb",

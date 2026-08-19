@@ -19,7 +19,9 @@ use elements::confidential::{Asset, Value};
 use elements::encode::serialize;
 use elements::hashes::Hash as _;
 use elements::secp256k1_zkp::{PublicKey, Secp256k1, XOnlyPublicKey};
-use elements::{BlockHash, OutPoint, SchnorrSig, SchnorrSighashType, Script, TxOut, TxOutSecrets};
+use elements::{
+    AssetId, BlockHash, OutPoint, SchnorrSig, SchnorrSighashType, Script, TxOut, TxOutSecrets,
+};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
@@ -284,6 +286,11 @@ pub struct InventorySnapshotCommitment([u8; 32]);
 
 impl InventorySnapshotCommitment {
     #[must_use]
+    pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
     pub const fn to_bytes(self) -> [u8; 32] {
         self.0
     }
@@ -432,7 +439,7 @@ impl fmt::Debug for ConfidentialDestination {
             .field("script_pubkey", &self.script_pubkey)
             .field("blinding_public_key", &self.blinding_public_key)
             .field("internal_key", &self.internal_key)
-            .field("wallet_locator", &self.wallet_locator)
+            .field("wallet_locator", &"[opaque]")
             .finish()
     }
 }
@@ -441,14 +448,53 @@ impl fmt::Debug for ConfidentialDestination {
 pub trait DestinationSource {
     type Error: Error + Send + Sync + 'static;
 
-    /// Return a destination never previously issued for this purpose.
+    /// Return a globally fresh destination whose recovery metadata remains
+    /// usable after the caller durably persists it and the process restarts.
     ///
-    /// Non-reuse is a required backend guarantee; this interface cannot infer
-    /// wallet derivation history and therefore cannot enforce it itself.
+    /// The destination must never have been returned for either purpose. A
+    /// caller may permanently burn an issued destination when a concurrent
+    /// idempotent request wins or a database mutation rolls back; the backend
+    /// must never recycle it. Global non-reuse and durable recoverability are
+    /// backend guarantees that this interface cannot infer or enforce.
     fn fresh_confidential_destination(
         &self,
         purpose: DestinationPurpose,
     ) -> Result<ConfidentialDestination, Self::Error>;
+}
+
+/// Trusted provider-wallet capability for validating settlement outputs.
+///
+/// Output recovery belongs behind the wallet boundary because it requires the
+/// destination's confidential blinding secret. Public proof verification is
+/// not enough: an implementation must resolve the durable
+/// [`WalletKeyLocator`], derive the ECDH nonce encoded by the output's
+/// confidential nonce, and rewind the rangeproof. The blinding key, ECDH
+/// shared secret, asset blinding factor, and value blinding factor must remain
+/// internal to the wallet implementation.
+pub trait ProviderOutputRecovery {
+    type Error: Error + Send + Sync + 'static;
+
+    /// Validate that `wallet_locator` resolves to `expected_internal_key`,
+    /// that this tree-less key controls `txout`, and that the output is
+    /// recoverable and opens to exactly `expected_asset` and
+    /// `expected_amount`.
+    ///
+    /// The implementation must require confidential asset, value, and nonce
+    /// commitments and use the wallet's own durable locator state; PSET
+    /// blinding-key metadata is not evidence of ownership or recoverability.
+    /// It must return an error if the locator does not recover the expected
+    /// spend key, the script is not its tree-less P2TR output, ECDH nonce
+    /// derivation or rangeproof rewind fails, or the recovered asset or amount
+    /// differs. Success exposes no [`TxOutSecrets`] or other secret material to
+    /// the caller.
+    fn validate_confidential_output(
+        &self,
+        wallet_locator: WalletKeyLocator,
+        expected_internal_key: XOnlyPublicKey,
+        txout: &TxOut,
+        expected_asset: AssetId,
+        expected_amount: u64,
+    ) -> Result<(), Self::Error>;
 }
 
 /// One explicit-`SIGHASH_ALL` P2TR key-path signature for a provider input.
@@ -507,8 +553,9 @@ pub struct SigningResponse {
 impl SigningResponse {
     /// Bind signatures to the exact ordered target list of `job`.
     ///
-    /// Cryptographic signature verification belongs to the concrete PSET
-    /// validator because it requires the final transaction and every prevout.
+    /// Cryptographic signature verification and insertion belong to the
+    /// concrete signer/finalizer adapter because they require the exact
+    /// committed transaction and every authoritative prevout.
     pub fn new(
         job: &SigningJob,
         signatures: Vec<ProviderInputSignature>,
@@ -622,6 +669,19 @@ fn output_binding(
     hash_frame(&mut hasher, &internal_key.serialize());
     hash_frame(&mut hasher, &wallet_locator.to_bytes());
     InventoryBinding::new(hasher.finalize().into())
+}
+
+/// Recompute a durable inventory binding when the full public prevout is
+/// available (for example inside a persisted firm quote).
+pub(crate) fn recompute_inventory_binding(item: InventoryItem, txout: &TxOut) -> InventoryBinding {
+    output_binding(
+        item.outpoint(),
+        txout,
+        item.asset(),
+        item.amount(),
+        item.internal_key(),
+        item.wallet_locator(),
+    )
 }
 
 fn snapshot_commitment(

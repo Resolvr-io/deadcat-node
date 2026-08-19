@@ -6,20 +6,31 @@
 //! publishes only outputs present in a recent complete wallet snapshot *and*
 //! durably unallocated, and it holds the snapshot lock while reserving them.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::sync::{Mutex, MutexGuard};
 
 use elements::OutPoint;
+use elements::hashes::Hash as _;
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
-use crate::model::{Clock, InventoryState, ProviderIdentity, ReservationPlan, UnixMillis};
-use crate::store::{ProviderError, ReservationBook, ReserveOutcome};
+#[cfg(test)]
+use crate::model::ReservationPlan;
+use crate::model::{Clock, InventoryState, ProviderIdentity, UnixMillis};
+use crate::model::{IdempotencyKey, OwnerId, QuoteRequestDigest};
+use crate::quote::{FirmQuoteDraft, FirmQuoteOutcome, QuoteEnginePolicy};
+#[cfg(test)]
+use crate::store::ReserveOutcome;
+use crate::store::{ProviderError, ReservationBook};
 use crate::wallet::{
     InventorySnapshotCommitment, InventorySource, WalletOwnedOutput, WalletScanAnchor,
 };
 
 /// Conservative default upper bound for one complete wallet scan.
 pub const DEFAULT_MAX_INVENTORY_OUTPUTS: usize = 10_000;
+const ELIGIBLE_INVENTORY_DOMAIN: &[u8] = b"deadcat/rfq/eligible-inventory/v1";
 
 /// Quote-admission policy for wallet inventory snapshots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +109,8 @@ impl EligibilityToken {
 pub struct EligibleInventory {
     token: EligibilityToken,
     anchor: WalletScanAnchor,
+    allocation_revision: u64,
+    eligible_commitment: [u8; 32],
     outputs: Vec<WalletOwnedOutput>,
 }
 
@@ -150,6 +163,18 @@ impl EligibleInventory {
     #[must_use]
     pub const fn anchor(&self) -> WalletScanAnchor {
         self.anchor
+    }
+
+    /// Monotonic durable revision of inventory allocation state.
+    #[must_use]
+    pub const fn allocation_revision(&self) -> u64 {
+        self.allocation_revision
+    }
+
+    /// Commitment to the exact eligible outpoints and wallet bindings.
+    #[must_use]
+    pub const fn eligible_commitment(&self) -> [u8; 32] {
+        self.eligible_commitment
     }
 
     #[must_use]
@@ -308,7 +333,8 @@ where
     ///
     /// Existing exact idempotent requests are replayed independently of the
     /// old discovery token; they never allocate inventory a second time.
-    pub fn reserve<C: Clock>(
+    #[cfg(test)]
+    pub(crate) fn reserve<C: Clock>(
         &self,
         eligible: &EligibleInventory,
         plan: &ReservationPlan,
@@ -376,13 +402,100 @@ where
             .map_err(Into::into)
     }
 
+    /// Atomically reserve the exact provider inputs and persist the complete
+    /// firm quote selected from `eligible`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reserve_firm_quote<C: Clock>(
+        &self,
+        eligible: &EligibleInventory,
+        owner: OwnerId,
+        key: IdempotencyKey,
+        request_digest: QuoteRequestDigest,
+        draft: &FirmQuoteDraft,
+        policy: QuoteEnginePolicy,
+        clock: &C,
+    ) -> Result<FirmQuoteOutcome, InventoryCoordinatorError<S::Error>> {
+        draft.validate().map_err(|_| {
+            InventoryCoordinatorError::Provider(ProviderError::FirmQuoteDraftInvalid)
+        })?;
+        let state = self.lock_state()?;
+        // Preflight runs before pricing so failed capacity checks cannot burn
+        // wallet destinations. Recheck only idempotency after taking the
+        // snapshot lock: a concurrent identical request may have won in the
+        // interval, and replay must not depend on the now-stale snapshot.
+        if let Some(replayed) = self
+            .book
+            .replay_firm_quote(owner, key, request_digest, clock)?
+        {
+            return Ok(replayed);
+        }
+        let now = clock.now();
+        let latest = self.require_fresh(&state, now)?;
+        if latest.token != eligible.token {
+            return Err(InventoryCoordinatorError::SnapshotSuperseded {
+                requested: eligible.token,
+                current: latest.token,
+            });
+        }
+        let current_eligible = self.eligible_from_snapshot(latest)?;
+        if draft.snapshot.allocation_revision() != current_eligible.allocation_revision
+            || draft.snapshot.eligible_commitment() != current_eligible.eligible_commitment
+        {
+            return Err(InventoryCoordinatorError::Provider(
+                ProviderError::EligibleInventoryChanged,
+            ));
+        }
+        if draft.snapshot.anchor() != latest.anchor
+            || draft.snapshot.commitment() != latest.token.snapshot
+        {
+            return Err(InventoryCoordinatorError::Provider(
+                ProviderError::FirmQuoteSnapshotMismatch,
+            ));
+        }
+        for quoted_input in draft.contribution.inputs() {
+            let Some(output) = current_eligible
+                .outputs
+                .iter()
+                .find(|output| output.outpoint() == quoted_input.outpoint())
+            else {
+                return Err(InventoryCoordinatorError::OutpointNotInEligibleView(
+                    quoted_input.outpoint(),
+                ));
+            };
+            if output.asset() != draft.selected_asset
+                || output.txout() != quoted_input.witness_utxo()
+                || output.binding() != quoted_input.inventory_binding()
+            {
+                return Err(InventoryCoordinatorError::Provider(
+                    ProviderError::FirmQuoteInventoryMismatch(quoted_input.outpoint()),
+                ));
+            }
+        }
+        self.book
+            .reserve_firm_quote_from_snapshot(
+                owner,
+                key,
+                request_digest,
+                draft,
+                policy,
+                latest.token.observed_at,
+                self.policy.max_snapshot_age_millis,
+                clock,
+            )
+            .map_err(Into::into)
+    }
+
     fn eligible_from_snapshot(
         &self,
         latest: &PublishedSnapshot,
     ) -> Result<EligibleInventory, InventoryCoordinatorError<S::Error>> {
-        let durable = self
-            .book
-            .inventory_all()?
+        let outpoints = latest
+            .outputs
+            .iter()
+            .map(WalletOwnedOutput::outpoint)
+            .collect::<Vec<_>>();
+        let (durable, allocation_revision) = self.book.inventory_state_for(&outpoints)?;
+        let durable = durable
             .into_iter()
             .map(|view| (view.item().outpoint(), view))
             .collect::<BTreeMap<_, _>>();
@@ -408,6 +521,8 @@ where
         Ok(EligibleInventory {
             token: latest.token,
             anchor: latest.anchor,
+            allocation_revision,
+            eligible_commitment: eligible_commitment(&outputs),
             outputs,
         })
     }
@@ -450,6 +565,18 @@ where
             .lock()
             .map_err(|_| InventoryCoordinatorError::CoordinatorLockPoisoned)
     }
+}
+
+fn eligible_commitment(outputs: &[WalletOwnedOutput]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(ELIGIBLE_INVENTORY_DOMAIN);
+    hasher.update((outputs.len() as u64).to_be_bytes());
+    for output in outputs {
+        hasher.update(output.outpoint().txid.to_byte_array());
+        hasher.update(output.outpoint().vout.to_be_bytes());
+        hasher.update(output.binding().to_bytes());
+    }
+    hasher.finalize().into()
 }
 
 /// Fail-closed discovery, freshness, or durable-allocation error.
