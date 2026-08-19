@@ -42,10 +42,16 @@ concrete final Liquid PSET before the irreversible signing transition: it binds
 the persisted RFQ leg inside a venue-neutral transaction, checks authoritative
 unspent prevouts, finalized taker P2TR `SIGHASH_ALL` signatures, confidential
 disclosures/proofs/balance and provider output recovery, and derives fee and
-weight facts with the missing provider witnesses projected. Its `FirmQuote` is
-still an internal, unauthenticated artifact, not yet a provider-signed network
-quote. A production wallet/RPC/HSM backend, market-data pricing source, signer
-adapter, authenticated remote protocol, and relay remain future work.
+weight facts with the missing provider witnesses projected. After durable
+commitment, the signing coordinator gives only the exact persisted job to the
+provider signer, cryptographically verifies and inserts its signatures, proves
+that no other PSET field changed, rechecks proofs and fee facts, and persists
+one canonical signed PSET before returning it. Exact retries replay that
+durable winner without re-signing; concurrently in-flight valid signature
+encodings may both sign, but every caller returns the same stored winner. Its
+`FirmQuote` is still an internal, unauthenticated artifact, not yet a provider-
+signed network quote. A production wallet/RPC/HSM backend, market-data pricing
+source, authenticated remote protocol, and relay remain future work.
 This initial validator accepts ordinary finalized tree-less P2TR
 `SIGHASH_ALL` inputs outside the current RFQ leg; Simplicity covenant inputs
 and a second interactive RFQ signer need a later authenticated venue/script
@@ -54,10 +60,10 @@ The eventual service must derive market assets from chain-validated canonical
 parameters and add authenticated-owner rate limits plus bounded history
 retention; the library's live-quote quotas only cap concurrent reservations.
 The safety-critical commit is reachable only by consuming the validator's
-opaque one-shot intent; the signed-result transition remains crate-internal
-until the signer adapter lands. The RFQ provider remains separate from
-`deadcat-node`; future AMM and DLOB protocols are not implemented by this
-repository today.
+opaque one-shot intent, and signed-artifact persistence accepts only the
+coordinator's private verified-PSET capability. The RFQ provider remains
+separate from `deadcat-node`; future AMM and DLOB protocols are not implemented
+by this repository today.
 
 The RFQ provider database is still clean-slate preproduction state. Its schema
 and private record-layout versions intentionally remain `1` while the provider

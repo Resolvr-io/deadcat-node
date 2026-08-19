@@ -643,7 +643,11 @@ validation. The validator binds the RFQ contribution inside a venue-neutral
 transaction, checks authoritative prevouts, taker-first P2TR signatures,
 confidential proofs/balance and provider output recovery, derives exact fee
 metrics with projected provider witnesses, and exposes only an opaque one-shot
-capability for the durable commit. The API remains provisional until
+capability for the durable commit. Its signing coordinator then exact-matches
+the durable job, invokes the backend-neutral signer outside database locks,
+verifies and inserts every provider signature, proves all other PSET data is
+unchanged, rechecks proofs and fee facts, and stores one canonical signed PSET
+before returning or replaying it. The API remains provisional until
 authenticated signed remote RFQ evidence and a production wallet/signer/chain
 backend exercise it end to end.
 The initial profile verifies every non-provider input as a finalized tree-less

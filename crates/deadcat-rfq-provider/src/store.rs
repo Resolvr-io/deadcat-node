@@ -7,8 +7,8 @@ use elements::hashes::Hash as _;
 use elements::secp256k1_zkp::{Secp256k1, XOnlyPublicKey};
 use elements::{AssetId, BlockHash, OutPoint};
 use redb::{
-    Database, Durability, ReadableDatabase as _, ReadableTable as _, TableDefinition,
-    WriteTransaction,
+    Database, Durability, ReadTransaction, ReadableDatabase as _, ReadableTable as _,
+    TableDefinition, WriteTransaction,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -35,9 +35,10 @@ mod settlement;
 
 pub use settlement::{
     AuthoritativePrevout, DEFAULT_MAX_SETTLEMENT_INPUTS, DEFAULT_MAX_SETTLEMENT_OUTPUTS,
-    ProviderSettlementValidator, SettlementChainSource, SettlementInputPlacement, SettlementLayout,
-    SettlementLayoutError, SettlementLimitsError, SettlementOutputPlacement,
-    SettlementValidationError, SettlementValidationLimits, ValidatedSigningIntent,
+    ProviderSettlementValidator, ProviderSigningCoordinator, SettlementChainSource,
+    SettlementInputPlacement, SettlementLayout, SettlementLayoutError, SettlementLimitsError,
+    SettlementOutputPlacement, SettlementValidationError, SettlementValidationLimits,
+    SigningFinalizationError, ValidatedSigningIntent,
 };
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -1160,27 +1161,187 @@ impl ReservationBook {
         self.commit_before_sign_inner(access, None, pre_sign_payload, fee, clock)
     }
 
-    /// Persist exact signed bytes before they can be returned or relayed.
-    // The signer adapter added in the next provider layer will verify and
-    // canonicalize its result before invoking this crate-private transition.
-    #[allow(dead_code)]
-    pub(crate) fn record_signed<C: Clock>(
+    /// Resolve an exact durable job before invoking a signer. This read holds
+    /// no database lock across signing and prevents stale or cross-book jobs
+    /// from reaching a wallet or HSM.
+    fn signing_state_for(
+        &self,
+        expected_job: &SigningJob,
+    ) -> Result<ExactSigningState, ProviderError> {
+        self.ensure_healthy()?;
+        let read = self.database.begin_read()?;
+        let reservations = read.open_table(RESERVATIONS)?;
+        let record = reservations
+            .get(expected_job.reservation_id().to_bytes().as_slice())?
+            .map(|value| decode_record::<StoredReservation>(value.value()))
+            .transpose()?
+            .ok_or(ProviderError::ReservationNotFound(
+                expected_job.reservation_id(),
+            ))?;
+        if record.id() != expected_job.reservation_id() {
+            return Err(ProviderError::CorruptState(
+                "reservation key and record ID disagree".to_owned(),
+            ));
+        }
+        record.validate()?;
+        if let StoredReservationState::Committed { intent }
+        | StoredReservationState::Signed { intent, .. } = &record.state
+        {
+            ensure_committed_allocations_read(&read, &record, intent.commitment)?;
+        }
+        match &record.state {
+            StoredReservationState::Committed { intent } => {
+                let durable_job = intent.to_job(record.id())?;
+                ensure_exact_signing_job(&durable_job, expected_job)?;
+                Ok(ExactSigningState::Pending(durable_job))
+            }
+            StoredReservationState::Signed { intent, artifact } => {
+                let durable_job = intent.to_job(record.id())?;
+                ensure_exact_signing_job(&durable_job, expected_job)?;
+                Ok(ExactSigningState::Signed(
+                    artifact.to_domain(record.id(), durable_job.commitment())?,
+                ))
+            }
+            StoredReservationState::Reserved => Err(ProviderError::SigningIntentNotCommitted(
+                expected_job.reservation_id(),
+            )),
+            StoredReservationState::Released { .. } => Err(
+                ProviderError::ReservationAlreadyReleased(expected_job.reservation_id()),
+            ),
+        }
+    }
+
+    /// Recheck that an artifact presented for replay is exactly the artifact
+    /// currently stored by this provider book.
+    fn replay_signed_artifact(
+        &self,
+        expected: &SignedArtifact,
+    ) -> Result<SignedOutcome, ProviderError> {
+        self.ensure_healthy()?;
+        let read = self.database.begin_read()?;
+        let reservations = read.open_table(RESERVATIONS)?;
+        let record = reservations
+            .get(expected.reservation_id().to_bytes().as_slice())?
+            .map(|value| decode_record::<StoredReservation>(value.value()))
+            .transpose()?
+            .ok_or(ProviderError::ReservationNotFound(
+                expected.reservation_id(),
+            ))?;
+        if record.id() != expected.reservation_id() {
+            return Err(ProviderError::CorruptState(
+                "reservation key and record ID disagree".to_owned(),
+            ));
+        }
+        record.validate()?;
+        let (intent, artifact) = match &record.state {
+            StoredReservationState::Signed { intent, artifact } => (intent, artifact),
+            StoredReservationState::Released { .. } => {
+                return Err(ProviderError::ReservationAlreadyReleased(
+                    expected.reservation_id(),
+                ));
+            }
+            StoredReservationState::Reserved | StoredReservationState::Committed { .. } => {
+                return Err(ProviderError::SigningIntentNotCommitted(
+                    expected.reservation_id(),
+                ));
+            }
+        };
+        ensure_committed_allocations_read(&read, &record, intent.commitment)?;
+        let actual = artifact.to_domain(record.id(), SigningCommitment::new(intent.commitment))?;
+        if actual != *expected {
+            return Err(ProviderError::SignedArtifactBindingMismatch(
+                expected.reservation_id(),
+            ));
+        }
+        Ok(SignedOutcome {
+            artifact: actual,
+            recorded: false,
+        })
+    }
+
+    /// Persist one cryptographically verified, canonically finalized PSET.
+    /// If another valid signature encoding wins the race, return that exact
+    /// durable winner rather than exposing the losing candidate.
+    fn record_finalized_pset<C: Clock>(
+        &self,
+        expected_job: &SigningJob,
+        candidate: VerifiedSignedPset,
+        clock: &C,
+    ) -> Result<SignedOutcome, ProviderError> {
+        self.record_signed_inner(
+            expected_job.reservation_id(),
+            expected_job.commitment(),
+            Some(expected_job),
+            candidate.into_bytes(),
+            true,
+            clock,
+        )
+    }
+
+    fn record_signed_inner<C: Clock>(
         &self,
         reservation_id: ReservationId,
         expected_commitment: SigningCommitment,
+        expected_job: Option<&SigningJob>,
         signed_bytes: Vec<u8>,
+        replay_winner_on_conflict: bool,
         clock: &C,
     ) -> Result<SignedOutcome, ProviderError> {
         validate_settlement_bytes(&signed_bytes)?;
-        let (_operation_guard, write, now) = self.begin_timed_write(clock)?;
+        let (_operation_guard, write, now) = if replay_winner_on_conflict {
+            let expected_job = expected_job.ok_or_else(|| {
+                ProviderError::CorruptState(
+                    "verified signed candidate has no exact durable job".to_owned(),
+                )
+            })?;
+            let operation_guard = self
+                .operation_lock
+                .lock()
+                .map_err(|_| ProviderError::OperationLockPoisoned)?;
+            // Keep the operation lock from this state check through the
+            // eventual write. A concurrent winner is therefore replayed
+            // before observing the clock, including when this caller carries
+            // an older timestamp.
+            if let ExactSigningState::Signed(artifact) = self.signing_state_for(expected_job)? {
+                return self.replay_signed_artifact(&artifact);
+            }
+            let (write, now) = self.begin_timed_write_locked(&operation_guard, clock)?;
+            (operation_guard, write, now)
+        } else {
+            self.begin_timed_write(clock)?
+        };
         let mut record = read_reservation_from_write(&write, reservation_id)?
             .ok_or(ProviderError::ReservationNotFound(reservation_id))?;
+        if record.id() != reservation_id {
+            return Err(ProviderError::CorruptState(
+                "reservation key and record ID disagree".to_owned(),
+            ));
+        }
+        record.validate()?;
+        if let StoredReservationState::Committed { intent }
+        | StoredReservationState::Signed { intent, .. } = &record.state
+        {
+            ensure_committed_allocations_write(&write, &record, intent.commitment)?;
+        }
         let intent = match &record.state {
-            StoredReservationState::Committed { intent } => intent.clone(),
+            StoredReservationState::Committed { intent } => {
+                if let Some(expected_job) = expected_job {
+                    ensure_exact_signing_job(&intent.to_job(record.id())?, expected_job)?;
+                }
+                intent.clone()
+            }
             StoredReservationState::Signed { intent, artifact } => {
-                if intent.commitment != expected_commitment.to_bytes()
-                    || artifact.bytes != signed_bytes
-                {
+                if let Some(expected_job) = expected_job {
+                    ensure_exact_signing_job(&intent.to_job(record.id())?, expected_job)?;
+                }
+                if intent.commitment != expected_commitment.to_bytes() {
+                    return Err(ProviderError::SigningCommitmentMismatch {
+                        reservation_id,
+                        expected: SigningCommitment::new(intent.commitment),
+                        actual: expected_commitment,
+                    });
+                }
+                if artifact.bytes != signed_bytes && !replay_winner_on_conflict {
                     return Err(ProviderError::DifferentSignedArtifact(reservation_id));
                 }
                 let artifact = artifact.to_domain(reservation_id, expected_commitment)?;
@@ -1233,6 +1394,26 @@ impl ReservationBook {
             artifact,
             recorded: true,
         })
+    }
+
+    /// Legacy state-machine test seam. Production signed bytes can cross this
+    /// boundary only through the signing coordinator.
+    #[cfg(test)]
+    pub(crate) fn record_signed<C: Clock>(
+        &self,
+        reservation_id: ReservationId,
+        expected_commitment: SigningCommitment,
+        signed_bytes: Vec<u8>,
+        clock: &C,
+    ) -> Result<SignedOutcome, ProviderError> {
+        self.record_signed_inner(
+            reservation_id,
+            expected_commitment,
+            None,
+            signed_bytes,
+            false,
+            clock,
+        )
     }
 
     /// Exact actions safe to resume after restart. The caller must sign or
@@ -1377,11 +1558,21 @@ impl ReservationBook {
             .operation_lock
             .lock()
             .map_err(|_| ProviderError::OperationLockPoisoned)?;
+        let (write, now) = self.begin_timed_write_locked(&operation_guard, clock)?;
+        Ok((operation_guard, write, now))
+    }
+
+    /// Begin a timed write while the caller retains `operation_lock`.
+    fn begin_timed_write_locked<C: Clock>(
+        &self,
+        _operation_guard: &MutexGuard<'_, ()>,
+        clock: &C,
+    ) -> Result<(WriteTransaction, UnixMillis), ProviderError> {
         let observation = self.begin_immediate_write()?;
         let now = observe_time(&observation, clock)?;
         self.commit_write(observation)?;
         let write = self.begin_immediate_write()?;
-        Ok((operation_guard, write, now))
+        Ok((write, now))
     }
 
     fn commit_write(&self, write: WriteTransaction) -> Result<(), ProviderError> {
@@ -1440,6 +1631,90 @@ pub(super) enum SettlementContextState {
     Reserved,
     Committed(SigningJob),
     Signed(SigningJob),
+}
+
+/// Exact durable state for one already-committed signing job.
+enum ExactSigningState {
+    Pending(SigningJob),
+    Signed(SignedArtifact),
+}
+
+/// Opaque proof that the signing coordinator has cryptographically and
+/// structurally validated one canonical completed PSET.
+struct VerifiedSignedPset(Vec<u8>);
+
+impl VerifiedSignedPset {
+    fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+fn ensure_exact_signing_job(
+    durable: &SigningJob,
+    expected: &SigningJob,
+) -> Result<(), ProviderError> {
+    if durable != expected {
+        return Err(ProviderError::SigningJobBindingMismatch(
+            expected.reservation_id(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_committed_allocations_read(
+    read: &ReadTransaction,
+    record: &StoredReservation,
+    commitment: [u8; 32],
+) -> Result<(), ProviderError> {
+    let allocations = read.open_table(ALLOCATIONS)?;
+    let expected = StoredAllocation::Committed {
+        reservation_id: record.id,
+        commitment,
+    };
+    for outpoint in &record.outpoints {
+        let key = outpoint_key(*outpoint);
+        let actual = allocations
+            .get(key.as_slice())?
+            .map(|value| decode_record::<StoredAllocation>(value.value()))
+            .transpose()?
+            .ok_or_else(|| {
+                ProviderError::CorruptState(format!(
+                    "committed outpoint {outpoint:?} has no permanent allocation"
+                ))
+            })?;
+        if actual != expected {
+            return Err(ProviderError::CorruptState(format!(
+                "committed outpoint {outpoint:?} has a different permanent allocation"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_committed_allocations_write(
+    write: &WriteTransaction,
+    record: &StoredReservation,
+    commitment: [u8; 32],
+) -> Result<(), ProviderError> {
+    let expected = StoredAllocation::Committed {
+        reservation_id: record.id,
+        commitment,
+    };
+    for outpoint in &record.outpoints {
+        let key = outpoint_key(*outpoint);
+        let actual = read_record_from_write::<StoredAllocation>(write, ALLOCATIONS, &key)?
+            .ok_or_else(|| {
+                ProviderError::CorruptState(format!(
+                    "committed outpoint {outpoint:?} has no permanent allocation"
+                ))
+            })?;
+        if actual != expected {
+            return Err(ProviderError::CorruptState(format!(
+                "committed outpoint {outpoint:?} has a different permanent allocation"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4113,6 +4388,10 @@ pub enum ProviderError {
         expected: SigningCommitment,
         actual: SigningCommitment,
     },
+    #[error("signing job does not exactly match durable state: {0:?}")]
+    SigningJobBindingMismatch(ReservationId),
+    #[error("signed artifact does not exactly match durable state: {0:?}")]
+    SignedArtifactBindingMismatch(ReservationId),
     #[error("reservation already stored a different signed artifact: {0:?}")]
     DifferentSignedArtifact(ReservationId),
     #[error("fee policy rejected the final transaction: {0}")]

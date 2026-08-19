@@ -5,7 +5,7 @@
 //! provider's signing point of no return durable and auditable. The required
 //! ordering is:
 //!
-//! `validate -> commit exact payload -> sign -> persist signed bytes -> release`
+//! `validate -> commit exact payload -> sign -> persist signed bytes -> return/relay`
 //!
 //! Only an uncommitted reservation can expire or be cancelled. Once a signing
 //! payload is committed, every reserved outpoint remains retired even across
@@ -17,9 +17,11 @@
 //! the commit transition: it rechecks the durable quote, authoritative
 //! prevouts, complete taker signatures, confidential proofs and openings, and
 //! exact fee/weight facts before it emits a one-shot signing capability.
-//! Concrete wallet/RPC/HSM implementations remain outside this crate. The
-//! signed-result transition remains private until a concrete signer adapter
-//! can be its only producer.
+//! After durable commitment, the signing coordinator invokes only the
+//! committed job, verifies and inserts its provider signatures, revalidates
+//! the completed PSET, and makes a private verified-PSET capability the only
+//! path to signed-artifact persistence. Concrete wallet/RPC/HSM
+//! implementations remain outside this crate.
 
 mod inventory;
 mod model;
@@ -55,10 +57,10 @@ pub use quote::{
 pub use store::{
     AuthoritativePrevout, CommitOutcome, DEFAULT_MAX_SETTLEMENT_INPUTS,
     DEFAULT_MAX_SETTLEMENT_OUTPUTS, MAX_EXPIRATION_BATCH, ProviderError,
-    ProviderSettlementValidator, ReservationBook, SCHEMA_VERSION, SettlementChainSource,
-    SettlementInputPlacement, SettlementLayout, SettlementLayoutError, SettlementLimitsError,
-    SettlementOutputPlacement, SettlementValidationError, SettlementValidationLimits,
-    SignedOutcome, ValidatedSigningIntent,
+    ProviderSettlementValidator, ProviderSigningCoordinator, ReservationBook, SCHEMA_VERSION,
+    SettlementChainSource, SettlementInputPlacement, SettlementLayout, SettlementLayoutError,
+    SettlementLimitsError, SettlementOutputPlacement, SettlementValidationError,
+    SettlementValidationLimits, SignedOutcome, SigningFinalizationError, ValidatedSigningIntent,
 };
 pub use wallet::{
     ConfidentialDestination, DestinationPurpose, DestinationSource, InventorySnapshot,

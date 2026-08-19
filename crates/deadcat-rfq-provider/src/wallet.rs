@@ -90,10 +90,10 @@ impl WalletOwnedOutput {
     /// verified in isolation because its input-generator domain belongs to the
     /// output's creating transaction. The source must therefore authenticate
     /// that the creating transaction passed its configured chain or mempool
-    /// validation policy. The later settlement validator rechecks this exact
-    /// prevout and validates the new transaction's confidential balance and
-    /// proofs; it cannot reconstruct the old proof's missing generator domain
-    /// from this isolated output alone.
+    /// validation policy. The settlement validator rechecks this exact prevout
+    /// and validates the new transaction's confidential balance and proofs;
+    /// it cannot reconstruct the old proof's missing generator domain from
+    /// this isolated output alone.
     pub fn new(
         outpoint: OutPoint,
         txout: TxOut,
@@ -553,9 +553,9 @@ pub struct SigningResponse {
 impl SigningResponse {
     /// Bind signatures to the exact ordered target list of `job`.
     ///
-    /// Cryptographic signature verification and insertion belong to the
-    /// concrete signer/finalizer adapter because they require the exact
-    /// committed transaction and every authoritative prevout.
+    /// Cryptographic verification and insertion are performed by the provider
+    /// signing coordinator against the exact committed transaction and its
+    /// already-authoritatively-checked prevouts.
     pub fn new(
         job: &SigningJob,
         signatures: Vec<ProviderInputSignature>,
