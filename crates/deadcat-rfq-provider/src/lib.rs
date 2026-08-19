@@ -13,10 +13,13 @@
 //!
 //! Wallet discovery admits only confidential tree-less P2TR outputs and quote
 //! eligibility is the intersection of a fresh complete scan with durable
-//! unallocated state. Concrete wallet/RPC/HSM implementations remain outside
-//! this crate. The commit and signed-result transitions also remain private
-//! until the concrete transaction validator and signer adapter can be their
-//! only producers.
+//! unallocated state. The final-PSET validator is the sole production path to
+//! the commit transition: it rechecks the durable quote, authoritative
+//! prevouts, complete taker signatures, confidential proofs and openings, and
+//! exact fee/weight facts before it emits a one-shot signing capability.
+//! Concrete wallet/RPC/HSM implementations remain outside this crate. The
+//! signed-result transition remains private until a concrete signer adapter
+//! can be its only producer.
 
 mod inventory;
 mod model;
@@ -50,12 +53,16 @@ pub use quote::{
     StaticRateRule, StaticRationalPricing,
 };
 pub use store::{
-    CommitOutcome, MAX_EXPIRATION_BATCH, ProviderError, ReservationBook, SCHEMA_VERSION,
-    SignedOutcome,
+    AuthoritativePrevout, CommitOutcome, DEFAULT_MAX_SETTLEMENT_INPUTS,
+    DEFAULT_MAX_SETTLEMENT_OUTPUTS, MAX_EXPIRATION_BATCH, ProviderError,
+    ProviderSettlementValidator, ReservationBook, SCHEMA_VERSION, SettlementChainSource,
+    SettlementInputPlacement, SettlementLayout, SettlementLayoutError, SettlementLimitsError,
+    SettlementOutputPlacement, SettlementValidationError, SettlementValidationLimits,
+    SignedOutcome, ValidatedSigningIntent,
 };
 pub use wallet::{
     ConfidentialDestination, DestinationPurpose, DestinationSource, InventorySnapshot,
     InventorySnapshotCommitment, InventorySource, P2TR_SIGHASH_ALL_SCRIPT_WITNESS_BYTES,
-    P2TR_SIGHASH_ALL_SIGNATURE_BYTES, ProviderInputSignature, ProviderSigner, SigningResponse,
-    WalletBoundaryError, WalletOwnedOutput, WalletScanAnchor,
+    P2TR_SIGHASH_ALL_SIGNATURE_BYTES, ProviderInputSignature, ProviderOutputRecovery,
+    ProviderSigner, SigningResponse, WalletBoundaryError, WalletOwnedOutput, WalletScanAnchor,
 };

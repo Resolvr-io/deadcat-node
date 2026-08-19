@@ -24,12 +24,21 @@ use crate::model::{
     SigningTarget, TransactionFee, UnixMillis, WalletKeyLocator,
 };
 use crate::quote::{
-    FirmQuote, FirmQuoteDraft, FirmQuoteOutcome, FirmQuoteRequest, PricingDecision,
-    QuoteContribution, QuoteEnginePolicy, QuoteExecution, QuoteOutputRole, QuoteSnapshotEvidence,
-    QuotedProviderInput, finalize_quote, quote_from_stored_parts, quote_outcome,
-    recompute_quote_commitment, recovery_metadata_commitment,
+    DestinationRecovery, FirmQuote, FirmQuoteDraft, FirmQuoteOutcome, FirmQuoteRequest,
+    PricingDecision, QuoteContribution, QuoteEnginePolicy, QuoteExecution, QuoteOutputRole,
+    QuoteSnapshotEvidence, QuotedProviderInput, finalize_quote, quote_from_stored_parts,
+    quote_outcome, recompute_quote_commitment, recovery_metadata_commitment,
 };
 use crate::wallet::recompute_inventory_binding;
+
+mod settlement;
+
+pub use settlement::{
+    AuthoritativePrevout, DEFAULT_MAX_SETTLEMENT_INPUTS, DEFAULT_MAX_SETTLEMENT_OUTPUTS,
+    ProviderSettlementValidator, SettlementChainSource, SettlementInputPlacement, SettlementLayout,
+    SettlementLayoutError, SettlementLimitsError, SettlementOutputPlacement,
+    SettlementValidationError, SettlementValidationLimits, ValidatedSigningIntent,
+};
 
 pub const SCHEMA_VERSION: u32 = 1;
 /// Maximum number of unrelated expirations one explicit sweep may mutate in a
@@ -788,6 +797,102 @@ impl ReservationBook {
             .transpose()
     }
 
+    /// Load the authenticated, durable inputs needed to validate a final
+    /// settlement. The returned quote and recovery metadata are reconstructed
+    /// from the reservation record rather than accepted from the submitter.
+    ///
+    /// Committed and signed records include their exact durable signing job so
+    /// the settlement layer can recognize retries without consulting live
+    /// wallet or chain state. Released reservations are terminal and therefore
+    /// do not produce a validation context.
+    pub(super) fn settlement_context(
+        &self,
+        access: ReservationAccess,
+    ) -> Result<SettlementContext, ProviderError> {
+        self.ensure_healthy()?;
+        let read = self.database.begin_read()?;
+        let reservations = read.open_table(RESERVATIONS)?;
+        let record = reservations
+            .get(access.reservation_id().to_bytes().as_slice())?
+            .map(|value| decode_record::<StoredReservation>(value.value()))
+            .transpose()?
+            .ok_or(ProviderError::ReservationNotFound(access.reservation_id()))?;
+        if record.id() != access.reservation_id() {
+            return Err(ProviderError::CorruptState(
+                "reservation key and record ID disagree".to_owned(),
+            ));
+        }
+        record.validate()?;
+        if record.owner != access.owner().to_bytes() {
+            return Err(ProviderError::ReservationOwnerMismatch(
+                access.reservation_id(),
+            ));
+        }
+        let stored_quote = record.quote.as_ref().ok_or_else(|| {
+            ProviderError::CorruptState(
+                "settlement validation requires a firm-quote reservation".to_owned(),
+            )
+        })?;
+        let quote = stored_quote.to_domain(self.identity, &record)?;
+        let provider_receive_recovery = DestinationRecovery {
+            internal_key: stored_quote.provider_receive_internal_key,
+            wallet_locator: stored_quote.provider_receive_wallet_locator,
+        };
+        let provider_change_recovery = match (
+            stored_quote.provider_change_internal_key,
+            stored_quote.provider_change_wallet_locator,
+        ) {
+            (Some(internal_key), Some(wallet_locator)) => Some(DestinationRecovery {
+                internal_key,
+                wallet_locator,
+            }),
+            (None, None) => None,
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(ProviderError::CorruptState(
+                    "persisted provider change recovery is incomplete".to_owned(),
+                ));
+            }
+        };
+        let inventory = read.open_table(INVENTORY)?;
+        let mut provider_targets = Vec::with_capacity(record.outpoints.len());
+        for outpoint in &record.outpoints {
+            let stored = inventory
+                .get(outpoint_key(*outpoint).as_slice())?
+                .map(|value| decode_record::<StoredInventoryItem>(value.value()))
+                .transpose()?
+                .ok_or_else(|| {
+                    ProviderError::CorruptState(format!(
+                        "reserved outpoint {outpoint:?} has no inventory metadata"
+                    ))
+                })?;
+            stored.to_domain()?;
+            provider_targets.push(StoredSigningTarget::from_inventory(stored).to_domain()?);
+        }
+        let state = match &record.state {
+            StoredReservationState::Reserved => SettlementContextState::Reserved,
+            StoredReservationState::Released { .. } => {
+                return Err(ProviderError::ReservationAlreadyReleased(record.id()));
+            }
+            StoredReservationState::Committed { intent } => {
+                SettlementContextState::Committed(intent.to_job(record.id())?)
+            }
+            StoredReservationState::Signed { intent, artifact } => {
+                let job = intent.to_job(record.id())?;
+                artifact.to_domain(record.id(), job.commitment())?;
+                SettlementContextState::Signed(job)
+            }
+        };
+        Ok(SettlementContext {
+            provider: self.identity,
+            access,
+            quote,
+            provider_receive_recovery,
+            provider_change_recovery,
+            provider_targets,
+            state,
+        })
+    }
+
     /// Cancel a reservation only while it remains before the signing point of
     /// no return. Cancellation at or after the deadline is recorded as expiry.
     pub fn cancel<C: Clock>(
@@ -874,16 +979,40 @@ impl ReservationBook {
     /// before any wallet or HSM signer is invoked.
     ///
     /// `pre_sign_payload` must be the complete immutable provider signing
-    /// transcript produced by the later settlement validator, including the
-    /// finalized transaction body, proofs, authoritative prevouts, existing
-    /// user witnesses, approved sighash profile, and quote economics.
-    // The concrete validator added in the next provider layer will be this
-    // method's only production caller. Keeping the transition crate-private
-    // prevents detached fee assertions from crossing the trust boundary.
-    #[allow(dead_code)]
-    pub(crate) fn commit_before_sign<C: Clock>(
+    /// transcript produced by the settlement validator, including the
+    /// finalized transaction body, proofs, authoritatively checked PSET
+    /// prevouts, existing user witnesses, approved sighash profile, and quote
+    /// economics.
+    // The concrete validator is this method's only production caller. Keeping
+    // the transition private prevents detached fee assertions from crossing
+    // the trust boundary.
+    fn commit_validated_before_sign<C: Clock>(
+        &self,
+        expected_provider: ProviderIdentity,
+        access: ReservationAccess,
+        expected_quote_commitment: QuoteCommitment,
+        pre_sign_payload: Vec<u8>,
+        fee: TransactionFee,
+        clock: &C,
+    ) -> Result<CommitOutcome, ProviderError> {
+        if self.identity != expected_provider {
+            return Err(ProviderError::ValidatedIntentBindingMismatch(
+                access.reservation_id(),
+            ));
+        }
+        self.commit_before_sign_inner(
+            access,
+            Some(expected_quote_commitment),
+            pre_sign_payload,
+            fee,
+            clock,
+        )
+    }
+
+    fn commit_before_sign_inner<C: Clock>(
         &self,
         access: ReservationAccess,
+        expected_quote_commitment: Option<QuoteCommitment>,
         pre_sign_payload: Vec<u8>,
         fee: TransactionFee,
         clock: &C,
@@ -891,6 +1020,11 @@ impl ReservationBook {
         validate_settlement_bytes(&pre_sign_payload)?;
         let (_operation_guard, write, now) = self.begin_timed_write(clock)?;
         let mut record = require_authorized_reservation(&write, access)?;
+        if expected_quote_commitment.is_some_and(|expected| {
+            record.quote.is_none() || record.quote_commitment != expected.to_bytes()
+        }) {
+            return Err(ProviderError::ValidatedIntentBindingMismatch(record.id()));
+        }
 
         match &record.state {
             StoredReservationState::Committed { intent } => {
@@ -1011,6 +1145,19 @@ impl ReservationBook {
         let job = intent.to_job(record.id())?;
         self.commit_write(write)?;
         Ok(CommitOutcome::NewlyCommitted(job))
+    }
+
+    /// Legacy state-machine test seam. Production code can cross this boundary
+    /// only through [`ValidatedSigningIntent`](settlement::ValidatedSigningIntent).
+    #[cfg(test)]
+    pub(crate) fn commit_before_sign<C: Clock>(
+        &self,
+        access: ReservationAccess,
+        pre_sign_payload: Vec<u8>,
+        fee: TransactionFee,
+        clock: &C,
+    ) -> Result<CommitOutcome, ProviderError> {
+        self.commit_before_sign_inner(access, None, pre_sign_payload, fee, clock)
     }
 
     /// Persist exact signed bytes before they can be returned or relayed.
@@ -1274,6 +1421,25 @@ impl ReservationBook {
         }
         self.commit_write(write)
     }
+}
+
+/// Authenticated durable state from which the settlement validator derives
+/// one opaque signing intent.
+pub(super) struct SettlementContext {
+    pub(super) provider: ProviderIdentity,
+    pub(super) access: ReservationAccess,
+    pub(super) quote: FirmQuote,
+    pub(super) provider_receive_recovery: DestinationRecovery,
+    pub(super) provider_change_recovery: Option<DestinationRecovery>,
+    pub(super) provider_targets: Vec<SigningTarget>,
+    pub(super) state: SettlementContextState,
+}
+
+/// Durable replay state paired with a settlement context.
+pub(super) enum SettlementContextState {
+    Reserved,
+    Committed(SigningJob),
+    Signed(SigningJob),
 }
 
 #[cfg(test)]
@@ -3929,6 +4095,8 @@ pub enum ProviderError {
     ReservationAlreadyReleased(ReservationId),
     #[error("reservation crossed the irreversible signing point: {0:?}")]
     PointOfNoReturn(ReservationId),
+    #[error("validated settlement does not match the provider or firm quote for reservation {0:?}")]
+    ValidatedIntentBindingMismatch(ReservationId),
     #[error("reservation is already committed to a different signing intent: {0:?}")]
     DifferentSigningIntent(ReservationId),
     #[error("settlement payload must not be empty")]
