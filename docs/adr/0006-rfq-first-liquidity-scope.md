@@ -5,7 +5,7 @@
 - Supersedes: ADR 0002's release-scope decision
 - Retires as historical: ADR 0003
 - Amends: ADR 0001's node-side advisory-routing responsibility
-- Implementation status updated: 2026-08-11
+- Implementation status updated: 2026-08-19
 
 ## Context
 
@@ -124,8 +124,10 @@ links apply only to that revision.
    aggregate intent, exact per-leg allocation, authenticated proposal binding,
    route-owned transaction composition, and no remote wire format.
 5. **Provider state core, wallet capability boundary, quote engine, final-PSET
-   validator, and signing coordinator implemented under ADR 0007:** complete
-   the concrete wallet/chain adapters, production pricing, relay, and
-   remote-service layers.
+   validator, signing coordinator, initial custom wallet, and collaborative
+   blinding implemented under [ADR 0007](0007-rfq-provider-state-machine.md) and
+   [ADR 0008](0008-rfq-service-owned-wallet.md):** complete the
+   inventory/chain scanner, wallet operations and daemon integration,
+   production pricing, relay, and remote-service layers.
 6. Add production-shaped process, crash-recovery, mutation, reorg, and
    operational acceptance gates.

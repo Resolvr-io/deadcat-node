@@ -595,8 +595,19 @@ interface proposed here:
   memory for collaborative blinding, defines typed confidential receive/change
   destination capabilities, and gives signers only exact durable jobs with
   explicit `SIGHASH_ALL` targets. Destination non-reuse and authoritative scan
-  freshness are backend obligations. It intentionally does not choose a
-  production wallet, RPC, descriptor, or HSM backend.
+  freshness are backend obligations. The provider core itself intentionally
+  owns no keys or concrete wallet backend.
+- [ADR 0008](adr/0008-rfq-service-owned-wallet.md) selects the first adjacent
+  provider-wallet implementation: a versioned encrypted, in-memory-unlocked
+  service seed; domain-separated BIP32 spend and SLIP-77 blinding derivation;
+  self-authenticating high-entropy recovery locators; tree-less P2TR with the
+  Elements tap tweak; confidential-output recovery; and exact durable-job
+  `SIGHASH_ALL` signing. It exposes no arbitrary sign/send API, and it does not
+  run in `deadcat-node`.
+- The provider settlement layer now performs the non-last collaborative
+  blinding stage against the exact live reserved contribution. It rejects
+  output aliasing and unrelated PSET mutation, consumes provider input openings
+  only from the fresh redacted in-memory view, and exposes no blinding factors.
 - Its inventory-aware quote engine now supports configured
   collateral-to-YES/NO and YES/NO-to-collateral directions, exact-in and
   exact-out integer arithmetic, injected pricing policy, deterministic bounded
@@ -647,9 +658,12 @@ capability for the durable commit. Its signing coordinator then exact-matches
 the durable job, invokes the backend-neutral signer outside database locks,
 verifies and inserts every provider signature, proves all other PSET data is
 unchanged, rechecks proofs and fee facts, and stores one canonical signed PSET
-before returning or replaying it. The API remains provisional until
-authenticated signed remote RFQ evidence and a production wallet/signer/chain
-backend exercise it end to end.
+before returning or replaying it. The API remains provisional until the custom
+wallet is connected to an authoritative Elements-backed inventory/chain
+scanner and daemon runtime and authenticated signed remote RFQ evidence
+exercises the complete flow end to end. Filesystem/passphrase operations,
+stale-backup recovery tooling, live wallet-backed regtest coverage, and HSM
+support also remain outside the current slice.
 The initial profile verifies every non-provider input as a finalized tree-less
 P2TR key-path `SIGHASH_ALL` spend. Simplicity covenant inputs and more than one
 interactive RFQ signer remain later router/venue-verification work; they are

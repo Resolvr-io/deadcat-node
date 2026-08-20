@@ -56,11 +56,12 @@ pub use quote::{
 };
 pub use store::{
     AuthoritativePrevout, CommitOutcome, DEFAULT_MAX_SETTLEMENT_INPUTS,
-    DEFAULT_MAX_SETTLEMENT_OUTPUTS, MAX_EXPIRATION_BATCH, ProviderError,
-    ProviderSettlementValidator, ProviderSigningCoordinator, ReservationBook, SCHEMA_VERSION,
-    SettlementChainSource, SettlementInputPlacement, SettlementLayout, SettlementLayoutError,
-    SettlementLimitsError, SettlementOutputPlacement, SettlementValidationError,
-    SettlementValidationLimits, SignedOutcome, SigningFinalizationError, ValidatedSigningIntent,
+    DEFAULT_MAX_SETTLEMENT_OUTPUTS, MAX_EXPIRATION_BATCH, ProviderBlindedPset,
+    ProviderBlindingCoordinator, ProviderBlindingError, ProviderError, ProviderSettlementValidator,
+    ProviderSigningCoordinator, ReservationBook, SCHEMA_VERSION, SettlementChainSource,
+    SettlementInputPlacement, SettlementLayout, SettlementLayoutError, SettlementLimitsError,
+    SettlementOutputPlacement, SettlementValidationError, SettlementValidationLimits,
+    SignedOutcome, SigningFinalizationError, ValidatedSigningIntent,
 };
 pub use wallet::{
     ConfidentialDestination, DestinationPurpose, DestinationSource, InventorySnapshot,

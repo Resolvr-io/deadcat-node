@@ -35,6 +35,7 @@ mod settlement;
 
 pub use settlement::{
     AuthoritativePrevout, DEFAULT_MAX_SETTLEMENT_INPUTS, DEFAULT_MAX_SETTLEMENT_OUTPUTS,
+    ProviderBlindedPset, ProviderBlindingCoordinator, ProviderBlindingError,
     ProviderSettlementValidator, ProviderSigningCoordinator, SettlementChainSource,
     SettlementInputPlacement, SettlementLayout, SettlementLayoutError, SettlementLimitsError,
     SettlementOutputPlacement, SettlementValidationError, SettlementValidationLimits,

@@ -8,8 +8,10 @@ serves independently verifiable evidence over Iroh.
 The node is deliberately not a wallet or trading venue. End-user keys, wallet
 discovery, PSET construction, intent validation, venue selection, and signing
 stay on the client. The separate RFQ-provider library defines interfaces for
-provider-owned inventory, confidential blinding, and signing, but no provider
-wallet backend or key material runs in `deadcat-node`.
+provider-owned inventory, confidential blinding, and signing. An adjacent
+purpose-built RFQ wallet library holds only provider liquidity keys for the
+future separate RFQ daemon; no provider wallet backend or key material runs in
+`deadcat-node`.
 
 ## Current scope
 
@@ -50,8 +52,16 @@ one canonical signed PSET before returning it. Exact retries replay that
 durable winner without re-signing; concurrently in-flight valid signature
 encodings may both sign, but every caller returns the same stored winner. Its
 `FirmQuote` is still an internal, unauthenticated artifact, not yet a provider-
-signed network quote. A production wallet/RPC/HSM backend, market-data pricing
-source, authenticated remote protocol, and relay remain future work.
+signed network quote. The first custom provider-wallet slice adds a versioned
+encrypted keystore, in-memory BIP32/SLIP-77 key derivation, fresh confidential
+tree-less P2TR destinations, output recovery, exact durable-job signing, and a
+provider-side non-last blinding coordinator. It deliberately has no arbitrary
+signing API, and Elements Core remains only the intended chain, mempool, policy,
+and relay authority. Filesystem/passphrase operations, an authoritative
+inventory scanner, daemon and live-regtest integration, backup-recovery tooling,
+market-data pricing, the authenticated remote protocol, relay reconciliation,
+and HSM support remain future work. [ADR 0008](docs/adr/0008-rfq-service-owned-wallet.md)
+records that boundary.
 This initial validator accepts ordinary finalized tree-less P2TR
 `SIGHASH_ALL` inputs outside the current RFQ leg; Simplicity covenant inputs
 and a second interactive RFQ signer need a later authenticated venue/script
