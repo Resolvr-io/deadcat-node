@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use deadcat_rfq_provider::{
-    ConfidentialDestination, DestinationPurpose, DestinationSource, ProviderIdentity,
-    ProviderInputSignature, ProviderOutputRecovery, ProviderSigner, SigningJob, SigningResponse,
-    WalletBoundaryError, WalletKeyLocator,
+    ConfidentialDestination, DestinationPurpose, ProviderIdentity, ProviderInputSignature,
+    ProviderOutputRecovery, ProviderSigner, SigningJob, SigningResponse, WalletBoundaryError,
+    WalletKeyLocator, WalletOwnedOutput,
 };
 use elements::bitcoin::NetworkKind;
 use elements::bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv};
@@ -44,12 +44,12 @@ const RANDOM_PATH_COMPONENTS: usize = 5;
 const LOCATOR_AUTH_DOMAIN: &[u8] = b"deadcat/rfq/wallet/locator-auth/v1";
 const LOCATOR_TAG_DOMAIN: &[u8] = b"deadcat/rfq/wallet/locator-tag/v1";
 const LOCATOR_PATH_DOMAIN: &[u8] = b"deadcat/rfq/wallet/locator-path/v1";
+const BACKUP_AUTH_DOMAIN: &[u8] = b"deadcat/rfq/wallet/backup-auth/v1";
 const SLIP21_DOMAIN: &[u8] = b"Symmetric key seed";
 const SLIP77_LABEL: &[u8] = b"SLIP-0077";
 
 struct IssuanceState<R> {
     rng: R,
-    issued_nonces: BTreeSet<[u8; LOCATOR_NONCE_BYTES]>,
 }
 
 /// Unlocked, purpose-built provider hot wallet.
@@ -76,7 +76,7 @@ impl RfqWallet<OsRng> {
 }
 
 impl<R: RngCore + CryptoRng + Send> RfqWallet<R> {
-    fn with_rng(unlocked: UnlockedSeed, rng: R) -> Result<Self, RfqWalletError> {
+    pub(crate) fn with_rng(unlocked: UnlockedSeed, rng: R) -> Result<Self, RfqWalletError> {
         let (seed, identity, wallet_id) = unlocked.into_parts();
         let master_blinding_key = derive_slip77_master(&seed[..])?;
         let locator_auth_key = derive_locator_auth_key(&seed, identity, wallet_id)?;
@@ -86,10 +86,7 @@ impl<R: RngCore + CryptoRng + Send> RfqWallet<R> {
             seed,
             master_blinding_key,
             locator_auth_key,
-            issuance: Mutex::new(IssuanceState {
-                rng,
-                issued_nonces: BTreeSet::new(),
-            }),
+            issuance: Mutex::new(IssuanceState { rng }),
         })
     }
 
@@ -98,14 +95,24 @@ impl<R: RngCore + CryptoRng + Send> RfqWallet<R> {
         self.identity
     }
 
-    /// Issue a confidential destination for operator-provided initial or
-    /// replenishment liquidity.
-    ///
-    /// This is deliberately distinct from settlement receive and change so a
-    /// durable locator preserves the key's operational role without treating
-    /// an operator deposit as a quote settlement.
-    pub fn fresh_inventory_destination(&self) -> Result<ConfidentialDestination, RfqWalletError> {
+    pub(crate) const fn wallet_id(&self) -> [u8; 16] {
+        self.wallet_id
+    }
+
+    pub(crate) fn candidate_inventory_destination(
+        &self,
+    ) -> Result<ConfidentialDestination, RfqWalletError> {
         self.issue_destination(KeyPurpose::InventoryDeposit)
+    }
+
+    pub(crate) fn candidate_settlement_destination(
+        &self,
+        purpose: DestinationPurpose,
+    ) -> Result<ConfidentialDestination, RfqWalletError> {
+        self.issue_destination(match purpose {
+            DestinationPurpose::SettlementReceive => KeyPurpose::SettlementReceive,
+            DestinationPurpose::SettlementChange => KeyPurpose::SettlementChange,
+        })
     }
 
     /// Reconstruct the public spend script and blinding public key for an
@@ -122,6 +129,64 @@ impl<R: RngCore + CryptoRng + Send> RfqWallet<R> {
         self.destination_for_locator(locator)
     }
 
+    /// Authenticate and recover one complete confidential wallet output while
+    /// keeping its blinding factors inside the provider capability boundary.
+    ///
+    /// A concrete chain scanner supplies the creating outpoint and full
+    /// consensus output, including its rangeproof and surjection proof. The
+    /// returned value retains the opening only in the provider crate's
+    /// redacted in-memory representation used for collaborative blinding.
+    pub fn recover_owned_output(
+        &self,
+        locator: WalletKeyLocator,
+        outpoint: OutPoint,
+        txout: TxOut,
+    ) -> Result<WalletOwnedOutput, RfqWalletError> {
+        let decoded = self.decode_locator(locator)?;
+        let mut keypair = self.derive_spend_keypair(decoded)?;
+        let (internal_key, _) = keypair.0.x_only_public_key();
+        let expected_script = Script::new_v1_p2tr(&Secp256k1::new(), internal_key, None);
+        if txout.script_pubkey != expected_script
+            || !txout.asset.is_confidential()
+            || !txout.value.is_confidential()
+            || !txout.nonce.is_confidential()
+        {
+            return Err(RfqWalletError::OutputScriptOrConfidentialityMismatch);
+        }
+        let mut blinding_secret = self.slip77_blinding_secret(&expected_script)?;
+        let opening = txout
+            .unblind(&Secp256k1::new(), blinding_secret.0)
+            .map_err(|_| RfqWalletError::OutputUnblindFailed)?;
+        blinding_secret.0.non_secure_erase();
+        keypair.0.non_secure_erase();
+        WalletOwnedOutput::new(outpoint, txout, opening, internal_key, locator)
+            .map_err(RfqWalletError::from)
+    }
+
+    pub(crate) fn validate_locator(&self, locator: WalletKeyLocator) -> Result<(), RfqWalletError> {
+        self.decode_locator(locator).map(|_| ())
+    }
+
+    pub(crate) fn locator_nonce(
+        &self,
+        locator: WalletKeyLocator,
+    ) -> Result<[u8; LOCATOR_NONCE_BYTES], RfqWalletError> {
+        self.decode_locator(locator).map(|decoded| decoded.nonce)
+    }
+
+    pub(crate) fn backup_authentication_tag(
+        &self,
+        payload: &[u8],
+    ) -> Result<[u8; 32], RfqWalletError> {
+        let mut mac = HmacSha256::new_from_slice(self.locator_auth_key.as_ref())
+            .map_err(|_| RfqWalletError::KeyDerivationFailed)?;
+        mac.update(BACKUP_AUTH_DOMAIN);
+        mac.update(&identity_bytes(self.identity));
+        mac.update(&self.wallet_id);
+        mac.update(payload);
+        Ok(mac.finalize().into_bytes().into())
+    }
+
     fn issue_destination(
         &self,
         purpose: KeyPurpose,
@@ -133,7 +198,7 @@ impl<R: RngCore + CryptoRng + Send> RfqWallet<R> {
         for _ in 0..MAX_DESTINATION_ATTEMPTS {
             let mut nonce = [0_u8; LOCATOR_NONCE_BYTES];
             issuance.rng.fill_bytes(&mut nonce);
-            if nonce == [0; LOCATOR_NONCE_BYTES] || !issuance.issued_nonces.insert(nonce) {
+            if nonce == [0; LOCATOR_NONCE_BYTES] {
                 continue;
             }
             let locator = self.encode_locator(purpose, nonce)?;
@@ -335,20 +400,6 @@ impl<R> fmt::Debug for RfqWallet<R> {
             .field("wallet_id", &"[opaque]")
             .field("secrets", &"[redacted]")
             .finish_non_exhaustive()
-    }
-}
-
-impl<R: RngCore + CryptoRng + Send> DestinationSource for RfqWallet<R> {
-    type Error = RfqWalletError;
-
-    fn fresh_confidential_destination(
-        &self,
-        purpose: DestinationPurpose,
-    ) -> Result<ConfidentialDestination, Self::Error> {
-        self.issue_destination(match purpose {
-            DestinationPurpose::SettlementReceive => KeyPurpose::SettlementReceive,
-            DestinationPurpose::SettlementChange => KeyPurpose::SettlementChange,
-        })
     }
 }
 
@@ -618,9 +669,7 @@ mod tests {
     use core::str::FromStr as _;
     use std::fmt::Write as _;
 
-    use deadcat_rfq_provider::{
-        DestinationSource as _, ProviderId, ProviderIdentity, ProviderOutputRecovery as _,
-    };
+    use deadcat_rfq_provider::{ProviderId, ProviderIdentity, ProviderOutputRecovery as _};
     use elements::confidential::{Asset, AssetBlindingFactor, Nonce, Value, ValueBlindingFactor};
     use elements::hashes::Hash as _;
     use elements::hashes::hex::FromHex as _;
@@ -741,13 +790,13 @@ mod tests {
     fn destinations_are_tree_less_p2tr_and_counter_rollback_independent() {
         let (wallet, restored) = wallets();
         let receive = wallet
-            .fresh_confidential_destination(DestinationPurpose::SettlementReceive)
+            .candidate_settlement_destination(DestinationPurpose::SettlementReceive)
             .expect("receive");
         let change = wallet
-            .fresh_confidential_destination(DestinationPurpose::SettlementChange)
+            .candidate_settlement_destination(DestinationPurpose::SettlementChange)
             .expect("change");
         let after_restore = restored
-            .fresh_confidential_destination(DestinationPurpose::SettlementReceive)
+            .candidate_settlement_destination(DestinationPurpose::SettlementReceive)
             .expect("restored receive");
         let recovered_after_restore = restored
             .recover_confidential_destination(receive.wallet_locator())
@@ -780,7 +829,7 @@ mod tests {
     fn locator_tampering_and_cross_wallet_use_fail_authentication() {
         let (wallet, _) = wallets();
         let destination = wallet
-            .fresh_confidential_destination(DestinationPurpose::SettlementReceive)
+            .candidate_settlement_destination(DestinationPurpose::SettlementReceive)
             .expect("destination");
         let mut bytes = destination.wallet_locator().to_bytes();
         bytes[7] ^= 1;
@@ -808,7 +857,7 @@ mod tests {
     fn output_recovery_requires_exact_locator_key_asset_and_amount() {
         let (wallet, _) = wallets();
         let destination = wallet
-            .fresh_inventory_destination()
+            .candidate_inventory_destination()
             .expect("inventory destination");
         let asset = AssetId::from_byte_array([77; 32]);
         let amount = 42_000;
@@ -867,7 +916,7 @@ mod tests {
     fn signer_uses_elements_taptweak_and_explicit_sighash_all() {
         let (wallet, _) = wallets();
         let destination = wallet
-            .fresh_inventory_destination()
+            .candidate_inventory_destination()
             .expect("inventory destination");
         let outpoint = OutPoint::new(Txid::from_byte_array([90; 32]), 0);
         let prevout = TxOut {
@@ -930,10 +979,10 @@ mod tests {
     fn signer_rejects_wrong_internal_key_non_all_and_noncanonical_payload() {
         let (wallet, _) = wallets();
         let destination = wallet
-            .fresh_confidential_destination(DestinationPurpose::SettlementReceive)
+            .candidate_settlement_destination(DestinationPurpose::SettlementReceive)
             .expect("destination");
         let other = wallet
-            .fresh_confidential_destination(DestinationPurpose::SettlementReceive)
+            .candidate_settlement_destination(DestinationPurpose::SettlementReceive)
             .expect("other");
         let outpoint = OutPoint::new(Txid::from_byte_array([91; 32]), 1);
         let mut input = PsetInput::from_prevout(outpoint);

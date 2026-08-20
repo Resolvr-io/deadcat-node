@@ -144,7 +144,7 @@ impl EncryptedKeystore {
         Self::seal_entropy_with_rng(identity, passphrase, kdf, &entropy, rng)
     }
 
-    fn seal_entropy_with_rng<R: RngCore + CryptoRng>(
+    pub(crate) fn seal_entropy_with_rng<R: RngCore + CryptoRng>(
         identity: ProviderIdentity,
         passphrase: &[u8],
         kdf: KdfParams,
