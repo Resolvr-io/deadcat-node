@@ -33,11 +33,22 @@ use crate::binary_market::transitions::{
     subsequent_issuance,
 };
 
+// Static Taproot role slots:
+//
+//   0  Dormant YES RT coordinator
+//   1  Dormant NO RT follower
+//   2  Unresolved YES RT coordinator
+//   3  Unresolved NO RT follower
+//   4  Unresolved collateral follower
+//   5  YES-resolved collateral
+//   6  NO-resolved collateral
+//   7  Expired collateral
+
 // Typed five-operation witness ABI. SLOT is the only other witness field.
 //
 //   Left(Left(output_base))                         Issue
 //   Left(Right(output_base))                        Cancel
-//   Right(Left((output_base, outcome_yes, sig)))    Resolve
+//   Right(Left((output_base, is_yes_outcome, sig))) Resolve
 //   Right(Right(Left(output_base)))                 Expire
 //   Right(Right(Right(output_base)))                Redeem
 //
@@ -45,20 +56,97 @@ use crate::binary_market::transitions::{
 // subsequent issuance, dormant from active resolution/expiry, and resolved
 // from expired redemption. Transaction outputs distinguish partial from full
 // cancellation/redemption and authenticate burn quantity and token side.
-type MarketAction = Either<
-    Either<u32, u32>,
-    Either<(u32, bool, Signature), Either<u32, u32>>
->;
+type OutputBase = u32;
+type IssueOrCancel = Either<OutputBase, OutputBase>;
+type ResolutionAction = (OutputBase, bool, Signature);
+type ExpireOrRedeem = Either<OutputBase, OutputBase>;
+type ResolveOrTerminal = Either<ResolutionAction, ExpireOrRedeem>;
+type MarketAction = Either<IssueOrCancel, ResolveOrTerminal>;
+
+fn authenticate_coordinator(slot: u8, current: u32) {
+    // Authenticate coordinator siblings before reading ACTION. Slots 5, 6,
+    // and 7 are single-input terminal states.
+    match jet::eq_8(slot, 0) {
+        true => ensure_dormant_coordinator_group(
+            current,
+            safe_add_32(current, 1),
+        ),
+        false => match jet::eq_8(slot, 2) {
+            true => ensure_unresolved_coordinator_group(
+                current,
+                safe_add_32(current, 1),
+                safe_add_32(current, 2),
+            ),
+            false => assert!(or(
+                or(jet::eq_8(slot, 5), jet::eq_8(slot, 6)),
+                jet::eq_8(slot, 7),
+            )),
+        },
+    };
+}
+
+fn dispatch_action(slot: u8, current: u32, action: MarketAction) {
+    match action {
+        Left(issue_or_cancel: IssueOrCancel) => match issue_or_cancel {
+            Left(output_base: OutputBase) => match jet::eq_8(slot, 0) {
+                true => initial_issuance(current, output_base),
+                false => {
+                    assert!(jet::eq_8(slot, 2));
+                    subsequent_issuance(current, output_base);
+                },
+            },
+            Right(output_base: OutputBase) => {
+                assert!(jet::eq_8(slot, 2));
+                cancellation(current, output_base);
+            },
+        },
+        Right(resolve_or_terminal: ResolveOrTerminal) => match resolve_or_terminal {
+            Left(resolve: ResolutionAction) => {
+                let (output_base, is_yes_outcome, signature): ResolutionAction = resolve;
+                match jet::eq_8(slot, 0) {
+                    true => dormant_resolution(
+                        current, output_base, is_yes_outcome, signature,
+                    ),
+                    false => {
+                        assert!(jet::eq_8(slot, 2));
+                        active_resolution(
+                            current, output_base, is_yes_outcome, signature,
+                        );
+                    },
+                };
+            },
+            Right(expire_or_redeem: ExpireOrRedeem) => match expire_or_redeem {
+                Left(output_base: OutputBase) => match jet::eq_8(slot, 0) {
+                    true => dormant_expiry(current, output_base),
+                    false => {
+                        assert!(jet::eq_8(slot, 2));
+                        active_expiry(current, output_base);
+                    },
+                },
+                Right(output_base: OutputBase) => match or(
+                    jet::eq_8(slot, 5),
+                    jet::eq_8(slot, 6),
+                ) {
+                    true => resolved_redemption(slot, current, output_base),
+                    false => {
+                        assert!(jet::eq_8(slot, 7));
+                        expiry_redemption(slot, current, output_base);
+                    },
+                },
+            },
+        },
+    };
+}
 
 fn main() {
     let slot: u8 = witness::SLOT;
     let current: u32 = jet::current_index();
 
-    // This proves that SLOT is the hidden TapData word committed by the UTXO
-    // executing this program. Follower roles authenticate their complete group
-    // and return without ever consulting ACTION.
+    // Prove that SLOT is the hidden TapData word committed by the current UTXO.
     ensure_input_script(current, script_for_slot(slot));
 
+    // Followers authenticate their complete group and return without reading
+    // ACTION. SimplicityHL 0.6 requires witness expressions to remain in main.
     match jet::eq_8(slot, 1) {
         true => dormant_no_follower(),
         false => match jet::eq_8(slot, 3) {
@@ -66,82 +154,9 @@ fn main() {
             false => match jet::eq_8(slot, 4) {
                 true => unresolved_collateral_follower(),
                 false => {
-                    // Authenticate coordinator siblings before reading ACTION.
-                    // Slots 5, 6, and 7 are single-input terminal states.
-                    match jet::eq_8(slot, 0) {
-                        true => ensure_dormant_coordinator_group(
-                            current,
-                            safe_add_32(current, 1),
-                        ),
-                        false => match jet::eq_8(slot, 2) {
-                            true => ensure_unresolved_coordinator_group(
-                                current,
-                                safe_add_32(current, 1),
-                                safe_add_32(current, 2),
-                            ),
-                            false => assert!(or(
-                                or(jet::eq_8(slot, 5), jet::eq_8(slot, 6)),
-                                jet::eq_8(slot, 7),
-                            )),
-                        },
-                    };
-
+                    authenticate_coordinator(slot, current);
                     let action: MarketAction = witness::ACTION;
-                    match action {
-                        Left(issue_or_cancel: Either<u32, u32>) => match issue_or_cancel {
-                            Left(output_base: u32) => match jet::eq_8(slot, 0) {
-                                true => initial_issuance(current, output_base),
-                                false => {
-                                    assert!(jet::eq_8(slot, 2));
-                                    subsequent_issuance(current, output_base);
-                                },
-                            },
-                            Right(output_base: u32) => {
-                                assert!(jet::eq_8(slot, 2));
-                                cancellation(current, output_base);
-                            },
-                        },
-                        Right(resolve_or_terminal: Either<(u32, bool, Signature), Either<u32, u32>>) => match resolve_or_terminal {
-                            Left(resolve: (u32, bool, Signature)) => {
-                                let (output_base, outcome_yes, signature):
-                                    (u32, bool, Signature) = resolve;
-                                match jet::eq_8(slot, 0) {
-                                    true => dormant_resolution(
-                                        current, output_base, outcome_yes, signature,
-                                    ),
-                                    false => {
-                                        assert!(jet::eq_8(slot, 2));
-                                        active_resolution(
-                                            current, output_base, outcome_yes, signature,
-                                        );
-                                    },
-                                };
-                            },
-                            Right(expire_or_redeem: Either<u32, u32>) => {
-                                match expire_or_redeem {
-                                    Left(output_base: u32) => match jet::eq_8(slot, 0) {
-                                        true => dormant_expiry(current, output_base),
-                                        false => {
-                                            assert!(jet::eq_8(slot, 2));
-                                            active_expiry(current, output_base);
-                                        },
-                                    },
-                                    Right(output_base: u32) => match or(
-                                        jet::eq_8(slot, 5),
-                                        jet::eq_8(slot, 6),
-                                    ) {
-                                        true => resolved_redemption(
-                                            slot, current, output_base,
-                                        ),
-                                        false => {
-                                            assert!(jet::eq_8(slot, 7));
-                                            expiry_redemption(slot, current, output_base);
-                                        },
-                                    },
-                                };
-                            },
-                        },
-                    };
+                    dispatch_action(slot, current, action);
                 },
             },
         },

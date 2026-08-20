@@ -83,10 +83,19 @@ Later on 2026-07-31, the canonical compiler began deriving and binding the YES
 and NO oracle messages from the outcome asset IDs. The covenant now selects one
 of those messages before BIP340 verification instead of rebuilding the market
 ID and tagged hash during every resolution spend. This preserves the oracle
-protocol and A/B decision while changing the current parameterized golden CMR
-to `702f5d04f15bcdec3fa1070540bf2f68c0ecdcf40bc8aa8024e1e77ef19cd5ee`.
+protocol and A/B decision while changing the then-current parameterized golden
+CMR to `702f5d04f15bcdec3fa1070540bf2f68c0ecdcf40bc8aa8024e1e77ef19cd5ee`.
 The exact derived-message vectors and resource bounds are recorded in the
 [oracle-precomputation note](../binary-market-oracle-precomputation.md).
+
+Later on 2026-07-31, the still-undeployed covenant was reorganized around named
+coordinator-authentication and action-dispatch functions, with explicit
+transition and commitment names throughout its modules. This preserves the A/B
+decision, protocol behavior, and `SLOT`/`ACTION` ABI while changing the current
+parameterized golden CMR to
+`00e4bab69ce3f9d6346fe67fe186d4ef08d3c608ef31b4c4ade8a47459852447`.
+The exact identity and resource delta are recorded in the
+[SimplicityHL legibility note](../binary-market-simf-legibility.md).
 
 ## Candidate schedule
 

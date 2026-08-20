@@ -94,7 +94,7 @@ fn nonuniform_contract_arguments_compile_to_stable_cmr() {
     let compiled = CompiledBinaryMarket::new(params).expect("compile market");
     assert_eq!(
         hex(&compiled.cmr()),
-        "090548f91e2f07d2e691216336b578bf15fcdbde96f2e4255e4e70c60e4c1931"
+        "53fac89c22d842a74174c3f1d2f703708c0d323bd18e5d1cfe78c08fe0fb3ccc"
     );
 }
 
@@ -243,40 +243,40 @@ fn sample_binary_market_consensus_vectors_are_stable() {
     let compiled = CompiledBinaryMarket::new(params).expect("compile market");
     assert_eq!(
         hex(&compiled.cmr()),
-        "702f5d04f15bcdec3fa1070540bf2f68c0ecdcf40bc8aa8024e1e77ef19cd5ee"
+        "00e4bab69ce3f9d6346fe67fe186d4ef08d3c608ef31b4c4ade8a47459852447"
     );
     let expected_slots = [
         (
-            "512001d36e8c57cfcd1f3c2f17fb588985f8dcd5834e9938c4f7d35e3ef2a4e5acf7",
+            "5120342769121839ff131ef5dc6c6b3d015c719923f19a35669d8fc030283cd1d2da",
             "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac03491a3e42d2db13335d900b3cbadcb0d5088b4eb9073869ff309910862294069",
         ),
         (
-            "5120d33c3880d2a6c1fb3a95b359fd7d602a793a10e2af5da30806685bb2c50c8390",
-            "bf50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac09c44e27f20b80c93313762a6f4e71fc82db38469d90f902bc1720755b61660f3",
+            "512073a918ac4922398ec57f39976520a43414f807577a48fc41ecffdf61276510dd",
+            "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac09c44e27f20b80c93313762a6f4e71fc82db38469d90f902bc1720755b61660f3",
         ),
         (
-            "51208e9a829d1fb7d7c0cb19d524cb469dbe4e248744304f60c1bb487676ba660de5",
+            "51200715f9c32b080ed1c97bd1753454597d1a8cdf54e188d526fc9644b69e1a6f2e",
             "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac04bbdde171ae4fa8cfe1c7790ec1d737b4044251c647103b3e2c320a25a8b61e2",
         ),
         (
-            "5120a4e68ecf6a94a73272c75e2023f9ab3cd3fd1ce0e86e5556540ce33bec5739b1",
-            "bf50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac013169a5cae722314cc26e3f278b4f9d087affe9b0dab437d6d8c2b28ace343d0",
+            "512038f0ebf56bdeba2a12441455d1f8037e547261645870ed1d81769d56ab8bedae",
+            "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac013169a5cae722314cc26e3f278b4f9d087affe9b0dab437d6d8c2b28ace343d0",
         ),
         (
-            "51208745d41c870ac38b4aa9d9c9bf345f160a9e82f1691daa50216a79a224b6b7ea",
+            "5120ea649216fb0f285859c555d6959063ba375f21055b24c763cf214493bd182ff7",
             "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac04b7b02768d8d3b9339bfd3417355db78cada99eb21f1e32873b3ab77065ee015",
         ),
         (
-            "512098e5b0dc5969b4f0716f179507d882026857b84f507692da10d258081ff979f1",
-            "bf50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac094c17910e4ec9a08d1a445308fd4b66ee01cc818d1772a8deff59dd38b649bee",
+            "5120c0ba7d407510eced1dd8fd5b5a95b8040acba69b04aabf4d4a702b3eb28d0055",
+            "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac094c17910e4ec9a08d1a445308fd4b66ee01cc818d1772a8deff59dd38b649bee",
         ),
         (
-            "5120ba9e2e04ae3c5b62b8a2eba46eddb764d7d2038f2640a6db0654ee9d52e793ac",
+            "5120d25815311baec645ccca04622a0805497b864f456337bc6fb8aed0818c07c156",
             "bf50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0838594e38820be8487ed62ea7663c1d3ce2f20b3f0c7d8075b1bd3f436239d25",
         ),
         (
-            "51200a566889ec9ce31dea29985827ae10915373de02c609285b4d735b04880d7338",
-            "bf50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac03efb3634a85ea11aa3a246775edf9406ff088af069350d5b8a4ef7a9f862ae0c",
+            "5120d6dcd1da0f5bbb5b35bee654d715cd6c17d33cf2de001a9b042a9ebba88cc285",
+            "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac03efb3634a85ea11aa3a246775edf9406ff088af069350d5b8a4ef7a9f862ae0c",
         ),
     ];
     for (slot, (script, control_block)) in BinaryMarketSlot::ALL.into_iter().zip(expected_slots) {
