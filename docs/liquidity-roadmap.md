@@ -600,10 +600,12 @@ interface proposed here:
 - [ADR 0008](adr/0008-rfq-service-owned-wallet.md) selects the first adjacent
   provider-wallet implementation: a versioned encrypted, in-memory-unlocked
   service seed; domain-separated BIP32 spend and SLIP-77 blinding derivation;
-  self-authenticating high-entropy recovery locators; tree-less P2TR with the
-  Elements tap tweak; confidential-output recovery; and exact durable-job
-  `SIGHASH_ALL` signing. It exposes no arbitrary sign/send API, and it does not
-  run in `deadcat-node`.
+  self-authenticating high-entropy recovery locators; an identity-bound durable
+  catalog with persist-before-return issuance, revision checkpoints, and
+  wallet-only logical snapshots on a lock-supporting local Unix filesystem;
+  tree-less P2TR with the Elements tap tweak; confidential-output recovery; and
+  exact durable-job `SIGHASH_ALL` signing. It exposes no arbitrary sign/send
+  API, and it does not run in `deadcat-node`.
 - The provider settlement layer now performs the non-last collaborative
   blinding stage against the exact live reserved contribution. It rejects
   output aliasing and unrelated PSET mutation, consumes provider input openings
@@ -661,9 +663,10 @@ unchanged, rechecks proofs and fee facts, and stores one canonical signed PSET
 before returning or replaying it. The API remains provisional until the custom
 wallet is connected to an authoritative Elements-backed inventory/chain
 scanner and daemon runtime and authenticated signed remote RFQ evidence
-exercises the complete flow end to end. Filesystem/passphrase operations,
-stale-backup recovery tooling, live wallet-backed regtest coverage, and HSM
-support also remain outside the current slice.
+exercises the complete flow end to end. Protected passphrase delivery,
+external backup-freshness and coordinated provider-state recovery, live
+wallet-backed regtest coverage, and HSM support also remain outside the current
+slice.
 The initial profile verifies every non-provider input as a finalized tree-less
 P2TR key-path `SIGHASH_ALL` spend. Simplicity covenant inputs and more than one
 interactive RFQ signer remain later router/venue-verification work; they are
