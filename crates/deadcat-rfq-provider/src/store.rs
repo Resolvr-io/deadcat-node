@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -13,6 +14,7 @@ use redb::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use tempfile::TempPath;
 use thiserror::Error;
 
 use crate::model::{
@@ -160,17 +162,70 @@ pub struct ReservationBook {
     operation_lock: Mutex<()>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StoreOpenMode {
+    CreateNew,
+    OpenExisting,
+}
+
 impl ReservationBook {
-    pub fn open(path: impl AsRef<Path>, identity: ProviderIdentity) -> Result<Self, ProviderError> {
-        let database = Database::create(path)?;
+    /// Create and atomically publish a new provider database.
+    ///
+    /// The target must not exist. On Unix the database is published with mode
+    /// `0600` in an owner-controlled parent directory; an existing file or
+    /// symlink is never opened or replaced.
+    pub fn create(
+        path: impl AsRef<Path>,
+        identity: ProviderIdentity,
+    ) -> Result<Self, ProviderError> {
+        let path = path.as_ref();
+        let (database, staging, staging_identity) = create_staging_database(path)?;
         let book = Self {
             database,
             identity,
             poisoned: AtomicBool::new(false),
             operation_lock: Mutex::new(()),
         };
-        book.initialize_schema()?;
+        book.initialize_schema(StoreOpenMode::CreateNew)?;
+        publish_staging_database(book, staging, staging_identity, path)
+    }
+
+    /// Open an already-initialized provider database without creating or
+    /// repairing filesystem or schema state.
+    ///
+    /// On Unix the target must be a non-symlink regular file owned by the
+    /// effective user with exact mode `0600`, and its parent directory must be
+    /// owner-controlled. A missing or empty database is rejected.
+    pub fn open_existing(
+        path: impl AsRef<Path>,
+        identity: ProviderIdentity,
+    ) -> Result<Self, ProviderError> {
+        let file = secure_open_existing(path.as_ref())?;
+        let database = database_from_file(file)?;
+        let book = Self {
+            database,
+            identity,
+            poisoned: AtomicBool::new(false),
+            operation_lock: Mutex::new(()),
+        };
+        book.initialize_schema(StoreOpenMode::OpenExisting)?;
         Ok(book)
+    }
+
+    /// Legacy create-or-open behavior retained only for existing unit tests.
+    /// Production callers must choose [`Self::create`] during explicit
+    /// initialization or [`Self::open_existing`] during normal startup.
+    #[cfg(test)]
+    pub(crate) fn open(
+        path: impl AsRef<Path>,
+        identity: ProviderIdentity,
+    ) -> Result<Self, ProviderError> {
+        let path = path.as_ref();
+        match Self::create(path, identity) {
+            Ok(book) => Ok(book),
+            Err(ProviderError::TargetAlreadyExists) => Self::open_existing(path, identity),
+            Err(error) => Err(error),
+        }
     }
 
     #[must_use]
@@ -1645,9 +1700,14 @@ impl ReservationBook {
             .transpose()
     }
 
-    fn initialize_schema(&self) -> Result<(), ProviderError> {
+    fn initialize_schema(&self, mode: StoreOpenMode) -> Result<(), ProviderError> {
+        if mode == StoreOpenMode::OpenExisting {
+            ensure_provider_tables_exist(&self.database)?;
+        }
         let write = self.begin_immediate_write()?;
-        create_tables(&write)?;
+        if mode == StoreOpenMode::CreateNew {
+            create_tables(&write)?;
+        }
         let existing_schema = {
             let meta = write.open_table(META)?;
             meta.get(SCHEMA_VERSION_KEY)?
@@ -1655,6 +1715,9 @@ impl ReservationBook {
         };
         match existing_schema {
             Some(value) => {
+                if mode == StoreOpenMode::CreateNew {
+                    return Err(ProviderError::NonemptyNewDatabase);
+                }
                 let actual =
                     decode_u32(&value).map_err(|()| ProviderError::CorruptSchemaVersion)?;
                 if actual != SCHEMA_VERSION {
@@ -1683,6 +1746,15 @@ impl ReservationBook {
                 }
             }
             None => {
+                if mode == StoreOpenMode::OpenExisting {
+                    if provider_tables_are_nonempty(&write)? {
+                        return Err(ProviderError::CorruptState(
+                            "schema version is missing from a nonempty provider database"
+                                .to_owned(),
+                        ));
+                    }
+                    return Err(ProviderError::MissingMetadata(SCHEMA_VERSION_KEY));
+                }
                 if provider_tables_are_nonempty(&write)? {
                     return Err(ProviderError::CorruptState(
                         "schema version is missing from a nonempty provider database".to_owned(),
@@ -3353,6 +3425,259 @@ fn create_tables(write: &WriteTransaction) -> Result<(), ProviderError> {
     Ok(())
 }
 
+fn ensure_provider_tables_exist(database: &Database) -> Result<(), ProviderError> {
+    let read = database.begin_read()?;
+    read.open_table(META)?;
+    for definition in [
+        INVENTORY,
+        ALLOCATIONS,
+        RESERVATIONS,
+        REQUEST_KEYS,
+        EXPIRATIONS,
+        LIVE_QUOTES_BY_OWNER,
+        PENDING_SIGNING,
+    ] {
+        read.open_table(definition)?;
+    }
+    read.open_table(AUDIT)?;
+    Ok(())
+}
+
+fn create_staging_database(
+    target: &Path,
+) -> Result<(Database, TempPath, ProviderDatabaseFileIdentity), ProviderError> {
+    ensure_supported_platform()?;
+    ensure_target_absent(target)?;
+    validate_parent_directory(target)?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".deadcat-rfq-provider-")
+        .tempfile_in(parent_directory(target))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    validate_open_database_file(temporary.as_file())?;
+    let identity = ProviderDatabaseFileIdentity::from_file(temporary.as_file())?;
+    let (file, path) = temporary.into_parts();
+    let database = database_from_file(file)?;
+    Ok((database, path, identity))
+}
+
+fn publish_staging_database(
+    book: ReservationBook,
+    staging: TempPath,
+    staging_identity: ProviderDatabaseFileIdentity,
+    target: &Path,
+) -> Result<ReservationBook, ProviderError> {
+    match staging.persist_noclobber(target) {
+        Ok(_) => {}
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(ProviderError::TargetAlreadyExists);
+        }
+        Err(error) => return Err(ProviderError::Io(error.error)),
+    }
+    let confirmation = || -> Result<(), ProviderError> {
+        validate_parent_directory(target)?;
+        staging_identity.verify_target(target)?;
+        sync_parent_directory(target)
+    };
+    confirmation().map_err(ProviderError::published_but_unconfirmed)?;
+    Ok(book)
+}
+
+fn ensure_supported_platform() -> Result<(), ProviderError> {
+    #[cfg(unix)]
+    {
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        Err(ProviderError::UnsupportedPlatform)
+    }
+}
+
+fn ensure_target_absent(path: &Path) -> Result<(), ProviderError> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(_) => Err(ProviderError::TargetAlreadyExists),
+    }
+}
+
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn validate_parent_directory(path: &Path) -> Result<(), ProviderError> {
+    ensure_supported_platform()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let metadata = fs::symlink_metadata(parent_directory(path))?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+            return Err(ProviderError::UnsupportedParentDirectory);
+        }
+        let expected_owner = rustix::process::geteuid().as_raw();
+        if metadata.uid() != expected_owner {
+            return Err(ProviderError::ParentOwnerMismatch {
+                expected: expected_owner,
+                actual: metadata.uid(),
+            });
+        }
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o022 != 0 {
+            return Err(ProviderError::InsecureParentPermissions(mode));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ProviderDatabaseFileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl ProviderDatabaseFileIdentity {
+    fn from_file(file: &File) -> Result<Self, ProviderError> {
+        Self::from_metadata(&file.metadata()?)
+    }
+
+    fn from_metadata(metadata: &fs::Metadata) -> Result<Self, ProviderError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            if !metadata.file_type().is_file() {
+                return Err(ProviderError::UnsupportedFileType);
+            }
+            Ok(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            Err(ProviderError::UnsupportedPlatform)
+        }
+    }
+
+    fn verify_target(self, target: &Path) -> Result<(), ProviderError> {
+        let metadata = fs::symlink_metadata(target)?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err(ProviderError::PublishedFileMismatch);
+        }
+        let actual = Self::from_metadata(&metadata)?;
+        if self.matches(actual) {
+            Ok(())
+        } else {
+            Err(ProviderError::PublishedFileMismatch)
+        }
+    }
+
+    fn verify_file(self, file: &File) -> Result<(), ProviderError> {
+        let actual = Self::from_file(file)?;
+        if self.matches(actual) {
+            Ok(())
+        } else {
+            Err(ProviderError::OpenedFileMismatch)
+        }
+    }
+
+    fn matches(self, other: Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.device == other.device && self.inode == other.inode
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (self, other);
+            false
+        }
+    }
+}
+
+fn secure_open_existing(path: &Path) -> Result<File, ProviderError> {
+    ensure_supported_platform()?;
+    validate_parent_directory(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(ProviderError::UnsupportedFileType);
+    }
+    let expected_identity = ProviderDatabaseFileIdentity::from_metadata(&metadata)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(path)?;
+    validate_open_database_file(&file)?;
+    expected_identity.verify_file(&file)?;
+    if file.metadata()?.len() == 0 {
+        return Err(ProviderError::EmptyDatabase);
+    }
+    Ok(file)
+}
+
+fn validate_open_database_file(file: &File) -> Result<(), ProviderError> {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(ProviderError::UnsupportedFileType);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let expected_owner = rustix::process::geteuid().as_raw();
+        if metadata.uid() != expected_owner {
+            return Err(ProviderError::FileOwnerMismatch {
+                expected: expected_owner,
+                actual: metadata.uid(),
+            });
+        }
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(ProviderError::InsecurePermissions(mode));
+        }
+    }
+    Ok(())
+}
+
+fn database_from_file(file: File) -> Result<Database, ProviderError> {
+    // redb deliberately continues if a filesystem reports that file locking
+    // is unsupported. Probe and release a lock immediately before handing the
+    // same descriptor to redb so unsupported local locking fails closed.
+    match file.try_lock() {
+        Ok(()) => file.unlock()?,
+        Err(TryLockError::WouldBlock) => {
+            return Err(ProviderError::Database(
+                redb::DatabaseError::DatabaseAlreadyOpen,
+            ));
+        }
+        Err(TryLockError::Error(error)) => return Err(error.into()),
+    }
+    Ok(Database::builder().create_file(file)?)
+}
+
+fn sync_parent_directory(path: &Path) -> Result<(), ProviderError> {
+    #[cfg(unix)]
+    {
+        File::open(parent_directory(path))?.sync_all()?;
+    }
+    Ok(())
+}
+
 fn write_record<T: Serialize>(
     write: &WriteTransaction,
     definition: TableDefinition<&[u8], &[u8]>,
@@ -4520,6 +4845,8 @@ pub enum ProviderError {
     #[cfg(test)]
     #[error("injected provider mutation failure at {0}")]
     InjectedMutationFailure(&'static str),
+    #[error("provider database filesystem error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("redb database error: {0}")]
     Database(#[from] redb::DatabaseError),
     #[error("redb transaction error: {0}")]
@@ -4536,6 +4863,37 @@ pub enum ProviderError {
     OperationLockPoisoned,
     #[error("redb durability configuration error: {0}")]
     Durability(#[from] redb::SetDurabilityError),
+    #[error("provider database is empty")]
+    EmptyDatabase,
+    #[error("provider database target already exists")]
+    TargetAlreadyExists,
+    #[error("provider database path is not a regular file")]
+    UnsupportedFileType,
+    #[error("provider database parent path is not a real directory")]
+    UnsupportedParentDirectory,
+    #[error("durable RFQ provider storage is not supported on this platform")]
+    UnsupportedPlatform,
+    #[error("provider database file permissions are insecure: {0:#o}")]
+    InsecurePermissions(u32),
+    #[error("provider database file owner is {actual}, expected effective user {expected}")]
+    FileOwnerMismatch { expected: u32, actual: u32 },
+    #[error("provider database parent-directory permissions are insecure: {0:#o}")]
+    InsecureParentPermissions(u32),
+    #[error("provider database parent owner is {actual}, expected effective user {expected}")]
+    ParentOwnerMismatch { expected: u32, actual: u32 },
+    #[error("published provider database path does not name the database file that was created")]
+    PublishedFileMismatch,
+    #[error("opened provider database path changed while it was being validated")]
+    OpenedFileMismatch,
+    #[error(
+        "provider database publication reached the target but final confirmation failed; inspect and reopen the existing target instead of deleting it: {source}"
+    )]
+    PublishedButUnconfirmed {
+        #[source]
+        source: Box<ProviderError>,
+    },
+    #[error("new provider database unexpectedly contains state")]
+    NonemptyNewDatabase,
     #[error("record codec error: {0}")]
     Codec(#[from] postcard::Error),
     #[error("schema version has an invalid encoding")]
@@ -4661,6 +5019,14 @@ pub enum ProviderError {
     DifferentSignedArtifact(ReservationId),
     #[error("fee policy rejected the final transaction: {0}")]
     FeePolicy(#[from] FeePolicyViolation),
+}
+
+impl ProviderError {
+    fn published_but_unconfirmed(source: Self) -> Self {
+        Self::PublishedButUnconfirmed {
+            source: Box::new(source),
+        }
+    }
 }
 
 #[cfg(test)]

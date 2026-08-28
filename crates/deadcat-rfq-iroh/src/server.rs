@@ -219,6 +219,19 @@ pub struct SpawnedServer {
 }
 
 impl SpawnedServer {
+    /// Wait for an unexpected transport exit without consuming the shutdown
+    /// handle. Daemons should race this against their process signal so a
+    /// closed endpoint cannot leave a superficially live process behind.
+    pub async fn wait(&mut self) -> Result<(), ServerError> {
+        let result = (&mut self.task).await;
+        // A panicked server task cannot run its ordinary endpoint teardown.
+        // Close this retained handle before reporting either exit shape so the
+        // embedding daemon can safely drain its handler afterward.
+        self.endpoint.close().await;
+        result?;
+        Ok(())
+    }
+
     pub async fn shutdown_and_join(self) -> Result<(), ServerError> {
         self.endpoint.close().await;
         self.task.await?;

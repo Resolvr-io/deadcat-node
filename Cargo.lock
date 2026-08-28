@@ -1021,7 +1021,9 @@ dependencies = [
 name = "deadcat-rfq"
 version = "0.1.0-alpha"
 dependencies = [
+ "anyhow",
  "bitcoind",
+ "clap",
  "deadcat-rfq-iroh",
  "deadcat-rfq-provider",
  "deadcat-rfq-rpc",
@@ -1030,8 +1032,10 @@ dependencies = [
  "elements",
  "hex",
  "iroh",
+ "libc",
  "rand 0.8.7",
  "reqwest",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "smplx-sdk",
@@ -1039,6 +1043,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -1062,8 +1068,10 @@ dependencies = [
  "deadcat-client",
  "deadcat-types",
  "elements",
+ "libc",
  "postcard",
  "redb",
+ "rustix 1.1.4",
  "serde",
  "sha2 0.10.9",
  "tempfile",

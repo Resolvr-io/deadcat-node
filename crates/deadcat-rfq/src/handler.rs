@@ -70,7 +70,9 @@ impl Default for HandlerConfig {
 }
 
 impl HandlerConfig {
-    fn validate(&self) -> Result<(), HandlerStartError> {
+    /// Validate daemon supervision limits before persistent state is opened or
+    /// initialized. Startup repeats this check as defense in depth.
+    pub fn validate(&self) -> Result<(), HandlerStartError> {
         if self.execute_queue_capacity == 0
             || self.execute_queue_capacity > MAX_EXECUTE_QUEUE_CAPACITY
             || self.max_blocking_operations == 0

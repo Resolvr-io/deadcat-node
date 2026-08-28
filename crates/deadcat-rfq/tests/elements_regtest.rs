@@ -55,17 +55,32 @@ fn elements_node() -> BitcoinD {
     BitcoinD::with_conf("elementsd", &config).expect("isolated liquidregtest elementsd")
 }
 
-fn policy_asset(rpc: &Client) -> AssetId {
+fn default_policy_asset(rpc: &Client) -> AssetId {
+    let sidechain_info: JsonValue = rpc
+        .call("getsidechaininfo", &[])
+        .expect("query real liquidregtest sidechain info");
+    let policy_asset = AssetId::from_str(
+        sidechain_info
+            .get("pegged_asset")
+            .and_then(JsonValue::as_str)
+            .expect("liquidregtest sidechain pegged asset"),
+    )
+    .expect("pegged asset id");
     let labels: JsonValue = rpc
         .call("dumpassetlabels", &[])
         .expect("dump real liquidregtest asset labels");
-    AssetId::from_str(
+    let bitcoin_label_asset = AssetId::from_str(
         labels
             .get("bitcoin")
             .and_then(JsonValue::as_str)
-            .expect("liquidregtest native policy asset label"),
+            .expect("liquidregtest built-in bitcoin asset label"),
     )
-    .expect("policy asset id")
+    .expect("bitcoin label asset id");
+    assert_eq!(
+        bitcoin_label_asset, policy_asset,
+        "supported profile requires the built-in bitcoin label to match the pegged asset"
+    );
+    policy_asset
 }
 
 fn issue_distinct_asset(rpc: &Client, miner: &ElementsRpc) -> AssetId {
@@ -186,7 +201,7 @@ fn persistent_wallet_inventory_is_discovered_unblinded_and_recovered_after_resta
             .to_string(),
     )
     .expect("Elements genesis hash");
-    let policy_asset = policy_asset(&rpc);
+    let policy_asset = default_policy_asset(&rpc);
     let inventory_asset = issue_distinct_asset(&rpc, &miner);
     assert_ne!(inventory_asset, policy_asset);
 

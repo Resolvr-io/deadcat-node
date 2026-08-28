@@ -1,3 +1,4 @@
+use std::fs;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -26,6 +27,175 @@ fn identity(marker: u8) -> ProviderIdentity {
 
 fn open_book(directory: &TempDir, identity: ProviderIdentity) -> ReservationBook {
     ReservationBook::open(directory.path().join("provider.redb"), identity).expect("book")
+}
+
+#[test]
+fn explicit_database_lifecycle_creates_then_opens_but_never_creates_on_open() {
+    let directory = TempDir::new().expect("tempdir");
+    let path = directory.path().join("provider.redb");
+    let identity = identity(2);
+
+    let error = match ReservationBook::open_existing(&path, identity) {
+        Ok(_) => panic!("normal startup must not create a missing provider database"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        ProviderError::Io(error) if error.kind() == std::io::ErrorKind::NotFound
+    ));
+    assert!(!path.exists());
+
+    let created = ReservationBook::create(&path, identity).expect("create provider database");
+    assert_eq!(created.identity(), identity);
+    assert_eq!(created.schema_version().expect("schema"), SCHEMA_VERSION);
+    drop(created);
+
+    let opened = ReservationBook::open_existing(&path, identity).expect("open provider database");
+    assert_eq!(opened.identity(), identity);
+    assert_eq!(opened.schema_version().expect("schema"), SCHEMA_VERSION);
+}
+
+#[test]
+fn create_never_clobbers_an_existing_database() {
+    let directory = TempDir::new().expect("tempdir");
+    let path = directory.path().join("provider.redb");
+    let other_identity = identity(4);
+    let identity = identity(3);
+    let item = inventory(3);
+    {
+        let book = ReservationBook::create(&path, identity).expect("first creation");
+        book.import_inventory(item, &UnixMillis::new(100))
+            .expect("persist sentinel state");
+    }
+
+    assert!(matches!(
+        ReservationBook::create(&path, other_identity),
+        Err(ProviderError::TargetAlreadyExists)
+    ));
+    let reopened =
+        ReservationBook::open_existing(&path, identity).expect("reopen original database");
+    assert!(
+        reopened
+            .inventory(item.outpoint())
+            .expect("sentinel inventory")
+            .is_some()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn database_requires_exact_mode_and_rejects_symlinks() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let directory = TempDir::new().expect("tempdir");
+    let path = directory.path().join("provider.redb");
+    let identity = identity(4);
+    drop(ReservationBook::create(&path, identity).expect("create provider database"));
+    assert_eq!(
+        fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
+        0o600
+    );
+
+    let link = directory.path().join("provider-link.redb");
+    symlink(&path, &link).expect("symlink");
+    assert!(matches!(
+        ReservationBook::open_existing(&link, identity),
+        Err(ProviderError::UnsupportedFileType)
+    ));
+    assert!(matches!(
+        ReservationBook::create(&link, identity),
+        Err(ProviderError::TargetAlreadyExists)
+    ));
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640))
+        .expect("widen provider database permissions");
+    assert!(matches!(
+        ReservationBook::open_existing(&path, identity),
+        Err(ProviderError::InsecurePermissions(0o640))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn database_requires_an_owner_controlled_real_parent_directory() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let directory = TempDir::new().expect("tempdir");
+    let identity = identity(5);
+
+    let insecure_parent = directory.path().join("insecure-parent");
+    fs::create_dir(&insecure_parent).expect("create insecure parent");
+    fs::set_permissions(&insecure_parent, fs::Permissions::from_mode(0o770))
+        .expect("widen parent permissions");
+    let insecure_target = insecure_parent.join("provider.redb");
+    assert!(matches!(
+        ReservationBook::create(&insecure_target, identity),
+        Err(ProviderError::InsecureParentPermissions(0o770))
+    ));
+    assert!(!insecure_target.exists());
+    fs::set_permissions(&insecure_parent, fs::Permissions::from_mode(0o700))
+        .expect("restore parent permissions for cleanup");
+
+    let changed_parent = directory.path().join("changed-parent");
+    fs::create_dir(&changed_parent).expect("create secure parent");
+    let changed_target = changed_parent.join("provider.redb");
+    drop(ReservationBook::create(&changed_target, identity).expect("create provider database"));
+    fs::set_permissions(&changed_parent, fs::Permissions::from_mode(0o772))
+        .expect("make existing database parent insecure");
+    assert!(matches!(
+        ReservationBook::open_existing(&changed_target, identity),
+        Err(ProviderError::InsecureParentPermissions(0o772))
+    ));
+    fs::set_permissions(&changed_parent, fs::Permissions::from_mode(0o700))
+        .expect("restore parent permissions for cleanup");
+
+    let real_parent = directory.path().join("real-parent");
+    fs::create_dir(&real_parent).expect("create real parent");
+    let linked_parent = directory.path().join("linked-parent");
+    symlink(&real_parent, &linked_parent).expect("link parent");
+    let linked_target = linked_parent.join("provider.redb");
+    assert!(matches!(
+        ReservationBook::create(&linked_target, identity),
+        Err(ProviderError::UnsupportedParentDirectory)
+    ));
+    assert!(!real_parent.join("provider.redb").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn database_creation_enforces_mode_0600_under_a_restrictive_umask() {
+    const CHILD_ENV: &str = "DEADCAT_RFQ_PROVIDER_UMASK_TEST_CHILD";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = TempDir::new().expect("tempdir");
+        let path = directory.path().join("provider.redb");
+        let prior_umask = rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o777));
+        let result = ReservationBook::create(&path, identity(6));
+        rustix::process::umask(prior_umask);
+        drop(result.expect("create despite restrictive umask"));
+        assert_eq!(
+            fs::metadata(path).expect("metadata").permissions().mode() & 0o777,
+            0o600
+        );
+        return;
+    }
+
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "store::tests::database_creation_enforces_mode_0600_under_a_restrictive_umask",
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, "1")
+        .output()
+        .expect("spawn isolated umask test");
+    assert!(
+        output.status.success(),
+        "isolated umask test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn fee_policy(identity: ProviderIdentity) -> FeePolicy {

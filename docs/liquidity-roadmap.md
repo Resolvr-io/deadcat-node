@@ -664,11 +664,16 @@ before returning or replaying it. The custom wallet is now connected to a
 bounded authoritative Elements-backed inventory/chain adapter. Its mandatory
 live gate proves confirmed confidential discovery and unblinding, ordered
 full-witness settlement prevouts, and the same scan after wallet restart. The
-API remains provisional until daemon runtime and authenticated signed remote
-RFQ evidence exercise the complete flow end to end. Protected passphrase
-delivery, external backup-freshness and coordinated provider-state recovery,
-process-level daemon coverage, and HSM support also remain outside the current
-slice.
+authenticated remote protocol and supervised handler now have a separate
+`deadcat-rfq` executable with protected credential-file unlock, explicit
+no-clobber initialization, open-existing-only restart, stable Iroh identity,
+authoritative Elements/txindex preflight, recovery-before-readiness,
+confidential deposit-address issuance, and graceful signal draining. Its first
+profile is intentionally regtest-only and statically configured; canonical
+market evidence, a production pricing source, relay/reconciliation,
+authenticated-owner request-rate limits, external backup freshness,
+process-kill acceptance coverage, host memory hardening, and HSM support remain
+outside the current slice.
 The initial profile verifies every non-provider input as a finalized tree-less
 P2TR key-path `SIGHASH_ALL` spend. Simplicity covenant inputs and more than one
 interactive RFQ signer remain later router/venue-verification work; they are
