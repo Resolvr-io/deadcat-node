@@ -169,26 +169,30 @@ signing.
 
 ## Implemented boundary
 
-The implementation remains remote-transport-free. It now includes the
-encrypted keystore, destination derivation, identity-bound durable locator
-catalog, staged no-clobber file publication, logical wallet-only export and
-restore, output recovery, durable-job signer, provider-side non-last blinding
-coordinator, and the bounded authoritative Elements inventory/settlement
-adapter with focused adversarial tests. Its live liquidregtest gate funds
-confidential custom-wallet destinations, discovers and unblinds them after
-confirmation, recovers ordered full-witness prevouts, and repeats the scan
-after reopening the wallet.
+The wallet library itself remains transport-free and exposes only narrow
+destination, recovery, blinding, and committed-job signing capabilities. It now
+includes the encrypted keystore, identity-bound durable locator catalog, staged
+no-clobber file publication, logical wallet-only export and restore, and the
+bounded authoritative Elements inventory/settlement adapter with focused
+adversarial tests. Its live liquidregtest gate funds confidential custom-wallet
+destinations, discovers and unblinds them after confirmation, recovers ordered
+full-witness prevouts, and repeats the scan after reopening the wallet.
+
+The adjacent supervised `deadcat-rfq` daemon now composes that wallet with the
+provider state machine, Elements adapter, protected credential-file delivery,
+stable Iroh identity, and authenticated signed-quote/blind/execute/status
+protocol. It initializes state without clobbering, opens existing state only,
+recovers inventory and signing work before readiness, issues confidential
+deposit addresses, and drains transport before shutdown.
 
 It does **not** yet provide:
 
-- protected passphrase delivery, unattended unlock, memory locking, swap or
-  process-dump policy;
-- RFQ-daemon startup/configuration wiring or bounded and rate-limited remote
-  destination issuance;
+- memory locking, swap or process-dump policy;
+- authenticated-owner/global request-rate limits or bounded history retention;
 - continuous/off-host backup transport, external backup-freshness checkpoints,
   coordinated wallet/provider-state recovery, or key rotation;
-- the authenticated remote RFQ protocol, signed network quote, pricing source,
-  relay and outspend reconciliation; or
+- canonical market-derived configuration, a production pricing source,
+  public-network profiles, relay and outspend reconciliation; or
 - an HSM or external-signer backend.
 
 The current persistent store also does not implement Windows ACLs or a durable

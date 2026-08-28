@@ -572,8 +572,8 @@ that future RFQ, AMM, and DLOB layouts will compose safely.
 
 ### Current implementation footholds
 
-The current client contains useful shapes, but none is the stable venue
-interface proposed here:
+The current client contains the first venue-neutral and RFQ-specific seams, but
+not yet the wallet-bearing end-to-end router proposed here:
 
 - [`BinaryMarketTransitionPlan`](../crates/deadcat-client/src/market_builder.rs)
   exposes mandatory outputs at a caller-chosen base and finalizes only against
@@ -616,8 +616,9 @@ interface proposed here:
   inventory selection, confidential provider receive/change outputs, live
   quote admission limits, and exact idempotent replay across restart. It emits
   a symbolic provider contribution and is covered by a conformance test against
-  the client venue authorization model. The returned `FirmQuote` remains an
-  internal unauthenticated artifact until the signed remote protocol exists.
+  the client venue authorization model. That provider-core `FirmQuote` remains
+  internal; the runtime maps it into a strict signed network quote bound to both
+  authenticated Iroh endpoints, the idempotency key, and the exact request.
 - The provisional client-local [venue model](../crates/deadcat-client/src/venue.rs)
   and [transaction composer](../crates/deadcat-client/src/composition.rs)
   separate aggregate user intent from exact per-leg allocation, bind an
@@ -642,6 +643,21 @@ interface proposed here:
   separate private template path; a non-issuance binary-market transition is
   tested at nonzero composer offsets. Issuance fields and future AMM/DLOB
   economic-delta bindings remain deliberately deferred.
+- The taker-side
+  [`deadcat-rfq-client`](../crates/deadcat-rfq-client/src/lib.rs) pins the
+  provider endpoint, chain, policy asset, and required capabilities; manages
+  request IDs; authenticates signed quotes independently of their current
+  liveness; binds exact per-leg slippage and fee intent to a validated trading
+  market; maps provider inputs, outputs, and blinder roles into a prepared
+  venue leg; retains provider/client/reservation/quote recovery bindings; and
+  derives the exact RFQ settlement layout after wallet and other venue
+  contributions have received global positions. Provider-blinded PSETs must
+  cross an explicit caller-owned whole-transaction validator/signing trait
+  before becoming a versioned, self-consistency-checked execution-attempt
+  record; execute borrows that exact retry material and reports every
+  post-dispatch failure as ambiguous. A direct-Iroh test covers the
+  quote-to-compose-to-blind/execute/status boundary with nonzero RFQ offsets
+  and proves that provider work may finish after a client timeout.
 - The retired
   [`MakerFillPlan`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-client/src/maker_builder.rs)
   and
@@ -674,6 +690,15 @@ market evidence, a production pricing source, relay/reconciliation,
 authenticated-owner request-rate limits, external backup freshness,
 process-kill acceptance coverage, host memory hardening, and HSM support remain
 outside the current slice.
+The first taker integration now reaches the safe pre-wallet boundary described
+above. It deliberately does not yet select wallet inputs/change, validate
+authoritative prevouts and the provider-blinded whole PSET, finish balancing
+blinding, sign the taker inputs, verify the provider-signed result, persist and
+drive an ambiguous-execute attempt journal, correlate a client-computable
+attempt digest with durable provider status, or broadcast and monitor the
+transaction. The client crate supplies the opaque trust-transition interfaces
+and serializable attempt record, but no production wallet implementation or
+journal storage.
 The initial profile verifies every non-provider input as a finalized tree-less
 P2TR key-path `SIGHASH_ALL` spend. Simplicity covenant inputs and more than one
 interactive RFQ signer remain later router/venue-verification work; they are
