@@ -21,14 +21,14 @@ fn commitment_matches(actual: (u1, u256), expected: CompressedCommitment) -> boo
     )
 }
 
-fn get_input_confidential(index: u32) -> ((u1, u256), (u1, u256)) {
+fn get_input_confidential_commitments(index: u32) -> ((u1, u256), (u1, u256)) {
     let (asset, amount): (Asset1, Amount1) = unwrap(jet::input_amount(index));
     let asset_commitment: (u1, u256) = unwrap_left::<u256>(asset);
     let value_commitment: (u1, u256) = unwrap_left::<u64>(amount);
     (asset_commitment, value_commitment)
 }
 
-fn get_output_confidential(index: u32) -> ((u1, u256), (u1, u256)) {
+fn get_output_confidential_commitments(index: u32) -> ((u1, u256), (u1, u256)) {
     let (asset, amount): (Asset1, Amount1) = unwrap(jet::output_amount(index));
     let asset_commitment: (u1, u256) = unwrap_left::<u256>(asset);
     let value_commitment: (u1, u256) = unwrap_left::<u64>(amount);
@@ -51,58 +51,65 @@ pub fn no_rt_commitments() -> RtCommitments {
     )
 }
 
-pub fn ensure_same_rt_side(yes_is_a: bool, no_is_a: bool) {
-    assert!(jet::eq_1(<bool>::into(yes_is_a), <bool>::into(no_is_a)));
+pub fn ensure_same_rt_input_side(
+    yes_input_is_side_a: bool,
+    no_input_is_side_a: bool,
+) {
+    assert!(jet::eq_1(
+        <bool>::into(yes_input_is_side_a),
+        <bool>::into(no_input_is_side_a),
+    ));
 }
 
 // Validate the complete input/output commitments and return the input side.
 // Every transition, including terminal burns, must flip A <-> B.
-fn verify_rt_flip(
+fn ensure_rt_flip(
     input_index: u32,
     output_index: u32,
-    expected: RtCommitments,
+    expected_commitments: RtCommitments,
 ) -> bool {
-    let (asset_a, asset_b, value): RtCommitments = expected;
-    let (input_asset, input_value): ((u1, u256), (u1, u256)) =
-        get_input_confidential(input_index);
-    let (output_asset, output_value): ((u1, u256), (u1, u256)) =
-        get_output_confidential(output_index);
+    let (asset_a_commitment, asset_b_commitment, value_commitment): RtCommitments =
+        expected_commitments;
+    let (input_asset_commitment, input_value_commitment): ((u1, u256), (u1, u256)) =
+        get_input_confidential_commitments(input_index);
+    let (output_asset_commitment, output_value_commitment): ((u1, u256), (u1, u256)) =
+        get_output_confidential_commitments(output_index);
 
-    assert!(commitment_matches(input_value, value));
-    assert!(commitment_matches(output_value, value));
+    assert!(commitment_matches(input_value_commitment, value_commitment));
+    assert!(commitment_matches(output_value_commitment, value_commitment));
 
-    let input_is_a: bool = commitment_matches(input_asset, asset_a);
-    let input_is_b: bool = commitment_matches(input_asset, asset_b);
-    match input_is_a {
+    let input_is_side_a: bool = commitment_matches(input_asset_commitment, asset_a_commitment);
+    let input_is_side_b: bool = commitment_matches(input_asset_commitment, asset_b_commitment);
+    match input_is_side_a {
         true => {
-            assert!(not(input_is_b));
-            assert!(commitment_matches(output_asset, asset_b));
+            assert!(not(input_is_side_b));
+            assert!(commitment_matches(output_asset_commitment, asset_b_commitment));
         },
         false => {
-            assert!(input_is_b);
-            assert!(commitment_matches(output_asset, asset_a));
+            assert!(input_is_side_b);
+            assert!(commitment_matches(output_asset_commitment, asset_a_commitment));
         },
     };
-    input_is_a
+    input_is_side_a
 }
 
 pub fn ensure_rt_continuation(
     input_index: u32,
     output_index: u32,
-    expected: RtCommitments,
-    output_slot: u8,
+    expected_commitments: RtCommitments,
+    continuation_slot: u8,
 ) -> bool {
-    let input_is_a: bool = verify_rt_flip(input_index, output_index, expected);
-    ensure_output_script(output_index, script_for_slot(output_slot));
-    input_is_a
+    let input_is_side_a: bool = ensure_rt_flip(input_index, output_index, expected_commitments);
+    ensure_output_script(output_index, script_for_slot(continuation_slot));
+    input_is_side_a
 }
 
 pub fn ensure_rt_burn(
     input_index: u32,
     output_index: u32,
-    expected: RtCommitments,
+    expected_commitments: RtCommitments,
 ) -> bool {
-    let input_is_a: bool = verify_rt_flip(input_index, output_index, expected);
+    let input_is_side_a: bool = ensure_rt_flip(input_index, output_index, expected_commitments);
     ensure_burn_script(output_index);
-    input_is_a
+    input_is_side_a
 }

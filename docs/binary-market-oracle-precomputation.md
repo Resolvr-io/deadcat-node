@@ -20,7 +20,8 @@ and verify the resulting script as before.
 
 ## Golden identity
 
-For the canonical golden fixture, the precomputed program has CMR:
+For the canonical golden fixture, the oracle-precomputation candidate produced
+CMR:
 
 ```text
 702f5d04f15bcdec3fa1070540bf2f68c0ecdcf40bc8aa8024e1e77ef19cd5ee
@@ -39,14 +40,17 @@ YES = 0091d6c79a16ced37737ac34a7a461359d93ce1eebebca50eefd9197a1bc0876
 NO  = 10c3d52c18c0a9d2d1d9cd90dc1ae4537ad53cf2e2a4e980b5dd4f04b5f1263e
 ```
 
-The golden-vector suite also freezes all eight resulting Taproot scripts and
-control blocks.
+At that candidate point, the golden-vector suite also froze all eight resulting
+Taproot scripts and control blocks. A later source-legibility refactor changed
+the compiled identity without changing oracle-message derivation; its current
+vectors are recorded in the
+[SimplicityHL legibility note](binary-market-simf-legibility.md).
 
 ## Resource measurements
 
-The all-path, both-RT-side finalized corpus measured the following worst
-resolution rows after precomputation. Each covenant value is aggregated over
-all market inputs in that transaction.
+Immediately after precomputation, the all-path, both-RT-side finalized corpus
+measured the following worst resolution rows. Each covenant value is
+aggregated over all market inputs in that transaction.
 
 | Resolution shape | Cost (mw) | Program bytes | Stack bytes | Transaction bytes | vB |
 |---|---:|---:|---:|---:|---:|
@@ -66,5 +70,7 @@ The overall corpus maxima remain determined by non-resolution paths:
 | Transaction vsize | 3,894 vB |
 
 The corpus executes active and dormant YES and NO resolution, both RT input
-sides, corrupt signatures, and cross-outcome signatures. The parameter ABI,
-both CMRs, scripts, and control blocks are committed golden vectors.
+sides, corrupt signatures, and cross-outcome signatures. These values preserve
+the oracle-precomputation candidate as historical evidence; current all-path
+bounds and compiled identities are recorded in the
+[SimplicityHL legibility note](binary-market-simf-legibility.md).
