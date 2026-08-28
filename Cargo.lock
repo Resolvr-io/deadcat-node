@@ -1048,6 +1048,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "deadcat-rfq-client"
+version = "0.1.0-alpha"
+dependencies = [
+ "deadcat-client",
+ "deadcat-contracts",
+ "deadcat-rfq-iroh",
+ "deadcat-rfq-rpc",
+ "deadcat-rpc",
+ "deadcat-types",
+ "elements",
+ "iroh",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "deadcat-rfq-iroh"
 version = "0.1.0-alpha"
 dependencies = [

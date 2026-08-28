@@ -9,9 +9,9 @@ The node is deliberately not a wallet or trading venue. End-user keys, wallet
 discovery, PSET construction, intent validation, venue selection, and signing
 stay on the client. The separate RFQ-provider library defines interfaces for
 provider-owned inventory, confidential blinding, and signing. An adjacent
-purpose-built RFQ wallet library holds only provider liquidity keys for the
-future separate RFQ daemon; no provider wallet backend or key material runs in
-`deadcat-node`.
+purpose-built RFQ wallet and daemon hold provider liquidity keys and expose the
+authenticated swap protocol; no provider wallet backend or key material runs
+in `deadcat-node`.
 
 ## Current scope
 
@@ -51,10 +51,12 @@ that no other PSET field changed, rechecks proofs and fee facts, and persists
 one canonical signed PSET before returning it. Exact retries replay that
 durable winner without re-signing; concurrently in-flight valid signature
 encodings may both sign, but every caller returns the same stored winner. Its
-`FirmQuote` is still an internal, unauthenticated artifact, not yet a provider-
-signed network quote. The custom provider wallet now adds a versioned encrypted
-keystore, in-memory BIP32/SLIP-77 key derivation, fresh confidential tree-less
-P2TR destinations, output recovery, exact durable-job signing, and a
+core `FirmQuote` remains an internal artifact; the runtime converts it to the
+strict network schema and signs an attestation bound to both authenticated Iroh
+endpoints, the idempotency key, and the exact request. The custom provider wallet
+now adds a versioned encrypted keystore, in-memory BIP32/SLIP-77 key derivation,
+fresh confidential tree-less P2TR destinations, output recovery, exact
+durable-job signing, and a
 provider-side non-last blinding coordinator. Its identity-bound `wallet.redb`
 catalog durably records each random locator before returning a destination,
 publishes new and restored wallets through a same-directory staging file in a
@@ -69,11 +71,21 @@ ordered authoritative prevouts to final settlement validation. Chain anchors,
 wallet-catalog revisions, RPC payloads, scans, and settlement batches are all
 bounded and checked fail-closed; operation-wide deadlines and coinbase-maturity
 checks keep slow or not-yet-spendable observations out of the signing path. A
-mandatory liquidregtest gate exercises
-confidential discovery, unblinding, settlement lookup, and restart recovery.
-Protected passphrase delivery, daemon wiring, coordinated provider-state
-recovery, market-data pricing, the authenticated remote protocol, relay
-reconciliation, and HSM support remain future work.
+mandatory liquidregtest gate exercises confidential discovery, unblinding,
+settlement lookup, and restart recovery.
+The supervised `deadcat-rfq` daemon adds protected credential-file unlock,
+no-clobber initialization, stable Iroh identity, authoritative Elements
+preflight, recovery-before-readiness, confidential deposit-address issuance,
+and graceful draining. The taker-side `deadcat-rfq-client` pins that identity
+and chain, verifies signed quote authenticity separately from current liveness,
+normalizes exact RFQ intents into venue-neutral legs, retains durable recovery
+bindings, resolves quote-local IDs against the final global route layout, and
+separates provider-blinded PSETs from wallet-authorized, journalable execution
+attempts. Execute transport failures are reported as ambiguous while preserving
+the exact retry payload.
+The wallet-specific taker validator/signing coordinator, coordinated
+provider-state recovery, canonical market-data pricing, immediate provider
+relay/reconciliation, rate limits, and HSM support remain future work.
 [ADR 0008](docs/adr/0008-rfq-service-owned-wallet.md) records that boundary.
 This initial validator accepts ordinary finalized tree-less P2TR
 `SIGHASH_ALL` inputs outside the current RFQ leg; Simplicity covenant inputs

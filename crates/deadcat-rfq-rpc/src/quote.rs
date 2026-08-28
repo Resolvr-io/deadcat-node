@@ -1042,13 +1042,21 @@ impl SignedFirmQuote {
         })
     }
 
-    fn verify_authenticity(
+    /// Authenticate this retained quote without making a claim about whether
+    /// its acceptance window is still open.
+    ///
+    /// This is the appropriate verification step for durable recovery: an
+    /// expired quote must remain independently attributable to the pinned
+    /// provider and bound to the authenticated client, idempotency key, and
+    /// original request. Call [`VerifiedFirmQuote::live_at`] immediately
+    /// before using the quote to construct or authorize a new settlement.
+    pub fn verify(
         self,
         pinned_provider: EndpointId,
         authenticated_client: EndpointId,
         idempotency_key: IdempotencyKeyDto,
         requested: &FirmQuoteRequestDto,
-    ) -> Result<Self, AttestationError> {
+    ) -> Result<VerifiedFirmQuote, AttestationError> {
         self.quote.validate_structure()?;
         let provider = FixedBytes32::new(*pinned_provider.as_bytes());
         let client = FixedBytes32::new(*authenticated_client.as_bytes());
@@ -1067,11 +1075,14 @@ impl SignedFirmQuote {
         pinned_provider
             .verify(&digest, &signature)
             .map_err(|_| AttestationError::InvalidSignature)?;
-        Ok(self)
+        Ok(VerifiedFirmQuote(self))
     }
 
-    /// Verify the retained quote and additionally prove it is still inside its
-    /// provider-selected acceptance window at the caller's trusted wall time.
+    /// Authenticate the retained quote and prove its acceptance window is
+    /// still open at the caller's trusted wall time.
+    ///
+    /// This convenience method preserves the original `verify_at` flow while
+    /// returning the distinct capability settlement code should require.
     pub fn verify_at(
         self,
         pinned_provider: EndpointId,
@@ -1079,25 +1090,23 @@ impl SignedFirmQuote {
         idempotency_key: IdempotencyKeyDto,
         requested: &FirmQuoteRequestDto,
         now_millis: u64,
-    ) -> Result<VerifiedFirmQuote, AttestationError> {
-        let authenticated = self.verify_authenticity(
+    ) -> Result<LiveFirmQuote, AttestationError> {
+        let verified = self.verify(
             pinned_provider,
             authenticated_client,
             idempotency_key,
             requested,
         )?;
-        if now_millis >= authenticated.quote.accept_before_millis {
-            return Err(AttestationError::Expired);
-        }
-        Ok(VerifiedFirmQuote(authenticated))
+        verified.live_at(now_millis)
     }
 }
 
 /// Capability produced only after provider pin, authenticated client context,
 /// request equality, structural checks and signature verification all pass.
 /// It is intentionally not deserializable or directly constructible. This
-/// capability proves identity, request binding and structure, but not current
-/// liveness; settlement callers should obtain it through `verify_at`.
+/// capability proves identity, request binding and structure even after the
+/// quote expires, but does not prove current liveness. Settlement callers must
+/// first obtain a [`LiveFirmQuote`] through [`Self::live_at`].
 #[derive(Clone, Debug)]
 pub struct VerifiedFirmQuote(SignedFirmQuote);
 
@@ -1110,6 +1119,61 @@ impl VerifiedFirmQuote {
     #[must_use]
     pub const fn quote(&self) -> &FirmQuoteDto {
         &self.0.quote
+    }
+
+    /// Prove this authenticated quote is still live at the caller's trusted
+    /// wall time.
+    pub fn live_at(&self, now_millis: u64) -> Result<LiveFirmQuote, AttestationError> {
+        if now_millis >= self.quote().accept_before_millis {
+            return Err(AttestationError::Expired);
+        }
+        Ok(LiveFirmQuote {
+            verified: self.clone(),
+            checked_at_millis: now_millis,
+        })
+    }
+}
+
+/// Settlement capability proving a firm quote was authenticated and its
+/// acceptance window was open at `checked_at_millis`.
+///
+/// It is intentionally not deserializable or directly constructible. Code
+/// beginning or authorizing settlement should require this type rather than a
+/// [`SignedFirmQuote`] or [`VerifiedFirmQuote`], and should create it using a
+/// fresh trusted wall-clock reading immediately before that work.
+#[derive(Clone, Debug)]
+pub struct LiveFirmQuote {
+    verified: VerifiedFirmQuote,
+    checked_at_millis: u64,
+}
+
+impl LiveFirmQuote {
+    #[must_use]
+    pub const fn verified(&self) -> &VerifiedFirmQuote {
+        &self.verified
+    }
+
+    #[must_use]
+    pub const fn signed(&self) -> &SignedFirmQuote {
+        self.verified.signed()
+    }
+
+    #[must_use]
+    pub const fn quote(&self) -> &FirmQuoteDto {
+        self.verified.quote()
+    }
+
+    /// Trusted wall time at which the acceptance-window check was performed.
+    #[must_use]
+    pub const fn checked_at_millis(&self) -> u64 {
+        self.checked_at_millis
+    }
+
+    /// Discard the liveness claim while retaining authenticated recovery
+    /// evidence.
+    #[must_use]
+    pub fn into_verified(self) -> VerifiedFirmQuote {
+        self.verified
     }
 }
 
@@ -1203,6 +1267,10 @@ pub enum FirmQuoteValidationError {
     ProviderAttestationMismatch,
     #[error("firm quote and reservation status describe different durable records")]
     QuoteStatusMismatch,
+    #[error("cancellation response did not release the reservation by cancellation or expiry")]
+    InvalidCancellationState,
+    #[error("execution response did not commit or sign the reservation")]
+    InvalidExecutionState,
     #[error("reservation status timestamps are not monotonic or violate the acceptance window")]
     InvalidStatusTimeline,
 }
@@ -1504,6 +1572,63 @@ mod tests {
     }
 
     #[test]
+    fn authenticity_survives_expiry_but_live_capability_does_not() {
+        let provider_key = SecretKey::from_bytes(&[41; 32]);
+        let client_key = SecretKey::from_bytes(&[42; 32]);
+        let idempotency = FixedBytes32::new([43; 32]);
+        let quote = quote(provider_key.public());
+        let request = quote.request.clone();
+        let accept_before = quote.accept_before_millis;
+        let signed = SignedFirmQuote::sign(quote, &provider_key, client_key.public(), idempotency)
+            .expect("sign");
+
+        // Authentication is deliberately independent of wall time so this
+        // retained artifact remains useful for recovery after expiry.
+        let verified = signed
+            .clone()
+            .verify(
+                provider_key.public(),
+                client_key.public(),
+                idempotency,
+                &request,
+            )
+            .expect("authenticate expired retained quote");
+        assert_eq!(verified.quote().accept_before_millis, accept_before);
+        assert_eq!(
+            verified
+                .live_at(accept_before)
+                .expect_err("expiry boundary is not live"),
+            AttestationError::Expired
+        );
+        // Recovery code can retain the authenticated artifact independently
+        // of a settlement capability.
+        assert_eq!(verified.quote().request, request);
+
+        let checked_at = accept_before - 1;
+        let live = verified
+            .live_at(checked_at)
+            .expect("quote is live before boundary");
+        assert_eq!(live.checked_at_millis(), checked_at);
+        assert_eq!(live.quote(), verified.quote());
+        assert_eq!(live.signed(), verified.signed());
+        assert_eq!(live.verified().quote(), verified.quote());
+        assert_eq!(live.into_verified().quote(), verified.quote());
+
+        // The original convenience API now produces the same settlement-only
+        // capability while retaining its established boundary behavior.
+        let live = signed
+            .verify_at(
+                provider_key.public(),
+                client_key.public(),
+                idempotency,
+                &request,
+                checked_at,
+            )
+            .expect("authenticate and check liveness");
+        assert_eq!(live.checked_at_millis(), checked_at);
+    }
+
+    #[test]
     fn owner_ids_are_scoped_to_both_endpoints() {
         let provider = SecretKey::from_bytes(&[31; 32]).public();
         let other_provider = SecretKey::from_bytes(&[32; 32]).public();
@@ -1792,6 +1917,118 @@ mod tests {
                 .expect_err("release before creation"),
             FirmQuoteValidationError::InvalidStatusTimeline
         );
+    }
+
+    #[test]
+    fn cancellation_response_requires_a_cancelled_or_expired_release() {
+        let status = |state| ReservationStatusDto {
+            reservation_id: FixedBytes32::new([87; 32]),
+            quote_commitment: FixedBytes32::new([88; 32]),
+            created_at_millis: 1_000,
+            accept_before_millis: 2_000,
+            state,
+        };
+
+        for state in [
+            ReservationStateDto::Released {
+                reason: ReleaseReasonDto::ClientCancelled,
+                at_millis: 1_500,
+            },
+            ReservationStateDto::Released {
+                reason: ReleaseReasonDto::Expired,
+                at_millis: 2_000,
+            },
+        ] {
+            assert!(
+                Response::ReservationCancelled {
+                    status: status(state)
+                }
+                .validate()
+                .is_ok()
+            );
+        }
+
+        for state in [
+            ReservationStateDto::Reserved,
+            ReservationStateDto::Released {
+                reason: ReleaseReasonDto::ProviderRejected,
+                at_millis: 1_500,
+            },
+            ReservationStateDto::Committed {
+                signing_commitment: FixedBytes32::new([89; 32]),
+                committed_at_millis: 1_500,
+            },
+        ] {
+            assert_eq!(
+                Response::ReservationCancelled {
+                    status: status(state)
+                }
+                .validate()
+                .expect_err("method-specific cancellation state"),
+                FirmQuoteValidationError::InvalidCancellationState
+            );
+        }
+    }
+
+    #[test]
+    fn execution_response_requires_a_committed_or_signed_reservation() {
+        let status = |state| ReservationStatusDto {
+            reservation_id: FixedBytes32::new([90; 32]),
+            quote_commitment: FixedBytes32::new([91; 32]),
+            created_at_millis: 1_000,
+            accept_before_millis: 2_000,
+            state,
+        };
+        assert!(
+            Response::ExecutionAccepted {
+                status: status(ReservationStateDto::Committed {
+                    signing_commitment: FixedBytes32::new([92; 32]),
+                    committed_at_millis: 1_500,
+                })
+            }
+            .validate()
+            .is_ok()
+        );
+
+        let pset =
+            SettlementPset::from_pset(&PartiallySignedTransaction::new_v2()).expect("valid PSET");
+        let signing_commitment = FixedBytes32::new([93; 32]);
+        let mut hasher = Sha256::new();
+        hasher.update(SIGNED_ARTIFACT_DOMAIN);
+        hasher.update(signing_commitment.to_bytes());
+        hasher.update((pset.as_bytes().len() as u64).to_be_bytes());
+        hasher.update(pset.as_bytes());
+        let artifact_digest = FixedBytes32::new(hasher.finalize().into());
+        assert!(
+            Response::ExecutionAccepted {
+                status: status(ReservationStateDto::Signed {
+                    signing_commitment,
+                    artifact_digest,
+                    committed_at_millis: 1_500,
+                    signed_at_millis: 1_600,
+                    signed_pset: pset,
+                })
+            }
+            .validate()
+            .is_ok()
+        );
+
+        for state in [
+            ReservationStateDto::Reserved,
+            ReservationStateDto::Released {
+                reason: ReleaseReasonDto::ClientCancelled,
+                at_millis: 1_500,
+            },
+        ] {
+            assert_eq!(
+                Response::ExecutionAccepted {
+                    status: status(state)
+                }
+                .validate()
+                .expect_err("method-specific execution state"),
+                FirmQuoteValidationError::InvalidExecutionState
+            );
+        }
     }
 
     #[test]

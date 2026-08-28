@@ -308,8 +308,10 @@ catalog and wallet-only logical snapshot. The adjacent `deadcat-rfq` runtime
 crate now implements the authoritative Elements-backed inventory and
 settlement-chain adapter, including confirmed catalog scans, mempool-aware
 unspent checks, complete confidential prevouts, and chain/catalog coherence
-fences. Protected passphrase delivery, coordinated provider-state recovery,
-and daemon integration remain separate work.
+fences. The supervised `deadcat-rfq` daemon now connects these capabilities to
+protected credential-file unlock, stable Iroh identity, the authenticated RFQ
+protocol, explicit initialization/restart modes, startup recovery, and graceful
+draining. Coordinated provider-state backup/restore remains separate work.
 
 The settlement layer also implements the provider's non-last collaborative
 blinding stage. It binds the complete unblinded PSET to the exact live reserved
@@ -325,10 +327,11 @@ interface, deterministic bounded inventory selection, confidential provider
 receive and change destinations, a symbolic contribution compatible with the
 client's venue model, live-quote admission limits, and durable exact replay
 across restart. Quote construction and reservation are one fail-closed path
-over a fresh snapshot. The resulting `FirmQuote` is deliberately an internal,
-unauthenticated artifact: it is neither a signed provider attestation nor a
-wire response, and clients must not treat it as either until the dedicated
-authenticated RFQ protocol lands.
+over a fresh snapshot. The resulting provider-core `FirmQuote` remains an
+internal artifact, but the runtime now maps it into the strict network schema
+and signs an attestation bound to the provider endpoint, authenticated client
+endpoint, idempotency key, and exact request. Only that signed network quote is
+client evidence.
 
 Market quote configuration is likewise not chain evidence. The service must
 derive each configured contract ID and collateral/YES/NO asset tuple from an
@@ -347,12 +350,11 @@ nonempty witness would not be participant authorization.
 
 The remaining provider milestones are:
 
-1. add protected passphrase and unattended-unlock operations, coordinated
-   provider-state recovery, and RFQ-daemon integration for the implemented
-   persistent custom wallet, Elements adapter, blinding, validator, and signer
-   capabilities;
-2. define a dedicated authenticated RFQ protocol, signed quote envelope,
-   identity, and ALPN;
-3. persist relay and chain-reconciliation observations without ever reopening
-   a committed outpoint; and
-4. pass process-kill, signer ambiguity, mempool, confirmation, and reorg gates.
+1. derive market configuration from canonical evidence and add production
+   pricing plus authenticated-owner/global abuse controls and bounded history;
+2. persist relay and chain-reconciliation observations without ever reopening
+   a committed outpoint;
+3. coordinate wallet, provider-state, and Iroh-identity backup/restore with
+   external freshness checks; and
+4. pass process-kill, signer ambiguity, mempool, confirmation, reorg, and
+   public-network acceptance gates before deployment.

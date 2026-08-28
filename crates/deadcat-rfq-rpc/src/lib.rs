@@ -6,7 +6,8 @@
 //! authenticated endpoint pair with [`owner_id_from_endpoints`]. Firm quotes
 //! additionally carry an application signature by the provider's stable Iroh
 //! identity so they can be retained and independently verified after a stream
-//! closes.
+//! closes or their acceptance window expires. Authenticity and current quote
+//! liveness are represented by distinct capability types.
 
 mod codec;
 mod quote;
@@ -15,7 +16,7 @@ pub use codec::{FixedBytes32, FixedBytes33, FixedBytes64};
 pub use quote::{
     AssetAmountDto, AttestationError, BlinderRoleDto, FeePolicyDto, FeeSizeMetricDto, FirmQuoteDto,
     FirmQuoteRequestDto, FirmQuoteValidationError, IdempotencyKeyDto, InputPlacementDto,
-    MAX_RECIPIENT_SCRIPT_BYTES, MAX_SETTLEMENT_BYTES, MAX_SETTLEMENT_INPUTS,
+    LiveFirmQuote, MAX_RECIPIENT_SCRIPT_BYTES, MAX_SETTLEMENT_BYTES, MAX_SETTLEMENT_INPUTS,
     MAX_SETTLEMENT_OUTPUTS, OutputPlacementDto, PricingDecisionDto, PsetError, QuoteAttestation,
     QuoteContextDto, QuoteExecutionDto, QuoteInputDto, QuoteKindDto, QuoteOutputDto,
     QuoteOutputRoleDto, QuoteRecipientDto, RationalRateDto, ReleaseReasonDto, ReservationIdDto,
@@ -178,9 +179,30 @@ impl Response {
                 }
                 Ok(())
             }
-            Self::ReservationCancelled { status }
-            | Self::ExecutionAccepted { status }
-            | Self::ReservationStatus { status } => status.validate(),
+            Self::ReservationCancelled { status } => {
+                status.validate()?;
+                if !matches!(
+                    &status.state,
+                    ReservationStateDto::Released {
+                        reason: ReleaseReasonDto::ClientCancelled | ReleaseReasonDto::Expired,
+                        ..
+                    }
+                ) {
+                    return Err(FirmQuoteValidationError::InvalidCancellationState);
+                }
+                Ok(())
+            }
+            Self::ExecutionAccepted { status } => {
+                status.validate()?;
+                if !matches!(
+                    &status.state,
+                    ReservationStateDto::Committed { .. } | ReservationStateDto::Signed { .. }
+                ) {
+                    return Err(FirmQuoteValidationError::InvalidExecutionState);
+                }
+                Ok(())
+            }
+            Self::ReservationStatus { status } => status.validate(),
         }
     }
 }
