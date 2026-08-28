@@ -46,6 +46,11 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// Maximum number of unrelated expirations one explicit sweep may mutate in a
 /// single immediate-durability transaction.
 pub const MAX_EXPIRATION_BATCH: usize = 256;
+/// Maximum number of durable signing jobs returned by one recovery query.
+///
+/// Recovery callers should process a batch and query again. The fixed cap
+/// prevents an unbounded allocation even when a caller passes `usize::MAX`.
+pub const MAX_PENDING_SIGNING_BATCH: usize = 256;
 const RECORD_VERSION: u8 = 1;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -56,6 +61,7 @@ const REQUEST_KEYS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("reques
 const EXPIRATIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("expirations");
 const LIVE_QUOTES_BY_OWNER: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("live_quotes_by_owner");
+const PENDING_SIGNING: TableDefinition<&[u8], &[u8]> = TableDefinition::new("pending_signing");
 const AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
 
 const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -90,8 +96,10 @@ mod mutation_failpoints {
     pub(super) const COMMIT_AFTER_ALLOCATION: &str = "commit.after_allocation";
     pub(super) const COMMIT_AFTER_EXPIRATION: &str = "commit.after_expiration";
     pub(super) const COMMIT_AFTER_RECORD: &str = "commit.after_record";
+    pub(super) const COMMIT_AFTER_PENDING_SIGNING: &str = "commit.after_pending_signing";
     pub(super) const COMMIT_AFTER_AUDIT: &str = "commit.after_audit";
     pub(super) const SIGNED_AFTER_RECORD: &str = "signed.after_record";
+    pub(super) const SIGNED_AFTER_PENDING_SIGNING: &str = "signed.after_pending_signing";
     pub(super) const SIGNED_AFTER_AUDIT: &str = "signed.after_audit";
 
     #[derive(Clone, Copy)]
@@ -776,7 +784,7 @@ impl ReservationBook {
     }
 
     /// Unauthenticated state-machine inspection retained only for internal
-    /// tests. Production callers must use [`Self::reservation_status`].
+    /// tests. Production callers must use [`Self::reservation_status_at`].
     #[cfg(test)]
     pub(crate) fn reservation(
         &self,
@@ -802,12 +810,14 @@ impl ReservationBook {
             .transpose()
     }
 
-    /// Return the authenticated durable status of a reservation, including
-    /// the exact signed bytes once signing has completed.
+    /// Return a clock-free authenticated snapshot of durable reservation
+    /// status, including exact signed bytes once signing has completed.
     ///
     /// The artifact is reconstructed exclusively from the provider's durable
     /// record. A caller cannot use this endpoint to substitute or echo back a
     /// candidate artifact, and another owner cannot observe the reservation.
+    /// Request handlers that must apply the acceptance deadline before
+    /// replying should use [`Self::reservation_status_at`] instead.
     pub fn reservation_status(
         &self,
         access: ReservationAccess,
@@ -846,6 +856,46 @@ impl ReservationBook {
             reservation: record.to_view()?,
             signed_artifact,
         })
+    }
+
+    /// Return authenticated status after applying this reservation's deadline
+    /// at the sampled durable time.
+    ///
+    /// If the target is still `Reserved` at or after `accept_before`, this
+    /// operation atomically releases only that reservation before returning
+    /// its exact terminal status. Committed and signed reservations are past
+    /// the point of no return and are never released by a status lookup. As
+    /// with every timed operation, the trusted clock observation is durably
+    /// recorded even when authentication or lookup subsequently fails.
+    pub fn reservation_status_at<C: Clock>(
+        &self,
+        access: ReservationAccess,
+        clock: &C,
+    ) -> Result<AuthorizedReservationStatus, ProviderError> {
+        let (_operation_guard, write, now) = self.begin_timed_write(clock)?;
+        let mut record = require_authorized_reservation(&write, access)?;
+        if matches!(record.state, StoredReservationState::Reserved)
+            && now >= UnixMillis::new(record.accept_before)
+        {
+            release_reserved(&write, &mut record, ReleaseReason::Expired, now)?;
+        }
+        let signed_artifact = match &record.state {
+            StoredReservationState::Committed { intent } => {
+                ensure_committed_allocations_write(&write, &record, intent.commitment)?;
+                None
+            }
+            StoredReservationState::Signed { intent, artifact } => {
+                ensure_committed_allocations_write(&write, &record, intent.commitment)?;
+                Some(artifact.to_domain(record.id(), SigningCommitment::new(intent.commitment))?)
+            }
+            StoredReservationState::Reserved | StoredReservationState::Released { .. } => None,
+        };
+        let status = AuthorizedReservationStatus {
+            reservation: record.to_view()?,
+            signed_artifact,
+        };
+        self.commit_write(write)?;
+        Ok(status)
     }
 
     /// Load the authenticated, durable inputs needed to validate a final
@@ -1183,6 +1233,12 @@ impl ReservationBook {
         write_record(&write, RESERVATIONS, &record.id, &record)?;
         #[cfg(test)]
         mutation_failpoints::hit(mutation_failpoints::COMMIT_AFTER_RECORD)?;
+        let empty: &[u8] = &[];
+        write
+            .open_table(PENDING_SIGNING)?
+            .insert(pending_signing_key(now, record.id()).as_slice(), empty)?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::COMMIT_AFTER_PENDING_SIGNING)?;
         append_audit(
             &write,
             now,
@@ -1422,6 +1478,7 @@ impl ReservationBook {
             signed_at: now.value(),
         };
         let artifact = stored_artifact.to_domain(reservation_id, expected_commitment)?;
+        let committed_at = intent.committed_at;
         record.state = StoredReservationState::Signed {
             intent,
             artifact: stored_artifact,
@@ -1429,6 +1486,18 @@ impl ReservationBook {
         write_record(&write, RESERVATIONS, &reservation_id.to_bytes(), &record)?;
         #[cfg(test)]
         mutation_failpoints::hit(mutation_failpoints::SIGNED_AFTER_RECORD)?;
+        let pending_key = pending_signing_key(UnixMillis::new(committed_at), reservation_id);
+        let removed_pending = write
+            .open_table(PENDING_SIGNING)?
+            .remove(pending_key.as_slice())?
+            .is_some();
+        if !removed_pending {
+            return Err(ProviderError::CorruptState(format!(
+                "committed reservation {reservation_id:?} has no pending-signing index entry"
+            )));
+        }
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::SIGNED_AFTER_PENDING_SIGNING)?;
         append_audit(
             &write,
             now,
@@ -1491,6 +1560,57 @@ impl ReservationBook {
             }
         }
         Ok(actions)
+    }
+
+    /// Return an oldest-first bounded batch of exact durable jobs that still
+    /// require provider signing.
+    ///
+    /// Unlike [`Self::recovery_actions`], this reads the dedicated pending
+    /// index and never scans terminal reservation history or returns already
+    /// signed artifacts. Passing a limit above [`MAX_PENDING_SIGNING_BATCH`]
+    /// is equivalent to passing the cap.
+    pub fn pending_signing_jobs(&self, limit: usize) -> Result<Vec<SigningJob>, ProviderError> {
+        self.ensure_healthy()?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let read = self.database.begin_read()?;
+        let pending = read.open_table(PENDING_SIGNING)?;
+        let reservations = read.open_table(RESERVATIONS)?;
+        let mut jobs = Vec::new();
+        for entry in pending.iter()?.take(pending_signing_batch_limit(limit)) {
+            let (key, value) = entry?;
+            let key = decode_table_key::<40>("pending-signing", key.value())?;
+            if !value.value().is_empty() {
+                return Err(ProviderError::CorruptState(
+                    "pending-signing index value is not empty".to_owned(),
+                ));
+            }
+            let (committed_at, reservation_id) = decode_pending_signing_key(&key);
+            let stored = reservations
+                .get(reservation_id.to_bytes().as_slice())?
+                .ok_or_else(|| {
+                    ProviderError::CorruptState(
+                        "pending-signing index references a missing reservation".to_owned(),
+                    )
+                })?;
+            let record: StoredReservation = decode_record(stored.value())?;
+            record.validate()?;
+            let StoredReservationState::Committed { intent } = &record.state else {
+                return Err(ProviderError::CorruptState(format!(
+                    "pending-signing index references non-committed reservation {:?}",
+                    record.id()
+                )));
+            };
+            if record.id() != reservation_id || intent.committed_at != committed_at.value() {
+                return Err(ProviderError::CorruptState(format!(
+                    "pending-signing index disagrees with reservation {:?}",
+                    record.id()
+                )));
+            }
+            jobs.push(intent.to_job(record.id())?);
+        }
+        Ok(jobs)
     }
 
     pub fn audit_log(&self) -> Result<Vec<AuditEntry>, ProviderError> {
@@ -2442,6 +2562,7 @@ fn provider_tables_are_nonempty(write: &WriteTransaction) -> Result<bool, Provid
         REQUEST_KEYS,
         EXPIRATIONS,
         LIVE_QUOTES_BY_OWNER,
+        PENDING_SIGNING,
     ] {
         let table = write.open_table(definition)?;
         if table.iter()?.next().transpose()?.is_some() {
@@ -2628,6 +2749,22 @@ fn validate_store_integrity(
         keys
     };
 
+    let pending_signing = {
+        let table = write.open_table(PENDING_SIGNING)?;
+        let mut keys = BTreeSet::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            let key = decode_table_key::<40>("pending-signing", key.value())?;
+            if !value.value().is_empty() {
+                return Err(ProviderError::CorruptState(
+                    "pending-signing index value is not empty".to_owned(),
+                ));
+            }
+            keys.insert(key);
+        }
+        keys
+    };
+
     for record in reservations.values() {
         let expected_request_key = request_key(
             OwnerId::new(record.owner),
@@ -2658,6 +2795,16 @@ fn validate_store_integrity(
             record.id(),
         );
         let has_live_quote = live_quotes.contains(&expected_live_quote);
+        if let StoredReservationState::Committed { intent } = &record.state {
+            let expected_pending =
+                pending_signing_key(UnixMillis::new(intent.committed_at), record.id());
+            if !pending_signing.contains(&expected_pending) {
+                return Err(ProviderError::CorruptState(format!(
+                    "committed reservation {:?} has no pending-signing index entry",
+                    record.id()
+                )));
+            }
+        }
         match &record.state {
             StoredReservationState::Reserved => {
                 if !has_expiration {
@@ -2848,6 +2995,29 @@ fn validate_store_integrity(
         {
             return Err(ProviderError::CorruptState(format!(
                 "owner live-quote index disagrees with reservation {:?}",
+                record.id()
+            )));
+        }
+    }
+
+    for key in &pending_signing {
+        let (committed_at, reservation_id) = decode_pending_signing_key(key);
+        let record = reservations
+            .get(&reservation_id.to_bytes())
+            .ok_or_else(|| {
+                ProviderError::CorruptState(
+                    "pending-signing index references a missing reservation".to_owned(),
+                )
+            })?;
+        let StoredReservationState::Committed { intent } = &record.state else {
+            return Err(ProviderError::CorruptState(format!(
+                "pending-signing index references non-committed reservation {:?}",
+                record.id()
+            )));
+        };
+        if intent.committed_at != committed_at.value() {
+            return Err(ProviderError::CorruptState(format!(
+                "pending-signing index disagrees with reservation {:?}",
                 record.id()
             )));
         }
@@ -3148,6 +3318,29 @@ fn decode_table_key<const LENGTH: usize>(
     })
 }
 
+fn pending_signing_key(committed_at: UnixMillis, reservation_id: ReservationId) -> [u8; 40] {
+    let mut key = [0_u8; 40];
+    key[..8].copy_from_slice(&committed_at.value().to_be_bytes());
+    key[8..].copy_from_slice(&reservation_id.to_bytes());
+    key
+}
+
+const fn pending_signing_batch_limit(requested: usize) -> usize {
+    if requested < MAX_PENDING_SIGNING_BATCH {
+        requested
+    } else {
+        MAX_PENDING_SIGNING_BATCH
+    }
+}
+
+fn decode_pending_signing_key(key: &[u8; 40]) -> (UnixMillis, ReservationId) {
+    let committed_at = UnixMillis::new(u64::from_be_bytes(
+        key[..8].try_into().expect("fixed slice"),
+    ));
+    let reservation_id = ReservationId::new(key[8..].try_into().expect("fixed slice"));
+    (committed_at, reservation_id)
+}
+
 fn create_tables(write: &WriteTransaction) -> Result<(), ProviderError> {
     write.open_table(INVENTORY)?;
     write.open_table(ALLOCATIONS)?;
@@ -3155,6 +3348,7 @@ fn create_tables(write: &WriteTransaction) -> Result<(), ProviderError> {
     write.open_table(REQUEST_KEYS)?;
     write.open_table(EXPIRATIONS)?;
     write.open_table(LIVE_QUOTES_BY_OWNER)?;
+    write.open_table(PENDING_SIGNING)?;
     write.open_table(AUDIT)?;
     Ok(())
 }

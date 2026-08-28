@@ -8,9 +8,14 @@
 #![forbid(unsafe_code)]
 
 mod clock;
+mod handler;
 mod wallet;
 
 pub mod elements;
 
 pub use clock::{SystemClock, SystemClockError};
+pub use handler::{
+    AuthenticatedRfqHandler, HandlerConfig, HandlerStartError, ProviderRfqBackend, RfqBackend,
+    RuntimeWallet,
+};
 pub use wallet::SharedRfqWallet;

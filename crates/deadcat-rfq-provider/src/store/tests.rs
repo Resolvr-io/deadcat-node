@@ -299,6 +299,117 @@ fn reserved_status_has_no_signed_artifact() {
 }
 
 #[test]
+fn targeted_status_expires_at_the_deadline_and_not_before() {
+    let directory = TempDir::new().expect("tempdir");
+    let identity = identity(87);
+    let item = inventory(128);
+    let book = open_book(&directory, identity);
+    let reservation = reserve_one(&book, identity, item, owner(1), 1);
+    let access = ReservationAccess::new(reservation.id(), reservation.owner());
+
+    let before = book
+        .reservation_status_at(access, &UnixMillis::new(999))
+        .expect("status before deadline");
+    assert_eq!(before.reservation().state(), ReservationState::Reserved);
+
+    let at = book
+        .reservation_status_at(access, &UnixMillis::new(1_000))
+        .expect("status at deadline");
+    assert!(matches!(
+        at.reservation().state(),
+        ReservationState::Released {
+            reason: ReleaseReason::Expired,
+            at
+        } if at == UnixMillis::new(1_000)
+    ));
+    assert_eq!(
+        book.inventory(item.outpoint())
+            .expect("inventory")
+            .expect("known inventory")
+            .state(),
+        InventoryState::Available
+    );
+    drop(book);
+    let reopened = open_book(&directory, identity);
+    assert!(matches!(
+        reopened
+            .reservation_status(access)
+            .expect("released status after reopen")
+            .reservation()
+            .state(),
+        ReservationState::Released {
+            reason: ReleaseReason::Expired,
+            at
+        } if at == UnixMillis::new(1_000)
+    ));
+}
+
+#[test]
+fn targeted_status_wrong_owner_cannot_expire_the_reservation() {
+    let directory = TempDir::new().expect("tempdir");
+    let identity = identity(88);
+    let book = open_book(&directory, identity);
+    let reservation = reserve_one(&book, identity, inventory(129), owner(1), 1);
+
+    assert!(matches!(
+        book.reservation_status_at(
+            ReservationAccess::new(reservation.id(), owner(2)),
+            &UnixMillis::new(1_000),
+        ),
+        Err(ProviderError::ReservationOwnerMismatch(actual)) if actual == reservation.id()
+    ));
+    assert_eq!(
+        book.reservation(reservation.id())
+            .expect("reservation")
+            .expect("known reservation")
+            .state(),
+        ReservationState::Reserved
+    );
+    assert_eq!(
+        book.last_observed_time().expect("high watermark"),
+        Some(UnixMillis::new(1_000))
+    );
+    drop(book);
+    let reopened = open_book(&directory, identity);
+    assert_eq!(
+        reopened
+            .reservation(reservation.id())
+            .expect("reservation after reopen")
+            .expect("known reservation")
+            .state(),
+        ReservationState::Reserved
+    );
+}
+
+#[test]
+fn targeted_status_does_not_release_after_the_point_of_no_return() {
+    let directory = TempDir::new().expect("tempdir");
+    let identity = identity(89);
+    let item = inventory(130);
+    let book = open_book(&directory, identity);
+    let reservation = reserve_one(&book, identity, item, owner(1), 1);
+    let access = ReservationAccess::new(reservation.id(), reservation.owner());
+    let committed = book
+        .commit_before_sign(
+            access,
+            vec![1, 2, 3],
+            transaction_fee(identity, 200),
+            &UnixMillis::new(999),
+        )
+        .expect("commit before deadline");
+
+    let status = book
+        .reservation_status_at(access, &UnixMillis::new(1_000))
+        .expect("committed status at deadline");
+    assert!(matches!(
+        status.reservation().state(),
+        ReservationState::Committed { commitment, .. }
+            if commitment == committed.signing_job().expect("job").commitment()
+    ));
+    assert_eq!(book.pending_signing_jobs(1).expect("pending").len(), 1);
+}
+
+#[test]
 fn signed_status_replays_the_exact_durable_artifact() {
     let directory = TempDir::new().expect("tempdir");
     let identity = identity(85);
@@ -940,6 +1051,122 @@ fn commitment_and_signed_response_retries_are_exact_and_restart_safe() {
         [RecoveryAction::ReplaySignedExact(artifact)]
             if artifact == signed.artifact()
     ));
+    assert!(
+        reopened
+            .pending_signing_jobs(usize::MAX)
+            .expect("pending")
+            .is_empty()
+    );
+}
+
+#[test]
+fn pending_signing_jobs_are_bounded_ordered_and_survive_reopen() {
+    let directory = TempDir::new().expect("tempdir");
+    let identity = identity(90);
+    let first_item = inventory(131);
+    let second_item = inventory(132);
+    let (first_job, second_job) = {
+        let book = open_book(&directory, identity);
+        let first = reserve_one(&book, identity, first_item, owner(1), 1);
+        let first_job = book
+            .commit_before_sign(
+                ReservationAccess::new(first.id(), first.owner()),
+                vec![1],
+                transaction_fee(identity, 200),
+                &UnixMillis::new(200),
+            )
+            .expect("first commit")
+            .signing_job()
+            .expect("first job")
+            .clone();
+        let retry = book
+            .commit_before_sign(
+                ReservationAccess::new(first.id(), first.owner()),
+                vec![1],
+                transaction_fee(identity, 200),
+                &UnixMillis::new(201),
+            )
+            .expect("first commit retry");
+        assert_eq!(retry.signing_job(), Some(&first_job));
+        assert!(!retry.newly_committed());
+        assert_eq!(
+            book.pending_signing_jobs(usize::MAX)
+                .expect("pending")
+                .as_slice(),
+            std::slice::from_ref(&first_job)
+        );
+
+        book.import_inventory(second_item, &UnixMillis::new(202))
+            .expect("second inventory");
+        let second = book
+            .reserve(
+                &plan(
+                    identity,
+                    owner(2),
+                    2,
+                    3,
+                    vec![second_item.outpoint()],
+                    2_000,
+                ),
+                &UnixMillis::new(202),
+            )
+            .expect("second reserve")
+            .reservation()
+            .clone();
+        let second_job = book
+            .commit_before_sign(
+                ReservationAccess::new(second.id(), second.owner()),
+                vec![2],
+                transaction_fee(identity, 200),
+                &UnixMillis::new(203),
+            )
+            .expect("second commit")
+            .signing_job()
+            .expect("second job")
+            .clone();
+
+        assert!(book.pending_signing_jobs(0).expect("zero batch").is_empty());
+        assert_eq!(
+            book.pending_signing_jobs(1).expect("one job").as_slice(),
+            std::slice::from_ref(&first_job)
+        );
+        (first_job, second_job)
+    };
+
+    let reopened = open_book(&directory, identity);
+    assert_eq!(
+        reopened
+            .pending_signing_jobs(usize::MAX)
+            .expect("all pending jobs"),
+        [first_job.clone(), second_job.clone()]
+    );
+    reopened
+        .record_signed(
+            first_job.reservation_id(),
+            first_job.commitment(),
+            vec![9],
+            &UnixMillis::new(204),
+        )
+        .expect("sign first");
+    assert_eq!(
+        reopened
+            .pending_signing_jobs(usize::MAX)
+            .expect("remaining"),
+        [second_job]
+    );
+}
+
+#[test]
+fn pending_signing_batch_limit_is_hard_capped() {
+    assert_eq!(pending_signing_batch_limit(0), 0);
+    assert_eq!(
+        pending_signing_batch_limit(MAX_PENDING_SIGNING_BATCH),
+        MAX_PENDING_SIGNING_BATCH
+    );
+    assert_eq!(
+        pending_signing_batch_limit(usize::MAX),
+        MAX_PENDING_SIGNING_BATCH
+    );
 }
 
 #[test]
@@ -1492,6 +1719,103 @@ fn startup_integrity_rejects_a_missing_committed_allocation() {
 }
 
 #[test]
+fn startup_integrity_rejects_a_missing_pending_signing_entry() {
+    let directory = TempDir::new().expect("tempdir");
+    let path = directory.path().join("provider.redb");
+    let identity = identity(91);
+    let reservation_id = {
+        let book = ReservationBook::open(&path, identity).expect("book");
+        let reservation = reserve_one(&book, identity, inventory(133), owner(1), 1);
+        book.commit_before_sign(
+            ReservationAccess::new(reservation.id(), reservation.owner()),
+            vec![1, 2, 3],
+            transaction_fee(identity, 200),
+            &UnixMillis::new(200),
+        )
+        .expect("commit");
+        reservation.id()
+    };
+
+    {
+        let database = Database::create(&path).expect("raw database");
+        let mut write = database.begin_write().expect("raw write");
+        write
+            .set_durability(Durability::Immediate)
+            .expect("durability");
+        let removed = write
+            .open_table(PENDING_SIGNING)
+            .expect("pending")
+            .remove(pending_signing_key(UnixMillis::new(200), reservation_id).as_slice())
+            .expect("remove")
+            .is_some();
+        assert!(removed);
+        write.commit().expect("commit corruption fixture");
+    }
+
+    let error = match ReservationBook::open(&path, identity) {
+        Ok(_) => panic!("missing pending-signing entry must fail closed"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, ProviderError::CorruptState(message)
+        if message.contains("pending-signing index entry")));
+}
+
+#[test]
+fn startup_integrity_rejects_a_pending_entry_for_a_signed_reservation() {
+    let directory = TempDir::new().expect("tempdir");
+    let path = directory.path().join("provider.redb");
+    let identity = identity(92);
+    let reservation_id = {
+        let book = ReservationBook::open(&path, identity).expect("book");
+        let reservation = reserve_one(&book, identity, inventory(134), owner(1), 1);
+        let job = book
+            .commit_before_sign(
+                ReservationAccess::new(reservation.id(), reservation.owner()),
+                vec![1, 2, 3],
+                transaction_fee(identity, 200),
+                &UnixMillis::new(200),
+            )
+            .expect("commit")
+            .signing_job()
+            .expect("job")
+            .clone();
+        book.record_signed(
+            reservation.id(),
+            job.commitment(),
+            vec![4, 5, 6],
+            &UnixMillis::new(300),
+        )
+        .expect("signed");
+        reservation.id()
+    };
+
+    {
+        let database = Database::create(&path).expect("raw database");
+        let mut write = database.begin_write().expect("raw write");
+        write
+            .set_durability(Durability::Immediate)
+            .expect("durability");
+        let empty: &[u8] = &[];
+        write
+            .open_table(PENDING_SIGNING)
+            .expect("pending")
+            .insert(
+                pending_signing_key(UnixMillis::new(200), reservation_id).as_slice(),
+                empty,
+            )
+            .expect("insert");
+        write.commit().expect("commit corruption fixture");
+    }
+
+    let error = match ReservationBook::open(&path, identity) {
+        Ok(_) => panic!("signed reservation pending-signing entry must fail closed"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, ProviderError::CorruptState(message)
+        if message.contains("non-committed reservation")));
+}
+
+#[test]
 fn missing_schema_metadata_cannot_reinitialize_a_nonempty_database() {
     let directory = TempDir::new().expect("tempdir");
     let path = directory.path().join("provider.redb");
@@ -1694,6 +2018,7 @@ fn signing_commitment_failpoints_never_cross_the_point_of_no_return() {
         (mutation_failpoints::COMMIT_AFTER_ALLOCATION, 1),
         (mutation_failpoints::COMMIT_AFTER_EXPIRATION, 0),
         (mutation_failpoints::COMMIT_AFTER_RECORD, 0),
+        (mutation_failpoints::COMMIT_AFTER_PENDING_SIGNING, 0),
         (mutation_failpoints::COMMIT_AFTER_AUDIT, 0),
     ];
     for (name, occurrence) in failpoints {
@@ -1746,6 +2071,12 @@ fn signing_commitment_failpoints_never_cross_the_point_of_no_return() {
             ReservationState::Reserved
         );
         assert!(reopened.recovery_actions().expect("recovery").is_empty());
+        assert!(
+            reopened
+                .pending_signing_jobs(usize::MAX)
+                .expect("pending")
+                .is_empty()
+        );
         assert_eq!(reopened.audit_log().expect("audit").len(), 3);
         for item in [first, second] {
             assert!(matches!(
@@ -1776,6 +2107,7 @@ fn signing_commitment_failpoints_never_cross_the_point_of_no_return() {
 fn signed_artifact_failpoints_leave_an_exact_recoverable_signing_job() {
     let failpoints = [
         (mutation_failpoints::SIGNED_AFTER_RECORD, 0),
+        (mutation_failpoints::SIGNED_AFTER_PENDING_SIGNING, 0),
         (mutation_failpoints::SIGNED_AFTER_AUDIT, 0),
     ];
     for (name, occurrence) in failpoints {
@@ -1811,6 +2143,13 @@ fn signed_artifact_failpoints_leave_an_exact_recoverable_signing_job() {
         assert!(matches!(
             reopened.recovery_actions().expect("recovery").as_slice(),
             [RecoveryAction::SignCommittedExact(job)]
+                if job.reservation_id() == reservation_id
+                    && job.commitment() == commitment
+                    && job.pre_sign_payload() == [1, 2, 3]
+        ));
+        assert!(matches!(
+            reopened.pending_signing_jobs(usize::MAX).expect("pending").as_slice(),
+            [job]
                 if job.reservation_id() == reservation_id
                     && job.commitment() == commitment
                     && job.pre_sign_payload() == [1, 2, 3]

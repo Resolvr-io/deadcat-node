@@ -1022,16 +1022,23 @@ name = "deadcat-rfq"
 version = "0.1.0-alpha"
 dependencies = [
  "bitcoind",
+ "deadcat-rfq-iroh",
  "deadcat-rfq-provider",
+ "deadcat-rfq-rpc",
  "deadcat-rfq-wallet",
+ "deadcat-types",
  "elements",
  "hex",
+ "iroh",
+ "rand 0.8.7",
  "reqwest",
  "serde",
  "serde_json",
  "smplx-sdk",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
