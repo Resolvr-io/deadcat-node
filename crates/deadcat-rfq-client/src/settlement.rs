@@ -6,12 +6,17 @@
 //! produce an execution attempt. The attempt retains the exact submitted
 //! layout and PSET behind a versioned, self-consistency-checked durable record.
 
+use deadcat_liquid_settlement::{
+    CanonicalPset, CanonicalPsetError, P2trVerificationError, verify_treeless_p2tr_explicit_all,
+};
 use deadcat_rfq_rpc::{
-    FirmQuoteValidationError, FixedBytes32, ReservationIdDto, SettlementLayoutDto, SettlementPset,
+    FirmQuoteValidationError, FixedBytes32, MAX_SETTLEMENT_BYTES, ReservationIdDto,
+    SettlementLayoutDto, SettlementPset,
 };
 use deadcat_types::{ChainIdentity, LiquidNetwork, serde_u64_string};
-use elements::AssetId;
+use elements::encode::serialize;
 use elements::hashes::Hash as _;
+use elements::{AssetId, SchnorrSighashType};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -44,7 +49,7 @@ pub struct ExecutionBinding {
 }
 
 impl ExecutionBinding {
-    fn from_settlement(settlement: &ResolvedRfqSettlement) -> Self {
+    pub(crate) fn from_settlement(settlement: &ResolvedRfqSettlement) -> Self {
         let handle = settlement.handle();
         Self {
             provider_endpoint: FixedBytes32::new(*handle.provider_endpoint().as_bytes()),
@@ -311,7 +316,11 @@ pub struct ExecutionAttempt {
 }
 
 impl ExecutionAttempt {
-    fn new(binding: ExecutionBinding, layout: SettlementLayoutDto, pset: SettlementPset) -> Self {
+    pub(crate) fn new(
+        binding: ExecutionBinding,
+        layout: SettlementLayoutDto,
+        pset: SettlementPset,
+    ) -> Self {
         let digest = execution_attempt_digest(&binding, &layout, &pset);
         Self {
             record: ExecutionAttemptRecord {
@@ -331,11 +340,33 @@ impl ExecutionAttempt {
                 actual: record.version,
             });
         }
-        record.binding.validate()?;
-        record.layout.validate()?;
         let expected = execution_attempt_digest(&record.binding, &record.layout, &record.pset);
         if record.digest != expected {
             return Err(ExecutionAttemptError::DigestMismatch);
+        }
+        record.binding.validate()?;
+        record.layout.validate()?;
+        let canonical = CanonicalPset::decode(record.pset.as_bytes(), MAX_SETTLEMENT_BYTES)
+            .map_err(ExecutionAttemptError::InvalidPset)?;
+        let pset = canonical.pset();
+        let input_count = pset.inputs().len();
+        let output_count = pset.outputs().len();
+        if usize::from(record.layout.taker_payment_input) >= input_count
+            || record
+                .layout
+                .provider_inputs
+                .iter()
+                .any(|placement| usize::from(placement.transaction_index) >= input_count)
+            || record
+                .layout
+                .quote_outputs
+                .iter()
+                .any(|placement| usize::from(placement.transaction_index) >= output_count)
+        {
+            return Err(ExecutionAttemptError::LayoutIndexOutOfPsetBounds {
+                inputs: input_count,
+                outputs: output_count,
+            });
         }
         Ok(Self { record })
     }
@@ -388,6 +419,111 @@ impl ExecutionAttempt {
     #[must_use]
     pub fn matches_pset(&self, pset: &SettlementPset) -> bool {
         self.record.pset == *pset
+    }
+
+    /// Verify the provider's returned PSET as the sole allowed extension of
+    /// this exact taker-authorized attempt.
+    ///
+    /// Every provider input must gain one valid explicit-`SIGHASH_ALL`
+    /// tree-less P2TR key-path signature and its exact one-item final witness.
+    /// Clearing only those two fields must reproduce the canonical attempt
+    /// byte-for-byte; globals, outputs, wallet inputs, and all other metadata
+    /// are therefore immutable.
+    pub fn verify_signed_result(
+        &self,
+        signed_pset: &SettlementPset,
+    ) -> Result<VerifiedSignedExecution, SignedExecutionError> {
+        let original = CanonicalPset::decode(self.pset().as_bytes(), MAX_SETTLEMENT_BYTES)?;
+        let signed = CanonicalPset::decode(signed_pset.as_bytes(), MAX_SETTLEMENT_BYTES)?;
+        let original_pset = original.pset();
+        let mut normalized = signed.pset().clone();
+        let transaction = signed
+            .pset()
+            .extract_tx()
+            .map_err(|error| SignedExecutionError::InvalidSignedPset(error.to_string()))?;
+        let prevouts = original_pset
+            .inputs()
+            .iter()
+            .enumerate()
+            .map(|(index, input)| {
+                input
+                    .witness_utxo
+                    .clone()
+                    .ok_or(SignedExecutionError::MissingWitnessUtxo { index })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for placement in &self.record.layout.provider_inputs {
+            let index = usize::from(placement.transaction_index);
+            let original_input = original_pset.inputs().get(index).ok_or(
+                SignedExecutionError::ProviderInputIndex {
+                    index,
+                    inputs: original_pset.inputs().len(),
+                },
+            )?;
+            if original_input.tap_merkle_root.is_some()
+                || original_input.sighash_type != Some(SchnorrSighashType::All.into())
+                || original_input.tap_key_sig.is_some()
+                || original_input.final_script_witness.is_some()
+            {
+                return Err(SignedExecutionError::InvalidOriginalProviderInput { index });
+            }
+            let internal_key = original_input
+                .tap_internal_key
+                .ok_or(SignedExecutionError::InvalidOriginalProviderInput { index })?;
+            let signed_input = signed.pset().inputs().get(index).ok_or(
+                SignedExecutionError::ProviderInputIndex {
+                    index,
+                    inputs: signed.pset().inputs().len(),
+                },
+            )?;
+            let signature = signed_input
+                .tap_key_sig
+                .ok_or(SignedExecutionError::MissingProviderSignature { index })?;
+            if signature.hash_ty != SchnorrSighashType::All
+                || signed_input.final_script_witness.as_ref() != Some(&vec![signature.to_vec()])
+            {
+                return Err(SignedExecutionError::InvalidProviderFinalWitness { index });
+            }
+            verify_treeless_p2tr_explicit_all(
+                &transaction,
+                &prevouts,
+                index,
+                signature,
+                internal_key,
+                self.binding().chain().genesis_hash,
+            )
+            .map_err(|source| SignedExecutionError::InvalidProviderSignature { index, source })?;
+            let normalized_input = normalized.inputs_mut().get_mut(index).ok_or(
+                SignedExecutionError::ProviderInputIndex {
+                    index,
+                    inputs: signed.pset().inputs().len(),
+                },
+            )?;
+            normalized_input.tap_key_sig = None;
+            normalized_input.final_script_witness = None;
+        }
+        if serialize(&normalized) != self.pset().as_bytes() {
+            return Err(SignedExecutionError::UnexpectedPsetMutation);
+        }
+        Ok(VerifiedSignedExecution(signed_pset.clone()))
+    }
+}
+
+/// Provider-signed settlement proven to be the exact authorized attempt plus
+/// the required provider signatures and final witnesses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedSignedExecution(SettlementPset);
+
+impl VerifiedSignedExecution {
+    #[must_use]
+    pub const fn pset(&self) -> &SettlementPset {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_pset(self) -> SettlementPset {
+        self.0
     }
 }
 
@@ -454,6 +590,12 @@ pub enum ExecutionAttemptError {
     InvalidReservationTimeline,
     #[error("execution-attempt settlement layout is invalid: {0}")]
     InvalidSettlementLayout(#[from] FirmQuoteValidationError),
+    #[error("execution-attempt PSET is not canonical and sane: {0}")]
+    InvalidPset(#[source] CanonicalPsetError),
+    #[error(
+        "execution-attempt layout references outside a PSET with {inputs} inputs and {outputs} outputs"
+    )]
+    LayoutIndexOutOfPsetBounds { inputs: usize, outputs: usize },
     #[error("execution-attempt digest does not match its exact payload")]
     DigestMismatch,
     #[error("execution attempt belongs to a different RFQ reservation")]
@@ -462,12 +604,42 @@ pub enum ExecutionAttemptError {
     SettlementLayoutMismatch,
 }
 
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum SignedExecutionError {
+    #[error("signed execution PSET is not canonical and sane: {0}")]
+    InvalidCanonicalPset(#[from] CanonicalPsetError),
+    #[error("signed execution PSET cannot be extracted: {0}")]
+    InvalidSignedPset(String),
+    #[error("attempt input {index} is missing its bound witness UTXO")]
+    MissingWitnessUtxo { index: usize },
+    #[error("provider input index {index} is out of range for {inputs} inputs")]
+    ProviderInputIndex { index: usize, inputs: usize },
+    #[error("attempt provider input {index} is not unsigned tree-less P2TR SIGHASH_ALL")]
+    InvalidOriginalProviderInput { index: usize },
+    #[error("signed execution is missing provider signature at input {index}")]
+    MissingProviderSignature { index: usize },
+    #[error("provider input {index} does not have the exact explicit-ALL final witness")]
+    InvalidProviderFinalWitness { index: usize },
+    #[error("provider signature at input {index} is invalid: {source}")]
+    InvalidProviderSignature {
+        index: usize,
+        #[source]
+        source: P2trVerificationError,
+    },
+    #[error("provider-signed PSET changed fields outside provider signatures and final witnesses")]
+    UnexpectedPsetMutation,
+}
+
 #[cfg(test)]
 mod tests {
     use deadcat_rfq_rpc::{InputPlacementDto, OutputPlacementDto};
+    use elements::confidential::{Asset, Nonce, Value};
     use elements::hashes::Hash as _;
-    use elements::pset::{Output as PsetOutput, PartiallySignedTransaction};
-    use elements::{AssetId, BlockHash, TxOut};
+    use elements::pset::{Input as PsetInput, Output as PsetOutput, PartiallySignedTransaction};
+    use elements::schnorr::TapTweak as _;
+    use elements::secp256k1_zkp::{Keypair, Message, Secp256k1, SecretKey as SecpSecretKey};
+    use elements::sighash::{Prevouts, SighashCache};
+    use elements::{AssetId, BlockHash, OutPoint, SchnorrSig, Script, TxOut, TxOutWitness, Txid};
     use iroh::SecretKey;
 
     use super::*;
@@ -478,12 +650,28 @@ mod tests {
 
     fn pset() -> SettlementPset {
         let mut pset = PartiallySignedTransaction::new_v2();
+        pset.add_input(PsetInput::from_prevout(OutPoint::new(
+            Txid::from_byte_array([1; 32]),
+            0,
+        )));
+        pset.add_input(PsetInput::from_prevout(OutPoint::new(
+            Txid::from_byte_array([2; 32]),
+            0,
+        )));
         pset.add_output(PsetOutput::from_txout(TxOut::new_fee(50, asset(7))));
         SettlementPset::from_pset(&pset).expect("fixture PSET")
     }
 
     fn other_pset() -> SettlementPset {
         let mut pset = PartiallySignedTransaction::new_v2();
+        pset.add_input(PsetInput::from_prevout(OutPoint::new(
+            Txid::from_byte_array([1; 32]),
+            0,
+        )));
+        pset.add_input(PsetInput::from_prevout(OutPoint::new(
+            Txid::from_byte_array([2; 32]),
+            0,
+        )));
         pset.add_output(PsetOutput::from_txout(TxOut::new_fee(51, asset(7))));
         SettlementPset::from_pset(&pset).expect("other fixture PSET")
     }
@@ -550,6 +738,103 @@ mod tests {
         .expect("infallible test authorization")
     }
 
+    fn signed_attempt() -> (ExecutionAttempt, SettlementPset) {
+        let secp = Secp256k1::new();
+        let provider_keypair = Keypair::from_secret_key(
+            &secp,
+            &SecpSecretKey::from_slice(&[0x31; 32]).expect("provider key"),
+        );
+        let (provider_internal_key, _) = provider_keypair.x_only_public_key();
+        let wallet_keypair = Keypair::from_secret_key(
+            &secp,
+            &SecpSecretKey::from_slice(&[0x32; 32]).expect("wallet key"),
+        );
+        let (wallet_internal_key, _) = wallet_keypair.x_only_public_key();
+        let provider_prevout = TxOut {
+            asset: Asset::Explicit(asset(7)),
+            value: Value::Explicit(5),
+            nonce: Nonce::Null,
+            script_pubkey: Script::new_v1_p2tr(&secp, provider_internal_key, None),
+            witness: TxOutWitness::default(),
+        };
+        let wallet_prevout = TxOut {
+            asset: Asset::Explicit(asset(7)),
+            value: Value::Explicit(5),
+            nonce: Nonce::Null,
+            script_pubkey: Script::new_v1_p2tr(&secp, wallet_internal_key, None),
+            witness: TxOutWitness::default(),
+        };
+        let mut provider_input =
+            PsetInput::from_prevout(OutPoint::new(Txid::from_byte_array([0x33; 32]), 0));
+        provider_input.witness_utxo = Some(provider_prevout.clone());
+        provider_input.tap_internal_key = Some(provider_internal_key);
+        provider_input.sighash_type = Some(SchnorrSighashType::All.into());
+        let mut wallet_input =
+            PsetInput::from_prevout(OutPoint::new(Txid::from_byte_array([0x34; 32]), 0));
+        wallet_input.witness_utxo = Some(wallet_prevout.clone());
+        let mut original = PartiallySignedTransaction::new_v2();
+        original.add_input(provider_input);
+        original.add_input(wallet_input);
+        original.add_output(PsetOutput::from_txout(TxOut::new_fee(10, asset(7))));
+        let original = SettlementPset::from_pset(&original).expect("canonical original PSET");
+        let layout = SettlementLayoutDto {
+            taker_payment_input: 1,
+            provider_inputs: vec![InputPlacementDto {
+                quote_input_id: 7,
+                transaction_index: 0,
+            }],
+            quote_outputs: vec![OutputPlacementDto {
+                quote_output_id: 8,
+                transaction_index: 0,
+            }],
+        };
+        let attempt = ExecutionAttempt::new(binding(), layout, original.clone());
+
+        let mut signed = original.to_pset().expect("decode original PSET");
+        let transaction = signed.extract_tx().expect("extract transaction");
+        let prevouts = [provider_prevout, wallet_prevout];
+        let sighash = SighashCache::new(&transaction)
+            .taproot_key_spend_signature_hash(
+                0,
+                &Prevouts::All(&prevouts),
+                SchnorrSighashType::All,
+                binding().chain().genesis_hash,
+            )
+            .expect("provider sighash");
+        let signature = SchnorrSig {
+            sig: secp.sign_schnorr(
+                &Message::from_digest(sighash.to_byte_array()),
+                &provider_keypair.tap_tweak(&secp, None).to_inner(),
+            ),
+            hash_ty: SchnorrSighashType::All,
+        };
+        signed.inputs_mut()[0].tap_key_sig = Some(signature);
+        signed.inputs_mut()[0].final_script_witness = Some(vec![signature.to_vec()]);
+        let signed = SettlementPset::from_pset(&signed).expect("canonical signed PSET");
+        (attempt, signed)
+    }
+
+    fn reorder_first_two_global_pairs(canonical: &[u8]) -> Vec<u8> {
+        const HEADER_BYTES: usize = 5;
+        let mut cursor = HEADER_BYTES;
+        let mut pairs = Vec::new();
+        while canonical[cursor] != 0 {
+            let start = cursor;
+            let key_length = usize::from(canonical[cursor]);
+            cursor += 1 + key_length;
+            let value_length = usize::from(canonical[cursor]);
+            cursor += 1 + value_length;
+            pairs.push(canonical[start..cursor].to_vec());
+        }
+        pairs.swap(0, 1);
+        let mut reordered = canonical[..HEADER_BYTES].to_vec();
+        for pair in pairs {
+            reordered.extend(pair);
+        }
+        reordered.extend_from_slice(&canonical[cursor..]);
+        reordered
+    }
+
     #[test]
     fn provider_output_crosses_explicit_authorizer_before_execution() {
         let authorized = authorized();
@@ -573,6 +858,55 @@ mod tests {
         let recovered = ExecutionAttempt::from_record(record).expect("validate durable record");
         assert_eq!(recovered, attempt);
         assert_eq!(recovered.digest(), attempt.digest());
+    }
+
+    #[test]
+    fn recovered_attempt_requires_a_canonical_sane_pset() {
+        let attempt = authorized().into_execution_attempt();
+        let reordered = reorder_first_two_global_pairs(attempt.pset().as_bytes());
+        let mut record = attempt.to_record();
+        record.pset = SettlementPset::from_bytes(reordered).expect("decodable reordered PSET");
+        record.digest = execution_attempt_digest(&record.binding, &record.layout, &record.pset);
+        assert!(matches!(
+            ExecutionAttempt::from_record(record),
+            Err(ExecutionAttemptError::InvalidPset(
+                CanonicalPsetError::NonCanonicalEncoding
+            ))
+        ));
+    }
+
+    #[test]
+    fn signed_result_allows_only_verified_provider_signature_fields() {
+        let (attempt, signed) = signed_attempt();
+        let verified = attempt
+            .verify_signed_result(&signed)
+            .expect("exact provider signature extension");
+        assert_eq!(verified.pset(), &signed);
+
+        let mut missing = signed.to_pset().expect("signed PSET");
+        missing.inputs_mut()[0].tap_key_sig = None;
+        let missing = SettlementPset::from_pset(&missing).expect("canonical mutation");
+        assert!(matches!(
+            attempt.verify_signed_result(&missing),
+            Err(SignedExecutionError::MissingProviderSignature { index: 0 })
+        ));
+
+        let mut wallet_metadata = signed.to_pset().expect("signed PSET");
+        wallet_metadata.inputs_mut()[1].sighash_type = Some(SchnorrSighashType::Single.into());
+        let wallet_metadata =
+            SettlementPset::from_pset(&wallet_metadata).expect("canonical mutation");
+        assert!(matches!(
+            attempt.verify_signed_result(&wallet_metadata),
+            Err(SignedExecutionError::UnexpectedPsetMutation)
+        ));
+
+        let mut wrong_witness = signed.to_pset().expect("signed PSET");
+        wrong_witness.inputs_mut()[0].final_script_witness = Some(vec![vec![0x01]]);
+        let wrong_witness = SettlementPset::from_pset(&wrong_witness).expect("canonical mutation");
+        assert!(matches!(
+            attempt.verify_signed_result(&wrong_witness),
+            Err(SignedExecutionError::InvalidProviderFinalWitness { index: 0 })
+        ));
     }
 
     #[test]
@@ -628,6 +962,21 @@ mod tests {
         assert!(matches!(
             ExecutionAttempt::from_record(invalid_timeline),
             Err(ExecutionAttemptError::InvalidReservationTimeline)
+        ));
+
+        let mut out_of_range = attempt.to_record();
+        out_of_range.layout.provider_inputs[0].transaction_index = 2;
+        out_of_range.digest = execution_attempt_digest(
+            &out_of_range.binding,
+            &out_of_range.layout,
+            &out_of_range.pset,
+        );
+        assert!(matches!(
+            ExecutionAttempt::from_record(out_of_range),
+            Err(ExecutionAttemptError::LayoutIndexOutOfPsetBounds {
+                inputs: 2,
+                outputs: 1
+            })
         ));
     }
 }

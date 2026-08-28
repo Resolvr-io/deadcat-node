@@ -1089,6 +1089,7 @@ fn quote_to_dto(quote: &FirmQuote, network: LiquidNetwork) -> FirmQuoteDto {
                 id: input.id().value(),
                 outpoint: input.outpoint(),
                 witness_utxo: TxOutDto::from_txout(input.witness_utxo()),
+                internal_key: FixedBytes32::new(input.internal_key().serialize()),
                 inventory_binding: FixedBytes32::new(input.inventory_binding().to_bytes()),
             })
             .collect(),

@@ -9,16 +9,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
+use deadcat_liquid_settlement::{
+    CanonicalPset, CanonicalPsetError, verify_confidential_proofs_and_balance,
+    verify_output_disclosure, verify_treeless_p2tr_explicit_all,
+};
 use elements::bitcoin::PublicKey as BitcoinPublicKey;
 use elements::encode::{deserialize, serialize};
-use elements::hashes::Hash as _;
 use elements::pset::{Input as PsetInput, Output as PsetOutput, PartiallySignedTransaction};
-use elements::schnorr::TapTweak as _;
-use elements::secp256k1_zkp::{Message, Secp256k1};
-use elements::sighash::{Prevouts, SighashCache};
+use elements::secp256k1_zkp::Secp256k1;
 use elements::{
-    AssetId, BlindAssetProofs as _, BlindValueProofs as _, BlockHash, LockTime, OutPoint,
-    SchnorrSig, SchnorrSighashType, Sequence, Transaction, TxOut,
+    AssetId, BlockHash, LockTime, OutPoint, SchnorrSig, SchnorrSighashType, Sequence, Transaction,
+    TxOut,
 };
 use thiserror::Error;
 
@@ -526,9 +527,9 @@ where
 
         let fee_amount =
             validate_outputs(pset, &transaction, context, layout, self.output_recovery)?;
-        transaction
-            .verify_tx_amt_proofs(&Secp256k1::new(), &prevouts)
-            .map_err(|error| SettlementValidationError::ConfidentialProofs(error.to_string()))?;
+        verify_confidential_proofs_and_balance(&transaction, &prevouts).map_err(|error| {
+            SettlementValidationError::ConfidentialProofs(error.detail().to_owned())
+        })?;
 
         let placeholder_signature = pset.inputs()[layout.taker_payment_input]
             .tap_key_sig
@@ -569,24 +570,18 @@ where
 }
 
 fn canonical_pset(bytes: &[u8]) -> Result<Vec<u8>, SettlementValidationError> {
-    if bytes.is_empty() {
-        return Err(SettlementValidationError::EmptyPayload);
-    }
-    if bytes.len() > MAX_SETTLEMENT_BYTES {
-        return Err(SettlementValidationError::PayloadTooLarge {
-            maximum: MAX_SETTLEMENT_BYTES,
-            actual: bytes.len(),
-        });
-    }
-    let pset = deserialize::<PartiallySignedTransaction>(bytes)
-        .map_err(|error| SettlementValidationError::InvalidPset(error.to_string()))?;
-    pset.sanity_check()
-        .map_err(|error| SettlementValidationError::InvalidPset(error.to_string()))?;
-    let canonical = serialize(&pset);
-    if canonical != bytes {
-        return Err(SettlementValidationError::NonCanonicalPset);
-    }
-    Ok(canonical)
+    CanonicalPset::decode(bytes, MAX_SETTLEMENT_BYTES)
+        .map(CanonicalPset::into_bytes)
+        .map_err(|error| match error {
+            CanonicalPsetError::EmptyPayload => SettlementValidationError::EmptyPayload,
+            CanonicalPsetError::PayloadTooLarge { maximum, actual } => {
+                SettlementValidationError::PayloadTooLarge { maximum, actual }
+            }
+            CanonicalPsetError::InvalidPset(detail) => {
+                SettlementValidationError::InvalidPset(detail)
+            }
+            CanonicalPsetError::NonCanonicalEncoding => SettlementValidationError::NonCanonicalPset,
+        })
 }
 
 fn project_finalized_pset(
@@ -882,25 +877,18 @@ fn verify_taproot_signature(
     internal_key: elements::secp256k1_zkp::XOnlyPublicKey,
     genesis_hash: elements::BlockHash,
 ) -> Result<(), SettlementValidationError> {
-    let sighash = SighashCache::new(transaction)
-        .taproot_key_spend_signature_hash(
-            index,
-            &Prevouts::All(prevouts),
-            SchnorrSighashType::All,
-            genesis_hash,
-        )
-        .map_err(|error| SettlementValidationError::InvalidSignature {
-            index,
-            detail: error.to_string(),
-        })?;
-    let message = Message::from_digest(sighash.to_byte_array());
-    let (output_key, _) = internal_key.tap_tweak(&Secp256k1::new(), None);
-    Secp256k1::new()
-        .verify_schnorr(&signature.sig, &message, output_key.as_inner())
-        .map_err(|error| SettlementValidationError::InvalidSignature {
-            index,
-            detail: error.to_string(),
-        })
+    verify_treeless_p2tr_explicit_all(
+        transaction,
+        prevouts,
+        index,
+        signature,
+        internal_key,
+        genesis_hash,
+    )
+    .map_err(|error| SettlementValidationError::InvalidSignature {
+        index,
+        detail: error.detail().to_owned(),
+    })
 }
 
 fn validate_outputs<R: ProviderOutputRecovery>(
@@ -1022,26 +1010,7 @@ fn validate_confidential_output(
             reason: "ordinary output is not a fully disclosed confidential output",
         });
     }
-    let asset = output.asset.expect("presence checked");
-    let amount = output.amount.expect("presence checked");
-    let asset_commitment = output.asset_comm.expect("presence checked");
-    let value_commitment = output.amount_comm.expect("presence checked");
-    if !output
-        .blind_asset_proof
-        .as_deref()
-        .expect("presence checked")
-        .blind_asset_proof_verify(&Secp256k1::new(), asset, asset_commitment)
-        || !output
-            .blind_value_proof
-            .as_deref()
-            .expect("presence checked")
-            .blind_value_proof_verify(
-                &Secp256k1::new(),
-                amount,
-                asset_commitment,
-                value_commitment,
-            )
-    {
+    if verify_output_disclosure(output).is_err() {
         return Err(SettlementValidationError::InvalidOutput {
             index,
             reason: "disclosed asset or amount does not match its commitment",

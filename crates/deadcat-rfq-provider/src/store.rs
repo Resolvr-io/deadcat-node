@@ -4520,6 +4520,8 @@ fn validate_firm_quote_shape(quote: &FirmQuote) -> Result<(), ProviderError> {
             || !input.witness_utxo().nonce.is_confidential()
             || input.witness_utxo().witness.surjection_proof.is_none()
             || input.witness_utxo().witness.rangeproof.is_none()
+            || input.witness_utxo().script_pubkey
+                != elements::Script::new_v1_p2tr(&Secp256k1::new(), input.internal_key(), None)
         {
             return Err(ProviderError::CorruptState(
                 "persisted firm quote has an invalid provider input".to_owned(),

@@ -22,7 +22,8 @@ use std::collections::BTreeMap;
 
 use elements::bitcoin::PublicKey;
 use elements::pset::{Input as PsetInput, Output as PsetOutput, PartiallySignedTransaction};
-use elements::{AssetId, LockTime, OutPoint, Script, Sequence, TxOut};
+use elements::secp256k1_zkp::{Secp256k1, XOnlyPublicKey};
+use elements::{AssetId, LockTime, OutPoint, SchnorrSighashType, Script, Sequence, TxOut};
 use thiserror::Error;
 
 /// Contribution-local symbolic identity for one transaction input.
@@ -77,6 +78,20 @@ impl InputSequence {
     }
 }
 
+/// Signing authorization metadata the composer may place on an input.
+///
+/// Version one deliberately supports only the ordinary tree-less key-path
+/// profile used by both provider and taker wallets. [`Self::Unspecified`]
+/// preserves the original composer behavior for callers that install or
+/// validate their own signing metadata later.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InputAuthorization {
+    #[default]
+    Unspecified,
+    /// Tree-less P2TR key-path spend with an explicit `SIGHASH_ALL` declaration.
+    TreeLessP2trSighashAll { internal_key: XOnlyPublicKey },
+}
+
 /// Narrow specification for an ordinary input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputSpec {
@@ -84,6 +99,7 @@ pub struct InputSpec {
     outpoint: OutPoint,
     witness_utxo: TxOut,
     sequence: InputSequence,
+    authorization: InputAuthorization,
 }
 
 impl InputSpec {
@@ -99,6 +115,29 @@ impl InputSpec {
             outpoint,
             witness_utxo,
             sequence,
+            authorization: InputAuthorization::Unspecified,
+        }
+    }
+
+    /// Declare the fixed ordinary-wallet authorization profile.
+    ///
+    /// The composer rejects a witness UTXO whose script is not the tree-less
+    /// P2TR output derived from `internal_key`, then installs the matching
+    /// Taproot internal key and explicit `SIGHASH_ALL` PSET fields.
+    #[must_use]
+    pub const fn tree_less_p2tr_sighash_all(
+        id: InputId,
+        outpoint: OutPoint,
+        witness_utxo: TxOut,
+        sequence: InputSequence,
+        internal_key: XOnlyPublicKey,
+    ) -> Self {
+        Self {
+            id,
+            outpoint,
+            witness_utxo,
+            sequence,
+            authorization: InputAuthorization::TreeLessP2trSighashAll { internal_key },
         }
     }
 
@@ -120,6 +159,11 @@ impl InputSpec {
     #[must_use]
     pub const fn sequence(&self) -> InputSequence {
         self.sequence
+    }
+
+    #[must_use]
+    pub const fn authorization(&self) -> InputAuthorization {
+        self.authorization
     }
 }
 
@@ -435,6 +479,7 @@ struct ManifestInput {
     outpoint: OutPoint,
     witness_utxo: TxOut,
     sequence: Sequence,
+    authorization: InputAuthorization,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -515,6 +560,7 @@ impl UnblindedStructureManifest {
                 || actual.required_height_locktime.is_some()
                 || actual.required_time_locktime.is_some()
                 || actual.final_script_sig.is_some()
+                || !matches_input_authorization(actual, expected.authorization)
                 || has_issuance_metadata(actual)
                 || has_pegin(actual)
                 || !actual.proprietary.is_empty()
@@ -737,11 +783,26 @@ impl TransactionComposer {
                 // field so a serialized handoff carries the complete proof.
                 pset_input.in_utxo_rangeproof = input.witness_utxo().witness.rangeproof.clone();
                 pset_input.sequence = Some(input.sequence().to_sequence());
+                match input.authorization() {
+                    InputAuthorization::Unspecified => {}
+                    InputAuthorization::TreeLessP2trSighashAll { internal_key } => {
+                        let expected_script =
+                            Script::new_v1_p2tr(&Secp256k1::new(), internal_key, None);
+                        if input.witness_utxo().script_pubkey != expected_script {
+                            return Err(CompositionError::InputAuthorizationMismatch(
+                                input.outpoint(),
+                            ));
+                        }
+                        pset_input.tap_internal_key = Some(internal_key);
+                        pset_input.sighash_type = Some(SchnorrSighashType::All.into());
+                    }
+                }
                 pset.add_input(pset_input);
                 manifest_inputs.push(ManifestInput {
                     outpoint: input.outpoint(),
                     witness_utxo: input.witness_utxo().clone(),
                     sequence: input.sequence().to_sequence(),
+                    authorization: input.authorization(),
                 });
             }
             placements.push(ContributionPlacement {
@@ -956,6 +1017,21 @@ fn same_prevout_body(actual: &TxOut, expected: &TxOut) -> bool {
         && actual.script_pubkey == expected.script_pubkey
 }
 
+fn matches_input_authorization(input: &PsetInput, expected: InputAuthorization) -> bool {
+    match expected {
+        // Legacy callers intentionally retain participant-specific ownership of
+        // signing metadata, matching the original structure-only manifest.
+        InputAuthorization::Unspecified => true,
+        InputAuthorization::TreeLessP2trSighashAll { internal_key } => {
+            input.tap_internal_key == Some(internal_key)
+                && input.sighash_type == Some(SchnorrSighashType::All.into())
+                && input.tap_merkle_root.is_none()
+                && input.tap_scripts.is_empty()
+                && input.tap_script_sigs.is_empty()
+        }
+    }
+}
+
 fn has_pegin(input: &PsetInput) -> bool {
     input.is_pegin()
         || input.pegin_tx.is_some()
@@ -1037,6 +1113,8 @@ pub enum CompositionError {
     UnsupportedOutpoint(OutPoint),
     #[error("ordinary input {0} does not spend a native witness output")]
     NonWitnessInput(OutPoint),
+    #[error("ordinary input {0} does not match its declared signing authorization")]
+    InputAuthorizationMismatch(OutPoint),
     #[error("duplicate symbolic output id {0:?}")]
     DuplicateOutputId(OutputId),
     #[error("output refers to unknown local blinder input {0:?}")]
@@ -1084,7 +1162,8 @@ mod tests {
     use elements::bitcoin::PublicKey as BitcoinPublicKey;
     use elements::confidential::{Asset, Nonce, Value};
     use elements::hashes::Hash as _;
-    use elements::secp256k1_zkp::{PublicKey, Secp256k1, SecretKey};
+    use elements::secp256k1_zkp::{Keypair, PublicKey, Secp256k1, SecretKey};
+    use elements::taproot::TapNodeHash;
     use elements::{AssetId, TxOutWitness, Txid};
 
     use super::*;
@@ -1142,6 +1221,15 @@ mod tests {
 
     fn fee() -> NetworkFee {
         NetworkFee::new(asset(1), 100).expect("fee")
+    }
+
+    fn internal_key(marker: u8) -> XOnlyPublicKey {
+        Keypair::from_secret_key(
+            &Secp256k1::new(),
+            &SecretKey::from_slice(&[marker; 32]).expect("secret"),
+        )
+        .x_only_public_key()
+        .0
     }
 
     #[test]
@@ -1220,6 +1308,89 @@ mod tests {
             .manifest()
             .validate(composed.pset())
             .expect("manifest");
+    }
+
+    #[test]
+    fn declared_tree_less_p2tr_profile_is_emitted_and_frozen() {
+        let provider_key = internal_key(41);
+        let prevout = explicit_utxo(
+            asset(1),
+            10_000,
+            Script::new_v1_p2tr(&Secp256k1::new(), provider_key, None),
+        );
+        let authorized = InputSpec::tree_less_p2tr_sighash_all(
+            InputId::new(1),
+            outpoint(42, 0),
+            prevout,
+            InputSequence::Final,
+            provider_key,
+        );
+        let mut composer = TransactionComposer::new(CompositionLimits::default(), fee());
+        composer
+            .push(TransactionContribution::new(
+                vec![authorized],
+                Vec::new(),
+                LockTimeConstraint::Unconstrained,
+            ))
+            .expect("contribution");
+        let composed = composer.finish().expect("composition");
+        let input = &composed.pset().inputs()[0];
+        assert_eq!(input.tap_internal_key, Some(provider_key));
+        assert_eq!(input.sighash_type, Some(SchnorrSighashType::All.into()));
+        assert!(input.tap_merkle_root.is_none());
+        composed
+            .manifest()
+            .validate(composed.pset())
+            .expect("declared authorization");
+
+        let mut wrong_key = composed.pset().clone();
+        wrong_key.inputs_mut()[0].tap_internal_key = Some(internal_key(43));
+        assert_eq!(
+            composed.manifest().validate(&wrong_key),
+            Err(CompositionError::InputMismatch { index: 0 })
+        );
+
+        let mut wrong_sighash = composed.pset().clone();
+        wrong_sighash.inputs_mut()[0].sighash_type = Some(SchnorrSighashType::Single.into());
+        assert_eq!(
+            composed.manifest().validate(&wrong_sighash),
+            Err(CompositionError::InputMismatch { index: 0 })
+        );
+
+        let mut script_tree = composed.pset().clone();
+        script_tree.inputs_mut()[0].tap_merkle_root = Some(TapNodeHash::from_byte_array([44; 32]));
+        assert_eq!(
+            composed.manifest().validate(&script_tree),
+            Err(CompositionError::InputMismatch { index: 0 })
+        );
+    }
+
+    #[test]
+    fn declared_tree_less_p2tr_profile_rejects_script_key_mismatch() {
+        let outpoint = outpoint(45, 0);
+        let authorized = InputSpec::tree_less_p2tr_sighash_all(
+            InputId::new(1),
+            outpoint,
+            explicit_utxo(
+                asset(1),
+                10_000,
+                Script::new_v1_p2tr(&Secp256k1::new(), internal_key(46), None),
+            ),
+            InputSequence::Final,
+            internal_key(47),
+        );
+        let mut composer = TransactionComposer::new(CompositionLimits::default(), fee());
+        composer
+            .push(TransactionContribution::new(
+                vec![authorized],
+                Vec::new(),
+                LockTimeConstraint::Unconstrained,
+            ))
+            .expect("contribution");
+        assert_eq!(
+            composer.finish().expect_err("script/key mismatch"),
+            CompositionError::InputAuthorizationMismatch(outpoint)
+        );
     }
 
     #[test]

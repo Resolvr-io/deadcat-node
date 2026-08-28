@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 
 use deadcat_types::{ChainIdentity, ContractId};
-use elements::secp256k1_zkp::PublicKey;
+use elements::secp256k1_zkp::{PublicKey, XOnlyPublicKey};
 use elements::{AssetId, OutPoint, Script, TxOut};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -50,6 +50,27 @@ mod inventory_binding_serde {
         Ok(InventoryBinding::new(<[u8; 32]>::deserialize(
             deserializer,
         )?))
+    }
+}
+
+mod xonly_public_key_serde {
+    use elements::secp256k1_zkp::XOnlyPublicKey;
+    use serde::de::Error as _;
+    use serde::{Deserialize as _, Deserializer, Serialize as _, Serializer};
+
+    pub(super) fn serialize<S>(value: &XOnlyPublicKey, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        value.serialize().serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<XOnlyPublicKey, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes = <[u8; 32]>::deserialize(deserializer)?;
+        XOnlyPublicKey::from_slice(&bytes).map_err(D::Error::custom)
     }
 }
 
@@ -1124,6 +1145,8 @@ pub struct QuotedProviderInput {
     outpoint: OutPoint,
     #[serde(with = "txout_serde")]
     witness_utxo: TxOut,
+    #[serde(with = "xonly_public_key_serde")]
+    internal_key: XOnlyPublicKey,
     #[serde(with = "inventory_binding_serde")]
     inventory_binding: InventoryBinding,
 }
@@ -1142,6 +1165,12 @@ impl QuotedProviderInput {
     #[must_use]
     pub const fn witness_utxo(&self) -> &TxOut {
         &self.witness_utxo
+    }
+
+    /// Untweaked key committed by this tree-less P2TR provider prevout.
+    #[must_use]
+    pub const fn internal_key(&self) -> XOnlyPublicKey {
+        self.internal_key
     }
 
     #[must_use]
@@ -2015,6 +2044,7 @@ fn quote_contribution(
                 id,
                 outpoint: output.outpoint(),
                 witness_utxo: output.txout().clone(),
+                internal_key: output.internal_key(),
                 inventory_binding: output.binding(),
             })
         })
@@ -2403,6 +2433,7 @@ struct StoredQuotedInputV1<'a> {
     id: u16,
     outpoint: OutPoint,
     witness_utxo: &'a TxOut,
+    internal_key: [u8; 32],
     inventory_binding: [u8; 32],
 }
 
@@ -2412,6 +2443,7 @@ impl<'a> From<&'a QuotedProviderInput> for StoredQuotedInputV1<'a> {
             id: value.id.value(),
             outpoint: value.outpoint,
             witness_utxo: &value.witness_utxo,
+            internal_key: value.internal_key.serialize(),
             inventory_binding: value.inventory_binding.to_bytes(),
         }
     }

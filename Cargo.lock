@@ -990,6 +990,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "deadcat-liquid-settlement"
+version = "0.1.0-alpha"
+dependencies = [
+ "elements",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "deadcat-node"
 version = "0.1.0-alpha"
 dependencies = [
@@ -1053,16 +1061,20 @@ version = "0.1.0-alpha"
 dependencies = [
  "deadcat-client",
  "deadcat-contracts",
+ "deadcat-liquid-settlement",
  "deadcat-rfq-iroh",
  "deadcat-rfq-rpc",
  "deadcat-rpc",
  "deadcat-types",
  "elements",
  "iroh",
+ "postcard",
  "rand 0.8.7",
+ "redb",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -1086,6 +1098,7 @@ name = "deadcat-rfq-provider"
 version = "0.1.0-alpha"
 dependencies = [
  "deadcat-client",
+ "deadcat-liquid-settlement",
  "deadcat-types",
  "elements",
  "libc",

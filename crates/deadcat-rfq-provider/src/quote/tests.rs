@@ -532,6 +532,7 @@ fn persisted_quote_contribution_round_trips_through_the_store_codec() {
         id: QuoteInputId::new(1),
         outpoint: owned.outpoint(),
         witness_utxo: owned.txout().clone(),
+        internal_key: owned.internal_key(),
         inventory_binding: owned.binding(),
     };
     let encoded = postcard::to_allocvec(&quoted_input).expect("encode quoted input");
@@ -1486,11 +1487,12 @@ fn map_to_client_proposal(request: &LegPreparationRequest, quote: &FirmQuote) ->
         .inputs()
         .iter()
         .map(|input| {
-            InputSpec::new(
+            InputSpec::tree_less_p2tr_sighash_all(
                 InputId::new(u64::from(input.id().value())),
                 input.outpoint(),
                 input.witness_utxo().clone(),
                 InputSequence::Final,
+                input.internal_key(),
             )
         })
         .collect::<Vec<_>>();
