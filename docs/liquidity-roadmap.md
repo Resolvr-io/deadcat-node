@@ -651,11 +651,18 @@ not yet the wallet-bearing end-to-end router proposed here:
   market; maps provider inputs, outputs, and blinder roles into a prepared
   venue leg; retains provider/client/reservation/quote recovery bindings; and
   derives the exact RFQ settlement layout after wallet and other venue
-  contributions have received global positions. Provider-blinded PSETs must
-  cross an explicit caller-owned whole-transaction validator/signing trait
-  before becoming a versioned, self-consistency-checked execution-attempt
-  record; execute borrows that exact retry material and reports every
-  post-dispatch failure as ambiguous. A direct-Iroh test covers the
+  contributions have received global positions. Its keyless whole-PSET
+  coordinator plans from that exact route, RFQ binding, and trading market;
+  requires one coherent caller-supplied market/chain/clock/prevout snapshot;
+  confines provider and wallet mutations to assigned blinding and signing
+  fields; invokes the caller-owned wallet through separate typed blind and sign
+  capabilities; and independently checks canonical encoding, economics,
+  liveness, current market, authoritative prevouts, input policy, disclosures,
+  proofs/balance, owned-output recovery, signatures, and fee/weight limits.
+  Only then can the exact result become a versioned execution attempt armed in
+  the durable client journal. Execute borrows that journaled retry material,
+  performs status-first byte-identical recovery, and verifies provider-signed
+  results. A direct-Iroh test covers the
   quote-to-compose-to-blind/execute/status boundary with nonzero RFQ offsets
   and proves that provider work may finish after a client timeout.
 - The retired
@@ -690,19 +697,18 @@ market evidence, a production pricing source, relay/reconciliation,
 authenticated-owner request-rate limits, external backup freshness,
 process-kill acceptance coverage, host memory hardening, and HSM support remain
 outside the current slice.
-The first taker integration now reaches the safe pre-wallet boundary described
-above. It deliberately does not yet select wallet inputs/change, validate
-authoritative prevouts and the provider-blinded whole PSET, finish balancing
-blinding, sign the taker inputs, verify the provider-signed result, persist and
-drive an ambiguous-execute attempt journal, correlate a client-computable
-attempt digest with durable provider status, or broadcast and monitor the
-transaction. The client crate supplies the opaque trust-transition interfaces
-and serializable attempt record, but no production wallet implementation or
-journal storage.
-The initial profile verifies every non-provider input as a finalized tree-less
-P2TR key-path `SIGHASH_ALL` spend. Simplicity covenant inputs and more than one
-interactive RFQ signer remain later router/venue-verification work; they are
-not accepted merely because they carry a witness.
+The first taker integration now implements the keyless whole-PSET authorization
+and restart-safe execution boundaries after route composition. It still does
+not select wallet inputs/change or supply a production wallet backend, but it
+validates the provider-blinded transaction against authoritative current state
+and prevouts, delegates balancing blinding and user-first signing, verifies the
+wallet-authorized and later provider-signed results, and persists/drives exact
+ambiguous Execute recovery. Broadcast, confirmation monitoring, and production
+wallet integration remain future work.
+The initial profile accepts exactly one RFQ leg plus ordinary tree-less P2TR
+key-path inputs with explicit `SIGHASH_ALL`. Simplicity covenant inputs and more
+than one interactive RFQ signer remain later router/venue-verification work;
+they are not accepted merely because they carry a witness.
 
 The provider database remains disposable preproduction state during this
 work. Its schema and private record-layout versions intentionally stay at `1`;

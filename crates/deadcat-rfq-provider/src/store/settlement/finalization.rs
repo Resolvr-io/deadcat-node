@@ -3,6 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 
+use deadcat_liquid_settlement::{
+    CanonicalPset, CanonicalPsetError, verify_confidential_proofs_and_balance,
+};
 use elements::encode::{deserialize, serialize};
 use elements::pset::PartiallySignedTransaction;
 use elements::secp256k1_zkp::Secp256k1;
@@ -259,11 +262,17 @@ impl PreparedSigningPset {
                 actual: signed_bytes.len(),
             });
         }
-        let reparsed = deserialize::<PartiallySignedTransaction>(&signed_bytes)
-            .map_err(|error| SigningFinalizationError::InvalidFinalizedPset(error.to_string()))?;
-        if serialize(&reparsed) != signed_bytes {
-            return Err(SigningFinalizationError::NonCanonicalFinalizedPset);
-        }
+        let reparsed = CanonicalPset::decode(&signed_bytes, MAX_SETTLEMENT_BYTES)
+            .map_err(|error| match error {
+                CanonicalPsetError::InvalidPset(detail) => {
+                    SigningFinalizationError::InvalidFinalizedPset(detail)
+                }
+                CanonicalPsetError::NonCanonicalEncoding => {
+                    SigningFinalizationError::NonCanonicalFinalizedPset
+                }
+                other => SigningFinalizationError::InvalidFinalizedPset(other.to_string()),
+            })?
+            .into_pset();
 
         let mut normalized = reparsed.clone();
         for (index, _) in &verified {
@@ -284,9 +293,9 @@ impl PreparedSigningPset {
             &self.prevouts,
             identity.genesis_hash(),
         )?;
-        finalized_transaction
-            .verify_tx_amt_proofs(&Secp256k1::new(), &self.prevouts)
-            .map_err(|error| SigningFinalizationError::ConfidentialProofs(error.to_string()))?;
+        verify_confidential_proofs_and_balance(&finalized_transaction, &self.prevouts).map_err(
+            |error| SigningFinalizationError::ConfidentialProofs(error.detail().to_owned()),
+        )?;
         let actual_fee = TransactionFee::new(
             job.fee().policy_asset(),
             finalized_transaction.fee_in(job.fee().policy_asset()),

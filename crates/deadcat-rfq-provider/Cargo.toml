@@ -9,6 +9,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+deadcat-liquid-settlement.workspace = true
 deadcat-types.workspace = true
 elements.workspace = true
 postcard.workspace = true

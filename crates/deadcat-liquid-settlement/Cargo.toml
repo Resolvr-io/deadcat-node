@@ -1,0 +1,13 @@
+[package]
+name = "deadcat-liquid-settlement"
+description = "Shared cryptographic validation primitives for Deadcat Liquid settlements."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+elements.workspace = true
+thiserror.workspace = true

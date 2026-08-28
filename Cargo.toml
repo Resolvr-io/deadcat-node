@@ -14,6 +14,7 @@ members = [
     "crates/deadcat-rfq-rpc",
     "crates/deadcat-rfq-wallet",
     "crates/deadcat-rfq",
+    "crates/deadcat-liquid-settlement",
 ]
 
 [workspace.package]
@@ -61,6 +62,7 @@ deadcat-rfq-iroh = { path = "crates/deadcat-rfq-iroh" }
 deadcat-rfq-rpc = { path = "crates/deadcat-rfq-rpc" }
 deadcat-rfq-wallet = { path = "crates/deadcat-rfq-wallet" }
 deadcat-rfq = { path = "crates/deadcat-rfq" }
+deadcat-liquid-settlement = { path = "crates/deadcat-liquid-settlement" }
 
 # The CLI and Rust libraries must remain on the exact same smplx release.
 # smplx 0.0.9 caps simplicityhl at 0.6.x; Cargo.lock pins the newest

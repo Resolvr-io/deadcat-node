@@ -165,11 +165,6 @@ impl FixtureWallet {
         }
     }
 
-    pub(super) fn configure_input(&self, input: &mut PsetInput) {
-        input.sighash_type = Some(SchnorrSighashType::All.into());
-        input.tap_internal_key = Some(self.internal_key);
-    }
-
     pub(super) fn sign_input(
         &self,
         pset: &mut PartiallySignedTransaction,
@@ -683,17 +678,19 @@ impl SettlementFixture {
             .expect("validated route");
         let wallet_contribution = TransactionContribution::new(
             vec![
-                InputSpec::new(
+                InputSpec::tree_less_p2tr_sighash_all(
                     WALLET_FEE_INPUT_ID,
                     fee_input.outpoint,
                     fee_input.txout.clone(),
                     InputSequence::Final,
+                    taker_wallet.internal_key,
                 ),
-                InputSpec::new(
+                InputSpec::tree_less_p2tr_sighash_all(
                     WALLET_PAYMENT_INPUT_ID,
                     payment_input.outpoint,
                     payment_input.txout.clone(),
                     InputSequence::Final,
+                    taker_wallet.internal_key,
                 ),
             ],
             vec![
@@ -765,15 +762,9 @@ impl SettlementFixture {
             fee_output: composed.layout().fee_output_index(),
         };
         let (mut pset, _, manifest) = composed.into_parts();
-        taker_wallet.configure_input(&mut pset.inputs_mut()[layout.taker_fee_input]);
-        taker_wallet.configure_input(&mut pset.inputs_mut()[layout.taker_payment_input]);
-        for input in quote.contribution().inputs() {
-            let index = layout.provider_input(input.id());
-            provider_inventory_wallet.configure_input(&mut pset.inputs_mut()[index]);
-        }
         manifest
             .validate(&pset)
-            .expect("configured PSET preserves manifest");
+            .expect("composed signing profiles preserve the manifest");
         let unblinded_pset = pset.clone();
 
         let mut provider_secrets = HashMap::new();
@@ -1205,11 +1196,12 @@ fn client_proposal(request: &LegPreparationRequest, quote: &FirmQuote) -> Propos
         .inputs()
         .iter()
         .map(|input| {
-            InputSpec::new(
+            InputSpec::tree_less_p2tr_sighash_all(
                 InputId::new(u64::from(input.id().value())),
                 input.outpoint(),
                 input.witness_utxo().clone(),
                 InputSequence::Final,
+                input.internal_key(),
             )
         })
         .collect();

@@ -4,7 +4,7 @@ use deadcat_types::{ContractId, LiquidNetwork, serde_u64_string};
 use elements::encode::{deserialize, serialize};
 use elements::hashes::Hash as _;
 use elements::pset::PartiallySignedTransaction;
-use elements::secp256k1_zkp::{PublicKey, RangeProof, SurjectionProof};
+use elements::secp256k1_zkp::{PublicKey, RangeProof, SurjectionProof, XOnlyPublicKey};
 use elements::{AssetId, BlockHash, OutPoint, Script, TxOut, TxOutWitness};
 use iroh::{EndpointId, SecretKey, Signature};
 use serde::de::Error as _;
@@ -258,6 +258,7 @@ pub struct QuoteInputDto {
     pub id: u16,
     pub outpoint: OutPoint,
     pub witness_utxo: TxOutDto,
+    pub internal_key: FixedBytes32,
     pub inventory_binding: FixedBytes32,
 }
 
@@ -465,6 +466,17 @@ impl FirmQuoteDto {
                     asset_generator,
                 )
                 .map_err(|_| FirmQuoteValidationError::InvalidProviderRangeproof)?;
+            let internal_key = XOnlyPublicKey::from_slice(&input.internal_key.to_bytes())
+                .map_err(|_| FirmQuoteValidationError::InvalidProviderInternalKey)?;
+            if prevout.script_pubkey
+                != Script::new_v1_p2tr(
+                    &elements::secp256k1_zkp::Secp256k1::new(),
+                    internal_key,
+                    None,
+                )
+            {
+                return Err(FirmQuoteValidationError::ProviderInternalKeyMismatch);
+            }
         }
         let mut output_ids = BTreeSet::new();
         let mut provider_payment = 0;
@@ -952,6 +964,7 @@ fn canonical_quote(quote: &FirmQuoteDto) -> Result<CanonicalFirmQuoteV1, Attesta
         writer.bytes(&input.witness_utxo.base)?;
         writer.option_bytes(input.witness_utxo.surjection_proof.as_deref())?;
         writer.option_bytes(input.witness_utxo.rangeproof.as_deref())?;
+        writer.fixed(&input.internal_key.to_bytes());
         writer.fixed(&input.inventory_binding.to_bytes());
     }
     writer
@@ -1249,6 +1262,10 @@ pub enum FirmQuoteValidationError {
     MissingProviderRangeproof,
     #[error("provider prevout must use a v1 P2TR script")]
     NonP2trProviderPrevout,
+    #[error("provider input contains an invalid Taproot internal key")]
+    InvalidProviderInternalKey,
+    #[error("provider Taproot internal key does not match its tree-less P2TR prevout script")]
+    ProviderInternalKeyMismatch,
     #[error("provider prevout rangeproof does not verify against its commitments and script")]
     InvalidProviderRangeproof,
     #[error("invalid settlement layout size")]
@@ -1323,18 +1340,22 @@ mod tests {
         }
     }
 
-    fn confidential_p2tr_txout(asset: AssetId, amount: u64) -> TxOut {
+    fn provider_internal_key() -> XOnlyPublicKey {
         let secp = Secp256k1::new();
         let spend_secret = SecpSecretKey::from_slice(&[101; 32]).expect("spend secret");
         let spend_keypair = Keypair::from_secret_key(&secp, &spend_secret);
-        let (internal_key, _) = spend_keypair.x_only_public_key();
+        spend_keypair.x_only_public_key().0
+    }
+
+    fn confidential_p2tr_txout(asset: AssetId, amount: u64) -> TxOut {
+        let secp = Secp256k1::new();
         let blinding_secret = SecpSecretKey::from_slice(&[102; 32]).expect("blinding secret");
         let blinding_public_key = PublicKey::from_secret_key(&secp, &blinding_secret);
         let explicit = TxOut {
             asset: Asset::Explicit(asset),
             value: Value::Explicit(amount),
             nonce: Nonce::Null,
-            script_pubkey: Script::new_v1_p2tr(&secp, internal_key, None),
+            script_pubkey: Script::new_v1_p2tr(&secp, provider_internal_key(), None),
             witness: TxOutWitness::empty(),
         };
         let mut rng = StdRng::from_seed([103; 32]);
@@ -1416,6 +1437,7 @@ mod tests {
                 id: 1,
                 outpoint: outpoint(11, 0),
                 witness_utxo: TxOutDto::from_txout(&confidential_p2tr_txout(output_asset, 200)),
+                internal_key: FixedBytes32::new(provider_internal_key().serialize()),
                 inventory_binding: FixedBytes32::new([12; 32]),
             }],
             outputs: vec![
@@ -1474,7 +1496,7 @@ mod tests {
         .expect("sign");
         assert_eq!(
             hex::encode(signed.attestation.signature.to_bytes()),
-            "9f7255b6022ba758f6fd90038b4d0f7fadff6aa3de8dd26decc990650f51883ba55033bf383ca08d97115290fe3aef2fcc6a6de09f760534458a38ce8b00750f"
+            "3ea5deca70be9fd24d4482803fddde0e3eb3046681beb79703cb4f4b760713b0d7de2aecda7dc6be7e9d1cb75c12b8bf11045666e4abfe7d118b10cc232e2701"
         );
         assert!(
             signed
@@ -1805,6 +1827,18 @@ mod tests {
         assert_eq!(
             non_p2tr.validate_structure().expect_err("non-P2TR"),
             FirmQuoteValidationError::NonP2trProviderPrevout
+        );
+
+        let mut mismatched_internal_key = valid.clone();
+        let replacement_secret = SecpSecretKey::from_slice(&[104; 32]).expect("replacement key");
+        let replacement_pair = Keypair::from_secret_key(&Secp256k1::new(), &replacement_secret);
+        mismatched_internal_key.inputs[0].internal_key =
+            FixedBytes32::new(replacement_pair.x_only_public_key().0.serialize());
+        assert_eq!(
+            mismatched_internal_key
+                .validate_structure()
+                .expect_err("script/key mismatch"),
+            FirmQuoteValidationError::ProviderInternalKeyMismatch
         );
 
         let mut wrong_p2tr = valid;

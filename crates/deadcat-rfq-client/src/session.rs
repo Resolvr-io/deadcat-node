@@ -8,25 +8,134 @@ use deadcat_rfq_iroh::{Client, ClientConfig, ClientError};
 use deadcat_rfq_rpc::{
     AttestationError, FirmQuoteDto, FirmQuoteRequestDto, FirmQuoteValidationError, FixedBytes32,
     IdempotencyKeyDto, LiveFirmQuote, ProviderCapability, ProviderInfo, Request, RequestEnvelope,
-    RequestId, ReservationIdDto, ReservationStatusDto, Response, SettlementLayoutDto,
-    SettlementPset, SignedFirmQuote, VerifiedFirmQuote,
+    RequestId, ReservationIdDto, ReservationStateDto, ReservationStatusDto, Response,
+    SettlementLayoutDto, SettlementPset, SignedFirmQuote, VerifiedFirmQuote,
 };
 use deadcat_types::ChainIdentity;
 use elements::AssetId;
 use iroh::{EndpointAddr, EndpointId, SecretKey};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+use crate::journal::{ExecutionJournalRecordError, JournaledExecution};
 use crate::settlement::{
     ExecutionAttempt, ExecutionAttemptDigest, ExecutionAttemptError, ProviderBlindedPset,
 };
 
 const STARTUP_REQUEST_ID: u64 = 1;
+pub const QUOTE_RECOVERY_RECORD_VERSION: u32 = 1;
+const QUOTE_RECOVERY_RECORD_DOMAIN: &[u8] = b"deadcat/rfq/client-quote-recovery/v1";
 const REQUIRED_CAPABILITIES: [ProviderCapability; 4] = [
     ProviderCapability::FirmQuotes,
     ProviderCapability::ProviderBlinding,
     ProviderCapability::SettlementExecution,
     ProviderCapability::DurableStatus,
 ];
+
+/// Serializable evidence needed to reauthenticate a firm quote after restart.
+///
+/// `received_at_millis` is the trusted first receipt observation. Recovery
+/// deliberately reuses it instead of sampling a new time, so restarting cannot
+/// relax the client's quote-clock policy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuoteRecoveryRecord {
+    version: u32,
+    signed_quote: SignedFirmQuote,
+    request: FirmQuoteRequestDto,
+    idempotency_key: IdempotencyKeyDto,
+    received_at_millis: u64,
+    digest: FixedBytes32,
+}
+
+impl QuoteRecoveryRecord {
+    #[must_use]
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+
+    #[must_use]
+    pub const fn signed_quote(&self) -> &SignedFirmQuote {
+        &self.signed_quote
+    }
+
+    #[must_use]
+    pub const fn request(&self) -> &FirmQuoteRequestDto {
+        &self.request
+    }
+
+    #[must_use]
+    pub const fn idempotency_key(&self) -> IdempotencyKeyDto {
+        self.idempotency_key
+    }
+
+    #[must_use]
+    pub const fn received_at_millis(&self) -> u64 {
+        self.received_at_millis
+    }
+
+    #[must_use]
+    pub const fn digest(&self) -> FixedBytes32 {
+        self.digest
+    }
+
+    fn new(
+        signed_quote: SignedFirmQuote,
+        request: FirmQuoteRequestDto,
+        idempotency_key: IdempotencyKeyDto,
+        received_at_millis: u64,
+    ) -> Result<Self, SessionError> {
+        let mut record = Self {
+            version: QUOTE_RECOVERY_RECORD_VERSION,
+            signed_quote,
+            request,
+            idempotency_key,
+            received_at_millis,
+            digest: FixedBytes32::new([0; 32]),
+        };
+        record.digest = quote_recovery_digest(&record)?;
+        Ok(record)
+    }
+
+    pub(crate) fn validate_integrity(&self) -> Result<(), SessionError> {
+        if self.version != QUOTE_RECOVERY_RECORD_VERSION {
+            return Err(SessionError::UnsupportedQuoteRecoveryRecordVersion {
+                actual: self.version,
+            });
+        }
+        if self.digest != quote_recovery_digest(self)? {
+            return Err(SessionError::QuoteRecoveryRecordDigestMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct QuoteRecoveryDigestInput<'a> {
+    version: u32,
+    signed_quote: &'a SignedFirmQuote,
+    request: &'a FirmQuoteRequestDto,
+    idempotency_key: IdempotencyKeyDto,
+    received_at_millis: u64,
+}
+
+fn quote_recovery_digest(record: &QuoteRecoveryRecord) -> Result<FixedBytes32, SessionError> {
+    let input = QuoteRecoveryDigestInput {
+        version: record.version,
+        signed_quote: &record.signed_quote,
+        request: &record.request,
+        idempotency_key: record.idempotency_key,
+        received_at_millis: record.received_at_millis,
+    };
+    let encoded =
+        postcard::to_allocvec(&input).map_err(SessionError::QuoteRecoveryRecordEncoding)?;
+    let mut digest = Sha256::new();
+    digest.update(QUOTE_RECOVERY_RECORD_DOMAIN);
+    digest.update((encoded.len() as u64).to_be_bytes());
+    digest.update(encoded);
+    Ok(FixedBytes32::new(digest.finalize().into()))
+}
 
 /// Pinned provider address and the chain context expected from that provider.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -318,7 +427,17 @@ impl AuthenticatedQuote {
             received_at_millis: self.received_at_millis,
             clock_policy_rejection: self.clock_policy_rejection,
             trusted_time: TrustedTime::new(self.received_at_millis.unwrap_or(0)),
+            recovery_only: false,
         })
+    }
+
+    fn into_recovery_replay(
+        self,
+        status: ReservationStatusDto,
+    ) -> Result<QuoteReplay, SessionError> {
+        let mut replay = self.into_replay(status)?;
+        replay.recovery_only = true;
+        Ok(replay)
     }
 }
 
@@ -361,6 +480,7 @@ pub struct QuoteReplay {
     received_at_millis: Option<u64>,
     clock_policy_rejection: Option<QuoteClockPolicyRejection>,
     trusted_time: TrustedTime,
+    recovery_only: bool,
 }
 
 impl QuoteReplay {
@@ -385,6 +505,23 @@ impl QuoteReplay {
         self.received_at_millis
     }
 
+    /// Snapshot the complete authenticated quote recovery artifact.
+    ///
+    /// Quotes received without a trusted first-receipt observation remain
+    /// useful as in-process authenticity evidence, but cannot produce a
+    /// restart record whose clock policy can be replayed faithfully.
+    pub fn to_recovery_record(&self) -> Result<QuoteRecoveryRecord, SessionError> {
+        let received_at_millis = self
+            .received_at_millis
+            .ok_or(SessionError::TrustedClockUnavailable)?;
+        QuoteRecoveryRecord::new(
+            self.quote.signed().clone(),
+            self.quote.quote().request.clone(),
+            self.quote.signed().attestation.idempotency_key,
+            received_at_millis,
+        )
+    }
+
     /// Reapply the local lifetime and provider-clock policy recorded when this
     /// quote was authenticated.
     ///
@@ -402,6 +539,9 @@ impl QuoteReplay {
     /// The replay is borrowed, so an expiry error preserves the handle needed
     /// to poll durable status after a request or response timeout.
     pub fn live_at(&self, now_millis: u64) -> Result<LiveQuoteReservation, SessionError> {
+        if self.recovery_only {
+            return Err(SessionError::PersistedQuoteRecoveryOnly);
+        }
         self.validate_clock_policy()?;
         self.trusted_time.observe(now_millis)?;
         if !matches!(
@@ -657,15 +797,36 @@ impl RfqSession {
         request: &FirmQuoteRequestDto,
         received_at_millis: u64,
     ) -> Result<QuoteReplay, SessionError> {
-        self.validate_request_context(request)?;
-        let authenticated = self.authenticate_signed_quote(
+        let record = QuoteRecoveryRecord::new(
             signed_quote.clone(),
+            request.clone(),
             idempotency_key,
-            request,
-            Some(received_at_millis),
+            received_at_millis,
+        )?;
+        self.recover_quote(&record).await
+    }
+
+    /// Reauthenticate a self-contained quote record and fetch durable status.
+    ///
+    /// Status is fetched before this returns. The returned replay is
+    /// deliberately recovery-only and can never be promoted to new settlement
+    /// authority, even if restart configuration is looser or the in-memory
+    /// trusted-time high-water mark was lost. Ambiguous execution recovery uses
+    /// [`Self::retry_armed_execution`] to replay only the journaled bytes.
+    pub async fn recover_quote(
+        &self,
+        record: &QuoteRecoveryRecord,
+    ) -> Result<QuoteReplay, SessionError> {
+        record.validate_integrity()?;
+        self.validate_request_context(&record.request)?;
+        let authenticated = self.authenticate_signed_quote(
+            record.signed_quote.clone(),
+            record.idempotency_key,
+            &record.request,
+            Some(record.received_at_millis),
         )?;
         let status = self.status(&authenticated.handle).await?;
-        authenticated.into_replay(status)
+        authenticated.into_recovery_replay(status)
     }
 
     /// Cancel a reservation and validate the complete returned binding.
@@ -723,29 +884,35 @@ impl RfqSession {
         ))
     }
 
-    /// Submit an exact, journalable taker-authorized attempt for provider
+    /// Submit an exact, durably armed taker-authorized attempt for provider
     /// validation and signing.
     ///
-    /// Persist [`ExecutionAttempt::to_record`] before calling this method. The
-    /// attempt is borrowed so every failure preserves the exact retry bytes.
-    /// Once dispatch begins, any error is conservatively ambiguous: the daemon
-    /// may already have queued or durably committed the attempt. Do not build a
-    /// different attempt for the same reservation after
-    /// [`ExecuteError::SubmissionUncertain`]. Poll status and retry only this
-    /// exact attempt until a terminal release or matching future protocol
-    /// commitment resolves the ambiguity.
+    /// The journal capability type-enforces durable write-before-dispatch. Once
+    /// dispatch begins, any error is conservatively ambiguous: the daemon may
+    /// already have queued or durably committed the attempt. Poll status and
+    /// retry only the exact journaled bytes until durable status resolves the
+    /// ambiguity.
     pub async fn execute_at(
         &self,
         reservation: &LiveQuoteReservation,
         settlement: &ResolvedRfqSettlement,
-        attempt: &ExecutionAttempt,
+        journaled: &JournaledExecution,
         now_millis: u64,
     ) -> Result<ReservationStatusDto, ExecuteError> {
         self.validate_handle_context(&reservation.handle)
             .map_err(ExecuteError::BeforeSubmission)?;
         validate_settlement_binding(&reservation.handle, settlement)
             .map_err(ExecuteError::BeforeSubmission)?;
-        attempt
+        journaled
+            .validate_handle(&reservation.handle)
+            .map_err(SessionError::InvalidExecutionAttempt)
+            .map_err(ExecuteError::BeforeSubmission)?;
+        journaled
+            .validate_dispatchable()
+            .map_err(SessionError::InvalidExecutionJournal)
+            .map_err(ExecuteError::BeforeSubmission)?;
+        journaled
+            .attempt()
             .validate_for_settlement(settlement)
             .map_err(SessionError::InvalidExecutionAttempt)
             .map_err(ExecuteError::BeforeSubmission)?;
@@ -756,6 +923,65 @@ impl RfqSession {
             .map_err(SessionError::InvalidSettlementLayout)
             .map_err(ExecuteError::BeforeSubmission)?;
 
+        let status = self
+            .dispatch_execution(&reservation.handle, journaled.attempt())
+            .await?;
+        journaled
+            .validate_next_status(&status)
+            .map_err(SessionError::InvalidExecutionJournal)
+            .map_err(|source| ExecuteError::SubmissionUncertain {
+                attempt: journaled.attempt().digest(),
+                source,
+            })?;
+        Ok(status)
+    }
+
+    /// Recover status and, only while it is still reserved, replay one exact
+    /// durably armed execution attempt.
+    ///
+    /// This is the only execute path that intentionally skips a local quote
+    /// expiry check. The journal capability proves the exact bytes were armed
+    /// before dispatch could begin; after an ambiguous outcome the provider's
+    /// durable state is authoritative. No new settlement may be constructed
+    /// through this method after expiry.
+    pub async fn retry_armed_execution(
+        &self,
+        journaled: &JournaledExecution,
+    ) -> Result<ReservationStatusDto, ExecuteError> {
+        let uncertain = |source| ExecuteError::SubmissionUncertain {
+            attempt: journaled.attempt().digest(),
+            source,
+        };
+        let replay = self
+            .recover_quote(journaled.quote())
+            .await
+            .map_err(uncertain)?;
+        journaled
+            .validate_handle(&replay.handle)
+            .map_err(SessionError::InvalidExecutionAttempt)
+            .map_err(uncertain)?;
+        journaled
+            .validate_next_status(&replay.status)
+            .map_err(SessionError::InvalidExecutionJournal)
+            .map_err(uncertain)?;
+        if !matches!(replay.status.state, ReservationStateDto::Reserved) {
+            return Ok(replay.status);
+        }
+        let status = self
+            .dispatch_execution(&replay.handle, journaled.attempt())
+            .await?;
+        journaled
+            .validate_next_status(&status)
+            .map_err(SessionError::InvalidExecutionJournal)
+            .map_err(uncertain)?;
+        Ok(status)
+    }
+
+    async fn dispatch_execution(
+        &self,
+        handle: &ReservationHandle,
+        attempt: &ExecutionAttempt,
+    ) -> Result<ReservationStatusDto, ExecuteError> {
         let request_id = self
             .request_ids
             .next()
@@ -765,7 +991,7 @@ impl RfqSession {
             .call(RequestEnvelope::new(
                 request_id,
                 Request::Execute {
-                    reservation_id: reservation.handle.reservation_id,
+                    reservation_id: handle.reservation_id,
                     layout: attempt.layout().clone(),
                     pset: attempt.pset().clone(),
                 },
@@ -781,8 +1007,7 @@ impl RfqSession {
                 source: SessionError::UnexpectedResponse("settlement execution"),
             });
         };
-        reservation
-            .handle
+        handle
             .validate_status(&status)
             .map_err(|source| ExecuteError::SubmissionUncertain {
                 attempt: attempt.digest(),
@@ -1059,6 +1284,12 @@ pub enum SessionError {
     RequestContextMismatch,
     #[error("trusted wall-clock time was unavailable after receiving the firm quote")]
     TrustedClockUnavailable,
+    #[error("unsupported quote-recovery record version {actual}")]
+    UnsupportedQuoteRecoveryRecordVersion { actual: u32 },
+    #[error("quote-recovery record digest does not match its contents")]
+    QuoteRecoveryRecordDigestMismatch,
+    #[error("quote-recovery record encoding failed: {0}")]
+    QuoteRecoveryRecordEncoding(#[source] postcard::Error),
     #[error("firm quote has an invalid time interval")]
     InvalidQuoteTimeline,
     #[error("firm quote lifetime {actual_millis}ms exceeds configured maximum {maximum_millis}ms")]
@@ -1078,6 +1309,8 @@ pub enum SessionError {
     InvalidReservationStatus(#[source] FirmQuoteValidationError),
     #[error("reservation replay is not in the reserved state")]
     ReservationNotReserved,
+    #[error("a persisted quote replay is recovery-only and cannot authorize new settlement")]
+    PersistedQuoteRecoveryOnly,
     #[error("trusted RFQ clock moved backwards from {previous_millis} to {now_millis}")]
     ClockMovedBackwards {
         previous_millis: u64,
@@ -1089,6 +1322,8 @@ pub enum SessionError {
     SettlementReservationMismatch,
     #[error("invalid RFQ execution attempt: {0}")]
     InvalidExecutionAttempt(#[source] ExecutionAttemptError),
+    #[error("invalid RFQ execution journal state: {0}")]
+    InvalidExecutionJournal(#[source] ExecutionJournalRecordError),
     #[error("reservation handle belongs to a different provider")]
     HandleProviderMismatch,
     #[error("reservation handle belongs to a different authenticated client")]
@@ -1128,17 +1363,25 @@ mod tests {
 
     use deadcat_rfq_rpc::{
         AssetAmountDto, BlinderRoleDto, FeePolicyDto, FeeSizeMetricDto, FixedBytes33,
-        PricingDecisionDto, QuoteContextDto, QuoteExecutionDto, QuoteInputDto, QuoteKindDto,
-        QuoteOutputDto, QuoteOutputRoleDto, QuoteRecipientDto, RationalRateDto, ReleaseReasonDto,
-        ReservationStateDto, SnapshotEvidenceDto, TxOutDto,
+        InputPlacementDto, OutputPlacementDto, PricingDecisionDto, QuoteContextDto,
+        QuoteExecutionDto, QuoteInputDto, QuoteKindDto, QuoteOutputDto, QuoteOutputRoleDto,
+        QuoteRecipientDto, RationalRateDto, ReleaseReasonDto, ReservationStateDto,
+        SnapshotEvidenceDto, TxOutDto,
     };
     use deadcat_types::{ContractId, LiquidNetwork};
     use elements::confidential::{Asset, AssetBlindingFactor, Nonce, Value, ValueBlindingFactor};
     use elements::hashes::Hash as _;
+    use elements::pset::{Input as PsetInput, Output as PsetOutput, PartiallySignedTransaction};
     use elements::secp256k1_zkp::{Keypair, PublicKey, Secp256k1, SecretKey as SecpSecretKey};
     use elements::{BlockHash, OutPoint, Script, TxOut, TxOutSecrets, TxOutWitness, Txid};
     use rand::SeedableRng as _;
     use rand::rngs::StdRng;
+
+    use crate::journal::{
+        ExecutionJournal as _, ExecutionJournalError, ExecutionJournalRecordError,
+        RedbExecutionJournal,
+    };
+    use crate::settlement::ExecutionBinding;
 
     use super::*;
 
@@ -1280,6 +1523,7 @@ mod tests {
                 id: 1,
                 outpoint: outpoint(0x2e, 0),
                 witness_utxo: TxOutDto::from_txout(&confidential_txout(output_asset, 200)),
+                internal_key: FixedBytes32::new(keypair(0x41).x_only_public_key().0.serialize()),
                 inventory_binding: FixedBytes32::new([0x2f; 32]),
             }],
             outputs: vec![
@@ -1344,6 +1588,55 @@ mod tests {
                 state: ReservationStateDto::Reserved,
             })
             .expect("bound replay")
+    }
+
+    fn execution_attempt(replay: &QuoteReplay, fee: u64) -> ExecutionAttempt {
+        let layout = SettlementLayoutDto {
+            taker_payment_input: 0,
+            provider_inputs: vec![InputPlacementDto {
+                quote_input_id: 1,
+                transaction_index: 1,
+            }],
+            quote_outputs: vec![
+                OutputPlacementDto {
+                    quote_output_id: 1,
+                    transaction_index: 0,
+                },
+                OutputPlacementDto {
+                    quote_output_id: 2,
+                    transaction_index: 1,
+                },
+            ],
+        };
+        let settlement = ResolvedRfqSettlement::new(*replay.handle(), layout.clone());
+        let binding = ExecutionBinding::from_settlement(&settlement);
+        let mut pset = PartiallySignedTransaction::new_v2();
+        let mut taker_input = PsetInput::from_prevout(outpoint(0x51, 0));
+        taker_input.witness_utxo = Some(TxOut {
+            asset: Asset::Explicit(policy_asset()),
+            value: Value::Explicit(fee),
+            nonce: Nonce::Null,
+            script_pubkey: p2tr_script(0x52),
+            witness: TxOutWitness::empty(),
+        });
+        let mut provider_input = PsetInput::from_prevout(outpoint(0x53, 0));
+        provider_input.witness_utxo = Some(confidential_txout(asset(0x23), 200));
+        pset.add_input(taker_input);
+        pset.add_input(provider_input);
+        pset.add_output(PsetOutput::from_txout(TxOut::new_fee(fee, policy_asset())));
+        pset.add_output(PsetOutput::from_txout(TxOut::new_fee(1, asset(0x23))));
+        let pset = SettlementPset::from_pset(&pset).expect("fixture PSET");
+        ExecutionAttempt::new(binding, layout, pset)
+    }
+
+    fn bound_status(replay: &QuoteReplay, state: ReservationStateDto) -> ReservationStatusDto {
+        ReservationStatusDto {
+            reservation_id: replay.handle().reservation_id(),
+            quote_commitment: replay.handle().quote_commitment(),
+            created_at_millis: replay.handle().created_at_millis(),
+            accept_before_millis: replay.handle().accept_before_millis(),
+            state,
+        }
     }
 
     fn handle() -> ReservationHandle {
@@ -1522,6 +1815,213 @@ mod tests {
         assert!(matches!(
             replay.live_at(1_500),
             Err(SessionError::TrustedClockUnavailable)
+        ));
+        assert!(matches!(
+            replay.to_recovery_record(),
+            Err(SessionError::TrustedClockUnavailable)
+        ));
+    }
+
+    #[test]
+    fn quote_recovery_record_preserves_exact_authentication_and_first_receipt() {
+        let replay = replay(Some(1_500));
+        let record = replay.to_recovery_record().expect("recovery record");
+        let encoded = serde_json::to_vec(&record).expect("serialize recovery record");
+        let decoded: QuoteRecoveryRecord =
+            serde_json::from_slice(&encoded).expect("deserialize recovery record");
+
+        assert_eq!(decoded, record);
+        assert_eq!(decoded.version(), QUOTE_RECOVERY_RECORD_VERSION);
+        assert_eq!(decoded.received_at_millis(), 1_500);
+        assert_eq!(decoded.request(), &decoded.signed_quote().quote.request);
+        assert_eq!(
+            decoded.idempotency_key(),
+            decoded.signed_quote().attestation.idempotency_key
+        );
+
+        let mut tampered = serde_json::to_value(&decoded).expect("recovery JSON");
+        tampered["received_at_millis"] = serde_json::json!(1_501);
+        let tampered: QuoteRecoveryRecord =
+            serde_json::from_value(tampered).expect("structural recovery JSON");
+        assert!(matches!(
+            tampered.validate_integrity(),
+            Err(SessionError::QuoteRecoveryRecordDigestMismatch)
+        ));
+    }
+
+    #[test]
+    fn persisted_recovery_cannot_promote_under_a_looser_restart_clock_policy() {
+        let (signed, request, provider_key, client_key, idempotency_key) = signed_quote_fixture();
+        let verified = signed
+            .verify(
+                provider_key.public(),
+                client_key.public(),
+                idempotency_key,
+                &request,
+            )
+            .expect("authentic quote");
+        let handle = ReservationHandle::from_quote(
+            verified.quote(),
+            provider_key.public(),
+            client_key.public(),
+        );
+        let strict = SessionConfig::new(ClientConfig::default(), 100, 1_000).expect("strict");
+        let strict_replay = AuthenticatedQuote::new(verified, handle, &strict, Some(1_500))
+            .into_replay(bound_status(
+                &replay(Some(1_500)),
+                ReservationStateDto::Reserved,
+            ))
+            .expect("authentic rejected replay");
+        assert!(matches!(
+            strict_replay.validate_clock_policy(),
+            Err(SessionError::QuoteLifetimeExceeded { .. })
+        ));
+        let persisted = strict_replay
+            .to_recovery_record()
+            .expect("persist rejected quote evidence");
+
+        let verified = persisted
+            .signed_quote()
+            .clone()
+            .verify(
+                provider_key.public(),
+                client_key.public(),
+                persisted.idempotency_key(),
+                persisted.request(),
+            )
+            .expect("reauthenticate persisted quote");
+        let loose = SessionConfig::new(ClientConfig::default(), 10_000, 1_000).expect("loose");
+        let recovered = AuthenticatedQuote::new(verified, handle, &loose, Some(1_500))
+            .into_recovery_replay(strict_replay.status().clone())
+            .expect("recovery replay");
+        recovered
+            .validate_clock_policy()
+            .expect("looser policy would otherwise accept");
+        assert!(matches!(
+            recovered.live_at(1_500),
+            Err(SessionError::PersistedQuoteRecoveryOnly)
+        ));
+    }
+
+    #[test]
+    fn durable_journal_arms_idempotently_reopens_and_rejects_conflicts_and_tampering() {
+        let replay = replay(Some(1_500));
+        let quote = replay.to_recovery_record().expect("recovery record");
+        let attempt = execution_attempt(&replay, 50);
+        let other_attempt = execution_attempt(&replay, 51);
+        let directory = tempfile::tempdir().expect("journal directory");
+        let path = directory.path().join("executions.redb");
+
+        {
+            let journal = RedbExecutionJournal::open(&path).expect("open journal");
+            let armed = journal.arm(&quote, &attempt).expect("durably arm");
+            assert_eq!(armed.revision(), 0);
+            let same = journal.arm(&quote, &attempt).expect("idempotent arm");
+            assert_eq!(same.to_record(), armed.to_record());
+            assert!(matches!(
+                journal.arm(&quote, &other_attempt),
+                Err(ExecutionJournalError::AttemptConflict)
+            ));
+        }
+
+        let reopened = RedbExecutionJournal::open(&path).expect("reopen journal");
+        let discovered = reopened
+            .list_after(None, 10)
+            .expect("discover journal after restart without an in-memory key");
+        assert_eq!(discovered.len(), 1);
+        let loaded = &discovered[0];
+        assert_eq!(loaded.attempt().digest(), attempt.digest());
+        assert_eq!(loaded.quote().received_at_millis(), 1_500);
+
+        let mut tampered = serde_json::to_value(loaded.to_record()).expect("record JSON");
+        tampered["quote"]["received_at_millis"] = serde_json::json!(1_501);
+        let mut tampered: crate::journal::ExecutionJournalRecord =
+            serde_json::from_value(tampered).expect("structural record JSON");
+        tampered
+            .recompute_digest_for_test()
+            .expect("valid outer digest over tampered inner record");
+        assert!(matches!(
+            tampered.validate(),
+            Err(ExecutionJournalRecordError::InvalidQuoteRecoveryRecord)
+        ));
+
+        let mut other_handle = *replay.handle();
+        other_handle.quote_commitment = FixedBytes32::new([0x77; 32]);
+        let layout = attempt.layout().clone();
+        let other_settlement = ResolvedRfqSettlement::new(other_handle, layout.clone());
+        let cross_wired = ExecutionAttempt::new(
+            ExecutionBinding::from_settlement(&other_settlement),
+            layout,
+            attempt.pset().clone(),
+        );
+        assert!(matches!(
+            reopened.arm(&quote, &cross_wired),
+            Err(ExecutionJournalError::InvalidRecord(
+                ExecutionJournalRecordError::QuoteAttemptBindingMismatch
+            ))
+        ));
+
+        let mut incomplete_layout = attempt.layout().clone();
+        incomplete_layout.quote_outputs.pop();
+        let incomplete_settlement =
+            ResolvedRfqSettlement::new(*replay.handle(), incomplete_layout.clone());
+        let incomplete = ExecutionAttempt::new(
+            ExecutionBinding::from_settlement(&incomplete_settlement),
+            incomplete_layout,
+            attempt.pset().clone(),
+        );
+        assert!(matches!(
+            reopened.arm(&quote, &incomplete),
+            Err(ExecutionJournalError::InvalidRecord(
+                ExecutionJournalRecordError::InvalidLayoutForQuote(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn durable_journal_cas_enforces_monotonic_provider_observations() {
+        let replay = replay(Some(1_500));
+        let quote = replay.to_recovery_record().expect("recovery record");
+        let attempt = execution_attempt(&replay, 50);
+        let directory = tempfile::tempdir().expect("journal directory");
+        let journal = RedbExecutionJournal::open(directory.path().join("executions.redb"))
+            .expect("open journal");
+        let armed = journal.arm(&quote, &attempt).expect("durably arm");
+        let key = armed.key();
+
+        let reserved = bound_status(&replay, ReservationStateDto::Reserved);
+        let observed = journal
+            .observe(key, 0, reserved.clone())
+            .expect("record reserved status");
+        assert_eq!(observed.revision(), 1);
+        let idempotent = journal
+            .observe(key, 1, reserved.clone())
+            .expect("idempotent observation");
+        assert_eq!(idempotent.revision(), 1);
+
+        let committed = bound_status(
+            &replay,
+            ReservationStateDto::Committed {
+                signing_commitment: FixedBytes32::new([0x78; 32]),
+                committed_at_millis: 2_000,
+            },
+        );
+        assert!(matches!(
+            journal.observe(key, 0, committed.clone()),
+            Err(ExecutionJournalError::RevisionConflict {
+                expected: 0,
+                actual: 1
+            })
+        ));
+        let committed = journal
+            .observe(key, 1, committed)
+            .expect("advance to committed");
+        assert_eq!(committed.revision(), 2);
+        assert!(matches!(
+            journal.observe(key, 2, reserved),
+            Err(ExecutionJournalError::InvalidRecord(
+                ExecutionJournalRecordError::StatusRegression
+            ))
         ));
     }
 

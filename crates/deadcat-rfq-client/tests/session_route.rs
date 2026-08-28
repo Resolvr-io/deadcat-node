@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use deadcat_client::composition::{
-    CompositionLimits, InputId, InputSequence, InputSpec, LockTimeConstraint, NetworkFee, OutputId,
-    OutputSpec, TransactionContribution,
+    BlinderRef, CompositionLimits, InputId, InputSequence, InputSpec, LockTimeConstraint,
+    NetworkFee, OutputId, OutputSpec, TransactionContribution,
 };
 use deadcat_client::validation::validate_contract_view;
 use deadcat_client::venue::{
@@ -13,8 +13,9 @@ use deadcat_client::venue::{
 };
 use deadcat_contracts::binary_market::BinaryMarketSlot;
 use deadcat_rfq_client::{
-    ExecuteError, ExecutionBinding, PreparedRfqLeg, ProviderTarget, QuoteBounds, RfqQuoteIntent,
-    RfqSession, SessionConfig, SessionError, TakerSettlementAuthorizer, TradingMarket,
+    ExecuteError, ExecutionBinding, ExecutionJournal as _, PreparedRfqLeg, ProviderTarget,
+    QuoteBounds, RedbExecutionJournal, RfqQuoteIntent, RfqSession, SessionConfig, SessionError,
+    TakerSettlementAuthorizer, TakerSettlementPlan, TradingMarket,
 };
 use deadcat_rfq_iroh::{ClientConfig, DiscoveryMode, RequestHandler, Server, ServerConfig};
 use deadcat_rfq_rpc::{
@@ -33,7 +34,10 @@ use elements::bitcoin::PublicKey as BitcoinPublicKey;
 use elements::confidential::{Asset, AssetBlindingFactor, Nonce, Value, ValueBlindingFactor};
 use elements::hashes::Hash as _;
 use elements::secp256k1_zkp::{Keypair, PublicKey, Secp256k1, SecretKey as SecpSecretKey};
-use elements::{AssetId, BlockHash, OutPoint, Script, TxOut, TxOutSecrets, TxOutWitness, Txid};
+use elements::{
+    AssetId, BlockHash, OutPoint, SchnorrSighashType, Script, TxOut, TxOutSecrets, TxOutWitness,
+    Txid,
+};
 use iroh::{EndpointId, SecretKey};
 use rand::SeedableRng as _;
 use rand::rngs::StdRng;
@@ -229,6 +233,7 @@ fn quote(provider: EndpointId, request: &deadcat_rfq_rpc::FirmQuoteRequestDto) -
             id: 7,
             outpoint: outpoint(0x67, 0),
             witness_utxo: TxOutDto::from_txout(&confidential_p2tr_txout(output_asset, 200)),
+            internal_key: FixedBytes32::new(keypair(0x71).x_only_public_key().0.serialize()),
             inventory_binding: FixedBytes32::new([0x68; 32]),
         }],
         outputs: vec![
@@ -294,6 +299,7 @@ struct ObservedRequests {
     quote_idempotency: Option<IdempotencyKeyDto>,
     blind: Option<(SettlementLayoutDto, SettlementPset)>,
     execute: Option<(SettlementLayoutDto, SettlementPset)>,
+    events: Vec<&'static str>,
 }
 
 struct FixtureHandler {
@@ -302,6 +308,7 @@ struct FixtureHandler {
     policy_asset: AssetId,
     observed: Arc<Mutex<ObservedRequests>>,
     status_calls: AtomicUsize,
+    status_reserved: AtomicBool,
     execute_delay_millis: AtomicUsize,
 }
 
@@ -374,14 +381,27 @@ impl RequestHandler for FixtureHandler {
                 if delay_millis != 0 {
                     tokio::time::sleep(Duration::from_millis(delay_millis as u64)).await;
                 }
-                self.observed.lock().expect("observed request lock").execute = Some((layout, pset));
+                let mut observed = self.observed.lock().expect("observed request lock");
+                observed.events.push("execute");
+                observed.execute = Some((layout, pset));
                 Response::ExecutionAccepted {
                     status: committed_status(),
                 }
             }
             Request::GetReservationStatus { .. } => {
-                let mut returned = committed_status();
-                if self.status_calls.fetch_add(1, Ordering::Relaxed) != 0 {
+                self.observed
+                    .lock()
+                    .expect("observed request lock")
+                    .events
+                    .push("status");
+                let mut returned = if self.status_reserved.load(Ordering::Relaxed) {
+                    status(ReservationStateDto::Reserved)
+                } else {
+                    committed_status()
+                };
+                if !self.status_reserved.load(Ordering::Relaxed)
+                    && self.status_calls.fetch_add(1, Ordering::Relaxed) != 0
+                {
                     // Keep the status structurally valid and reservation-bound
                     // at transport level while violating the quote's immutable
                     // commitment. RfqSession must reject it.
@@ -395,17 +415,20 @@ impl RequestHandler for FixtureHandler {
 
 fn wallet_contribution(policy_asset: AssetId, payer: OutPoint) -> TransactionContribution {
     TransactionContribution::new(
-        vec![InputSpec::new(
+        vec![InputSpec::tree_less_p2tr_sighash_all(
             InputId::new(1),
             payer,
             explicit_txout(policy_asset, 200, 0x81),
             InputSequence::Final,
+            keypair(0x81).x_only_public_key().0,
         )],
-        vec![OutputSpec::explicit(
+        vec![OutputSpec::confidential(
             OutputId::new(1),
             policy_asset,
             90,
             p2tr_script(0x82),
+            BitcoinPublicKey::new(blinding_public_key(0x83)),
+            BlinderRef::Local(InputId::new(1)),
         )],
         LockTimeConstraint::Unconstrained,
     )
@@ -426,6 +449,7 @@ async fn authenticated_session_prepares_composes_and_executes_an_exact_rfq_route
         policy_asset,
         observed: Arc::clone(&observed),
         status_calls: AtomicUsize::new(0),
+        status_reserved: AtomicBool::new(false),
         execute_delay_millis: AtomicUsize::new(0),
     });
     let server = Server::bind(
@@ -557,6 +581,15 @@ async fn authenticated_session_prepares_composes_and_executes_an_exact_rfq_route
         ),
         outpoint(0x67, 0)
     );
+    assert_eq!(
+        composed_pset.inputs()[1].tap_internal_key,
+        Some(keypair(0x71).x_only_public_key().0)
+    );
+    assert_eq!(
+        composed_pset.inputs()[1].sighash_type,
+        Some(SchnorrSighashType::All.into())
+    );
+    assert!(composed_pset.inputs()[1].tap_merkle_root.is_none());
     let payment = &composed_pset.outputs()[1];
     assert_eq!(payment.asset, Some(policy_asset));
     assert_eq!(payment.amount, Some(100));
@@ -588,6 +621,8 @@ async fn authenticated_session_prepares_composes_and_executes_an_exact_rfq_route
             .minimum_absolute_fee,
         10
     );
+    TakerSettlementPlan::new(&route, &binding)
+        .expect("production plan constructor binds the route, RFQ, and exact intent market");
 
     let pset = SettlementPset::from_pset(composed_pset).expect("composed PSET");
     assert!(matches!(
@@ -613,8 +648,17 @@ async fn authenticated_session_prepares_composes_and_executes_an_exact_rfq_route
         .authorize_with(&EchoTestAuthorizer)
         .expect("infallible test-only authorization seam");
     let attempt = authorized.into_execution_attempt();
+    let journal_directory = tempfile::tempdir().expect("execution journal directory");
+    let journal = RedbExecutionJournal::open(journal_directory.path().join("executions.redb"))
+        .expect("durable execution journal");
+    let recovery = replay
+        .to_recovery_record()
+        .expect("self-contained quote recovery record");
+    let journaled = journal
+        .arm(&recovery, &attempt)
+        .expect("attempt durably armed before Execute");
     let executed = session
-        .execute_at(&live, &settlement, &attempt, 1_700)
+        .execute_at(&live, &settlement, &journaled, 1_700)
         .await
         .expect("typed provider execute request");
     assert!(matches!(
@@ -701,7 +745,7 @@ async fn authenticated_session_prepares_composes_and_executes_an_exact_rfq_route
         .expect("fresh authenticated replay for timeout test");
     let ambiguous_live = ambiguous_replay.live_at(1_500).expect("live timeout quote");
     let error = ambiguous_session
-        .execute_at(&ambiguous_live, &settlement, &attempt, 1_700)
+        .execute_at(&ambiguous_live, &settlement, &journaled, 1_700)
         .await
         .expect_err("execute response must time out");
     assert!(matches!(
@@ -722,6 +766,53 @@ async fn authenticated_session_prepares_composes_and_executes_an_exact_rfq_route
         Some(attempt.pset()),
         "provider work may complete after the client timeout"
     );
+
+    let events_before_invalid_recovery =
+        observed.lock().expect("observed request lock").events.len();
+    let recovery_error = ambiguous_session
+        .retry_armed_execution(&journaled)
+        .await
+        .expect_err("invalid durable status keeps an armed outcome uncertain");
+    assert!(matches!(
+        recovery_error,
+        ExecuteError::SubmissionUncertain {
+            attempt: digest,
+            ..
+        } if digest == attempt.digest()
+    ));
+    {
+        let observed = observed.lock().expect("observed request lock");
+        assert_eq!(observed.events.len(), events_before_invalid_recovery + 1);
+        assert_eq!(observed.events.last(), Some(&"status"));
+    }
+
+    // This quote's synthetic 1970 deadline is long past wall-clock time. An
+    // armed recovery nevertheless asks durable status first and, when the
+    // provider still reports Reserved, replays only the exact journaled bytes
+    // without attempting to recreate a route settlement capability.
+    handler.execute_delay_millis.store(0, Ordering::Relaxed);
+    handler.status_reserved.store(true, Ordering::Relaxed);
+    let retried = ambiguous_session
+        .retry_armed_execution(&journaled)
+        .await
+        .expect("status-first exact retry after local expiry");
+    assert!(matches!(
+        retried.state,
+        ReservationStateDto::Committed { .. }
+    ));
+    {
+        let observed = observed.lock().expect("observed request lock");
+        assert_eq!(
+            &observed.events[observed.events.len() - 2..],
+            &["status", "execute"],
+            "recovery must status-check before exact replay"
+        );
+        assert_eq!(
+            observed.execute,
+            Some((layout.clone(), attempt.pset().clone())),
+            "post-expiry recovery must replay byte-identical attempt data"
+        );
+    }
     ambiguous_session.close().await;
     server.shutdown_and_join().await.expect("server shutdown");
 }

@@ -81,15 +81,21 @@ and chain, verifies signed quote authenticity separately from current liveness,
 normalizes exact RFQ intents into venue-neutral legs, retains durable recovery
 bindings, resolves quote-local IDs against the final global route layout, and
 separates provider-blinded PSETs from wallet-authorized, journalable execution
-attempts. Execute transport failures are reported as ambiguous while preserving
-the exact retry payload.
-The wallet-specific taker validator/signing coordinator, coordinated
-provider-state recovery, canonical market-data pricing, immediate provider
-relay/reconciliation, rate limits, and HSM support remain future work.
+attempts. Its keyless whole-PSET coordinator binds the exact route, RFQ, and
+validated market; checks provider-only mutation scope, coherent fresh market
+and chain state, authoritative prevouts, economics, owned-output openings,
+confidential proofs/balance, signatures, and fee/weight policy; then delegates
+balancing blinding and taker signing as two separate caller-wallet capabilities.
+The durable client journal arms exact attempts before Execute, performs
+status-first byte-identical recovery, and verifies the provider-signed result.
+Execute transport failures remain ambiguous until that recovery reconciles
+them. A production taker wallet backend, coordinated provider-state recovery,
+canonical market-data pricing, immediate provider relay/reconciliation, rate
+limits, and HSM support remain future work.
 [ADR 0008](docs/adr/0008-rfq-service-owned-wallet.md) records that boundary.
-This initial validator accepts ordinary finalized tree-less P2TR
-`SIGHASH_ALL` inputs outside the current RFQ leg; Simplicity covenant inputs
-and a second interactive RFQ signer need a later authenticated venue/script
+This initial taker profile accepts exactly one RFQ leg plus ordinary tree-less
+P2TR inputs with explicit `SIGHASH_ALL`. Simplicity covenant inputs and a
+second interactive RFQ signer need a later authenticated venue/script
 verification seam.
 The eventual service must derive market assets from chain-validated canonical
 parameters and add authenticated-owner rate limits plus bounded history

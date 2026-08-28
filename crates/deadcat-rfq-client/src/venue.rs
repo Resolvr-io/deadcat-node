@@ -2,14 +2,14 @@
 //!
 //! The signed quote authenticates provider-supplied prevouts and settlement
 //! policy; it does not prove those prevouts are canonical or still unspent.
-//! Before taker signing, the wallet-facing whole-PSET validator must compare
+//! Before taker signing, the wallet-facing whole-PSET coordinator compares
 //! every prevout with an authoritative chain source; revalidate that the exact
 //! market observation is still canonical, fresh, and trading; enforce the
 //! quote's fee rate/absolute-fee/weight limits; and enforce the v1 provider
-//! profile for every non-provider input (finalized tree-less P2TR with explicit
-//! `SIGHASH_ALL`). This crate intentionally stops before that key-bearing
-//! boundary. A clonable [`TradingMarket`] is preparation evidence, never a
-//! timeless authorization to sign.
+//! profile for every wallet input (tree-less P2TR with explicit `SIGHASH_ALL`).
+//! The actual blind/sign operation remains behind a caller-owned wallet trait.
+//! A clonable [`TradingMarket`] is preparation evidence, never a timeless
+//! authorization to sign.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -31,7 +31,7 @@ use deadcat_rfq_rpc::{
 use deadcat_rpc::{ContractParametersView, ContractStateView};
 use deadcat_types::{BinaryMarketState, ChainAnchor, ChainIdentity, ContractId, ContractSyncState};
 use elements::bitcoin::PublicKey as BitcoinPublicKey;
-use elements::secp256k1_zkp::PublicKey;
+use elements::secp256k1_zkp::{PublicKey, XOnlyPublicKey};
 use elements::{AssetId, OutPoint};
 use thiserror::Error;
 
@@ -112,6 +112,23 @@ impl TradingMarket {
         self.expiry_height
     }
 
+    pub(crate) fn supports_pair(&self, input_asset: AssetId, output_asset: AssetId) -> bool {
+        (input_asset == self.collateral_asset && self.outcome_assets.contains(&output_asset))
+            || (output_asset == self.collateral_asset && self.outcome_assets.contains(&input_asset))
+    }
+
+    pub(crate) fn is_continuation_of(&self, earlier: &Self) -> bool {
+        self.chain == earlier.chain
+            && self.policy_asset == earlier.policy_asset
+            && self.contract_id == earlier.contract_id
+            && self.collateral_asset == earlier.collateral_asset
+            && self.outcome_assets == earlier.outcome_assets
+            && self.expiry_height == earlier.expiry_height
+            && self.observed_at.height >= earlier.observed_at.height
+            && (self.observed_at.height != earlier.observed_at.height
+                || self.observed_at.hash == earlier.observed_at.hash)
+    }
+
     fn authorize_leg(&self, request: &LegPreparationRequest) -> Result<(), RfqVenueError> {
         let context = request.context();
         if context.chain != self.chain
@@ -121,11 +138,7 @@ impl TradingMarket {
             return Err(RfqVenueError::MarketMismatch);
         }
         let (input_asset, output_asset) = leg_pair(request.kind());
-        let launch_pair = (input_asset == self.collateral_asset
-            && self.outcome_assets.contains(&output_asset))
-            || (output_asset == self.collateral_asset
-                && self.outcome_assets.contains(&input_asset));
-        if !launch_pair {
+        if !self.supports_pair(input_asset, output_asset) {
             return Err(RfqVenueError::UnsupportedMarketAsset);
         }
         Ok(())
@@ -280,11 +293,14 @@ impl PreparedRfqLeg {
         for input in &quote.inputs {
             let local_id = InputId::new(u64::from(input.id));
             input_ids.push((input.id, local_id));
-            inputs.push(InputSpec::new(
+            let internal_key = XOnlyPublicKey::from_slice(&input.internal_key.to_bytes())
+                .map_err(|_| RfqVenueError::InvalidProviderInternalKey)?;
+            inputs.push(InputSpec::tree_less_p2tr_sighash_all(
                 local_id,
                 input.outpoint,
                 input.witness_utxo.to_txout()?,
                 InputSequence::Final,
+                internal_key,
             ));
         }
 
@@ -346,6 +362,7 @@ impl PreparedRfqLeg {
             leg: leg.clone(),
             binding: RfqLegBinding {
                 leg_id,
+                market: intent.market.clone(),
                 payer_blinder,
                 prepared_leg: leg,
                 input_ids,
@@ -378,6 +395,7 @@ impl PreparedRfqLeg {
 #[derive(Clone, Debug)]
 pub struct RfqLegBinding {
     leg_id: LegId,
+    market: TradingMarket,
     payer_blinder: OutPoint,
     prepared_leg: PreparedLeg,
     input_ids: Vec<(u16, InputId)>,
@@ -391,6 +409,14 @@ impl RfqLegBinding {
     #[must_use]
     pub const fn leg_id(&self) -> LegId {
         self.leg_id
+    }
+
+    /// Exact validated market capability used to create and authorize this
+    /// quote intent. Final settlement refreshes it, but never substitutes a
+    /// separately supplied same-contract capability.
+    #[must_use]
+    pub const fn market(&self) -> &TradingMarket {
+        &self.market
     }
 
     #[must_use]
@@ -579,6 +605,8 @@ pub enum RfqVenueError {
     QuoteIntentMismatch,
     #[error("the quote contains an invalid recipient blinding key")]
     InvalidBlindingKey,
+    #[error("the quote contains an invalid provider Taproot internal key")]
+    InvalidProviderInternalKey,
     #[error("the quote has no provider-payment output")]
     MissingPaymentOutput,
     #[error("the quote has no taker-receive output")]
