@@ -1035,6 +1035,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "deadcat-rfq-iroh"
+version = "0.1.0-alpha"
+dependencies = [
+ "deadcat-iroh",
+ "deadcat-rfq-rpc",
+ "deadcat-types",
+ "elements",
+ "iroh",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "deadcat-rfq-provider"
 version = "0.1.0-alpha"
 dependencies = [
@@ -1046,6 +1060,22 @@ dependencies = [
  "serde",
  "sha2 0.10.9",
  "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "deadcat-rfq-rpc"
+version = "0.1.0-alpha"
+dependencies = [
+ "deadcat-types",
+ "elements",
+ "hex",
+ "iroh",
+ "postcard",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
 ]
 

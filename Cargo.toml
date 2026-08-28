@@ -9,6 +9,8 @@ members = [
     "crates/deadcat-node",
     "crates/deadcat-cli",
     "crates/deadcat-rfq-provider",
+    "crates/deadcat-rfq-iroh",
+    "crates/deadcat-rfq-rpc",
     "crates/deadcat-rfq-wallet",
     "crates/deadcat-rfq",
 ]
@@ -53,6 +55,8 @@ deadcat-client = { path = "crates/deadcat-client" }
 deadcat-rpc = { path = "crates/deadcat-rpc" }
 deadcat-iroh = { path = "crates/deadcat-iroh" }
 deadcat-rfq-provider = { path = "crates/deadcat-rfq-provider" }
+deadcat-rfq-iroh = { path = "crates/deadcat-rfq-iroh" }
+deadcat-rfq-rpc = { path = "crates/deadcat-rfq-rpc" }
 deadcat-rfq-wallet = { path = "crates/deadcat-rfq-wallet" }
 deadcat-rfq = { path = "crates/deadcat-rfq" }
 

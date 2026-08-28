@@ -268,6 +268,80 @@ fn reservation_is_atomic_idempotent_and_owner_authenticated() {
 }
 
 #[test]
+fn reservation_status_rejects_a_different_owner() {
+    let directory = TempDir::new().expect("tempdir");
+    let identity = identity(83);
+    let book = open_book(&directory, identity);
+    let reservation = reserve_one(&book, identity, inventory(124), owner(1), 1);
+
+    assert!(matches!(
+        book.reservation_status(ReservationAccess::new(reservation.id(), owner(2))),
+        Err(ProviderError::ReservationOwnerMismatch(actual)) if actual == reservation.id()
+    ));
+}
+
+#[test]
+fn reserved_status_has_no_signed_artifact() {
+    let directory = TempDir::new().expect("tempdir");
+    let identity = identity(84);
+    let book = open_book(&directory, identity);
+    let reservation = reserve_one(&book, identity, inventory(125), owner(1), 1);
+
+    let status = book
+        .reservation_status(ReservationAccess::new(
+            reservation.id(),
+            reservation.owner(),
+        ))
+        .expect("authorized reservation status");
+    assert_eq!(status.reservation(), &reservation);
+    assert_eq!(status.reservation().state(), ReservationState::Reserved);
+    assert!(status.signed_artifact().is_none());
+}
+
+#[test]
+fn signed_status_replays_the_exact_durable_artifact() {
+    let directory = TempDir::new().expect("tempdir");
+    let identity = identity(85);
+    let book = open_book(&directory, identity);
+    let reservation = reserve_one(&book, identity, inventory(126), owner(1), 1);
+    let access = ReservationAccess::new(reservation.id(), reservation.owner());
+    let committed = book
+        .commit_before_sign(
+            access,
+            vec![1, 2, 3],
+            transaction_fee(identity, 200),
+            &UnixMillis::new(200),
+        )
+        .expect("commit signing intent");
+    let commitment = committed
+        .signing_job()
+        .expect("new signing job")
+        .commitment();
+    let expected_bytes = vec![9, 8, 7, 6];
+    let recorded = book
+        .record_signed(
+            reservation.id(),
+            commitment,
+            expected_bytes.clone(),
+            &UnixMillis::new(201),
+        )
+        .expect("record signed artifact")
+        .artifact()
+        .clone();
+
+    let status = book
+        .reservation_status(access)
+        .expect("authorized signed status");
+    assert!(matches!(
+        status.reservation().state(),
+        ReservationState::Signed { .. }
+    ));
+    let replayed = status.signed_artifact().expect("signed artifact");
+    assert_eq!(replayed, &recorded);
+    assert_eq!(replayed.bytes(), expected_bytes);
+}
+
+#[test]
 fn changed_request_cannot_reuse_an_idempotency_key() {
     let directory = TempDir::new().expect("tempdir");
     let identity = identity(12);
