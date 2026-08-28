@@ -73,7 +73,9 @@ regtest-process-boundary: generate
 regtest: regtest-market-ab regtest-multi-market regtest-backend-equivalence regtest-rfq-settlement regtest-rfq-wallet-source regtest-process-boundary
 
 wasm-check:
-    NIX_HARDENING_ENABLE=pic cargo check --locked -p deadcat-iroh --lib --target wasm32-unknown-unknown
+    NIX_HARDENING_ENABLE=pic cargo check --locked \
+        -p deadcat-iroh -p deadcat-rfq-rpc -p deadcat-rfq-iroh \
+        --lib --target wasm32-unknown-unknown
 
 ci-checks: fmt-check clippy test wasm-check
 

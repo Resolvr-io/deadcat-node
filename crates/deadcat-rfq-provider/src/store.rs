@@ -775,7 +775,10 @@ impl ReservationBook {
         })
     }
 
-    pub fn reservation(
+    /// Unauthenticated state-machine inspection retained only for internal
+    /// tests. Production callers must use [`Self::reservation_status`].
+    #[cfg(test)]
+    pub(crate) fn reservation(
         &self,
         reservation_id: ReservationId,
     ) -> Result<Option<ReservationView>, ProviderError> {
@@ -797,6 +800,52 @@ impl ReservationBook {
                 record.to_view()
             })
             .transpose()
+    }
+
+    /// Return the authenticated durable status of a reservation, including
+    /// the exact signed bytes once signing has completed.
+    ///
+    /// The artifact is reconstructed exclusively from the provider's durable
+    /// record. A caller cannot use this endpoint to substitute or echo back a
+    /// candidate artifact, and another owner cannot observe the reservation.
+    pub fn reservation_status(
+        &self,
+        access: ReservationAccess,
+    ) -> Result<AuthorizedReservationStatus, ProviderError> {
+        self.ensure_healthy()?;
+        let read = self.database.begin_read()?;
+        let reservations = read.open_table(RESERVATIONS)?;
+        let record = reservations
+            .get(access.reservation_id().to_bytes().as_slice())?
+            .map(|value| decode_record::<StoredReservation>(value.value()))
+            .transpose()?
+            .ok_or(ProviderError::ReservationNotFound(access.reservation_id()))?;
+        if record.id() != access.reservation_id() {
+            return Err(ProviderError::CorruptState(
+                "reservation key and record ID disagree".to_owned(),
+            ));
+        }
+        record.validate()?;
+        if record.owner != access.owner().to_bytes() {
+            return Err(ProviderError::ReservationOwnerMismatch(
+                access.reservation_id(),
+            ));
+        }
+        let signed_artifact = match &record.state {
+            StoredReservationState::Committed { intent } => {
+                ensure_committed_allocations_read(&read, &record, intent.commitment)?;
+                None
+            }
+            StoredReservationState::Signed { intent, artifact } => {
+                ensure_committed_allocations_read(&read, &record, intent.commitment)?;
+                Some(artifact.to_domain(record.id(), SigningCommitment::new(intent.commitment))?)
+            }
+            StoredReservationState::Reserved | StoredReservationState::Released { .. } => None,
+        };
+        Ok(AuthorizedReservationStatus {
+            reservation: record.to_view()?,
+            signed_artifact,
+        })
     }
 
     /// Load the authenticated, durable inputs needed to validate a final
@@ -1772,6 +1821,27 @@ impl CommitOutcome {
 pub struct SignedOutcome {
     artifact: SignedArtifact,
     recorded: bool,
+}
+
+/// Owner-authenticated durable reservation state suitable for status and
+/// replay responses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizedReservationStatus {
+    reservation: ReservationView,
+    signed_artifact: Option<SignedArtifact>,
+}
+
+impl AuthorizedReservationStatus {
+    #[must_use]
+    pub const fn reservation(&self) -> &ReservationView {
+        &self.reservation
+    }
+
+    /// Exact provider-persisted signed bytes, present only in `Signed` state.
+    #[must_use]
+    pub const fn signed_artifact(&self) -> Option<&SignedArtifact> {
+        self.signed_artifact.as_ref()
+    }
 }
 
 impl SignedOutcome {
