@@ -11,9 +11,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Read as _;
 use std::path::PathBuf;
+use std::str::FromStr as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -24,13 +25,14 @@ use deadcat_rfq_provider::{
 };
 use deadcat_rfq_wallet::PersistentWalletError;
 use elements::encode::deserialize;
-use elements::{BlockHash, OutPoint, Script, Transaction, TxOut, Txid};
+use elements::{AssetId, BlockHash, OutPoint, Script, Transaction, TxOut, Txid};
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::{Method, StatusCode, Url};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value as JsonValue, json};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::SharedRfqWallet;
 
@@ -38,6 +40,8 @@ use crate::SharedRfqWallet;
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default timeout for one complete RPC, including a UTXO-set scan.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default wall-clock deadline for one complete startup probe.
+pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default wall-clock deadline for one complete inventory snapshot operation.
 pub const DEFAULT_INVENTORY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Default wall-clock deadline for one complete settlement prevout operation.
@@ -63,6 +67,8 @@ pub const COINBASE_MATURITY_CONFIRMATIONS: u64 = 100;
 
 const MAX_COOKIE_BYTES: usize = 4 * 1024;
 const MAX_BACKEND_ERROR_CHARS: usize = 512;
+const ELEMENTS_REGTEST_CHAIN: &str = "liquidregtest";
+const STARTUP_OPERATION: &str = "startup";
 const INVENTORY_OPERATION: &str = "inventory";
 const SETTLEMENT_OPERATION: &str = "settlement";
 
@@ -99,6 +105,7 @@ pub struct ElementsCoreConfig {
     pub auth: ElementsCoreAuth,
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
+    pub startup_timeout: Duration,
     pub inventory_timeout: Duration,
     pub settlement_timeout: Duration,
     pub max_request_bytes: usize,
@@ -117,6 +124,7 @@ impl ElementsCoreConfig {
             auth,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             inventory_timeout: DEFAULT_INVENTORY_TIMEOUT,
             settlement_timeout: DEFAULT_SETTLEMENT_TIMEOUT,
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
@@ -131,6 +139,7 @@ impl ElementsCoreConfig {
     fn validate(&self) -> Result<Url, ElementsCoreSourceError> {
         if self.connect_timeout.is_zero()
             || self.request_timeout.is_zero()
+            || self.startup_timeout.is_zero()
             || self.inventory_timeout.is_zero()
             || self.settlement_timeout.is_zero()
         {
@@ -139,7 +148,8 @@ impl ElementsCoreConfig {
             ));
         }
         let now = Instant::now();
-        if now.checked_add(self.inventory_timeout).is_none()
+        if now.checked_add(self.startup_timeout).is_none()
+            || now.checked_add(self.inventory_timeout).is_none()
             || now.checked_add(self.settlement_timeout).is_none()
         {
             return Err(ElementsCoreSourceError::InvalidConfiguration(
@@ -204,6 +214,85 @@ impl ElementsCoreConfig {
         }
         Ok(url)
     }
+}
+
+/// Chain identifiers accepted by the regtest-first RFQ daemon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ElementsCoreNetwork {
+    /// An Elements regtest node, reported by Core as `liquidregtest`.
+    ElementsRegtest,
+}
+
+/// Wallet-independent status returned by an Elements Core startup probe.
+///
+/// A successful probe means the RPC endpoint answered within the configured
+/// bounds, identified itself as Elements regtest, was out of initial block
+/// download, reported a tip hash matching `getblockhash` at that height, had a
+/// chain-native pegged asset reported by `getsidechaininfo`, had a built-in
+/// `bitcoin` asset label consistent with that pegged asset, and had a
+/// synchronized transaction index. The caller remains responsible for
+/// comparing the returned genesis hash and pegged asset with the selected
+/// daemon profile and persistent provider state.
+///
+/// Elements Core 23.3.3 defaults its active policy/relay-fee asset to the
+/// pegged asset, but allows `-feeasset` to override it and does not expose the
+/// active setting through RPC. Consequently, this probe validates the pegged
+/// asset and the supported default label profile, but cannot attest the
+/// effective policy asset. The older `-policyasset` spelling is not accepted
+/// by this Core version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ElementsCoreChainStatus {
+    network: ElementsCoreNetwork,
+    genesis_hash: BlockHash,
+    pegged_asset: AssetId,
+    tip_height: u32,
+    tip_hash: BlockHash,
+}
+
+impl ElementsCoreChainStatus {
+    #[must_use]
+    pub const fn network(self) -> ElementsCoreNetwork {
+        self.network
+    }
+
+    #[must_use]
+    pub const fn genesis_hash(self) -> BlockHash {
+        self.genesis_hash
+    }
+
+    /// Return the chain-native pegged asset reported by `getsidechaininfo`.
+    ///
+    /// This is not necessarily Elements Core's effective policy/relay-fee
+    /// asset because `-feeasset` can override that setting and Core 23.3.3
+    /// does not expose the override through RPC.
+    #[must_use]
+    pub const fn pegged_asset(self) -> AssetId {
+        self.pegged_asset
+    }
+
+    #[must_use]
+    pub const fn tip_height(self) -> u32 {
+        self.tip_height
+    }
+
+    #[must_use]
+    pub const fn tip_hash(self) -> BlockHash {
+        self.tip_hash
+    }
+}
+
+/// Probe the configured Elements Core without opening or accessing an RFQ
+/// wallet.
+///
+/// This is intended for daemon initialization and startup validation before
+/// any persistent provider state is opened. It uses the same URL, credential,
+/// request-size, response-size, and timeout machinery as [`ElementsCoreSource`].
+pub fn probe_elements_core(
+    config: &ElementsCoreConfig,
+) -> Result<ElementsCoreChainStatus, ElementsCoreSourceError> {
+    let url = config.validate()?;
+    let transport = HttpRpcTransport::new(config.clone(), url)?;
+    probe_elements_core_with_transport(&transport, config.request_timeout, config.startup_timeout)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -318,6 +407,84 @@ trait RpcTransport: Send + Sync {
     ) -> Result<JsonValue, ElementsCoreSourceError>;
 }
 
+fn call_rpc<T: DeserializeOwned>(
+    rpc: &dyn RpcTransport,
+    request_timeout: Duration,
+    method: &'static str,
+    params: JsonValue,
+    deadline: OperationDeadline,
+) -> Result<T, ElementsCoreSourceError> {
+    deadline.check()?;
+    let value = rpc.call(method, params, deadline.rpc_budget(request_timeout))?;
+    let result = serde_json::from_value(value).map_err(|error| {
+        ElementsCoreSourceError::InvalidRpcResponse(format!("invalid {method} result: {error}"))
+    })?;
+    deadline.check()?;
+    Ok(result)
+}
+
+fn probe_elements_core_with_transport(
+    rpc: &dyn RpcTransport,
+    request_timeout: Duration,
+    startup_timeout: Duration,
+) -> Result<ElementsCoreChainStatus, ElementsCoreSourceError> {
+    let deadline = OperationDeadline::start(STARTUP_OPERATION, startup_timeout)?;
+    let genesis_hash = call_rpc(rpc, request_timeout, "getblockhash", json!([0]), deadline)?;
+    let tip: BlockchainInfo = call_rpc(
+        rpc,
+        request_timeout,
+        "getblockchaininfo",
+        json!([]),
+        deadline,
+    )?;
+    let network = parse_elements_core_network(&tip.chain)?;
+    if tip.initial_block_download {
+        return Err(ElementsCoreSourceError::InitialBlockDownload);
+    }
+    let sidechain_info: JsonValue = call_rpc(
+        rpc,
+        request_timeout,
+        "getsidechaininfo",
+        json!([]),
+        deadline,
+    )?;
+    let pegged_asset = parse_pegged_asset(&sidechain_info)?;
+    let labels: JsonValue = call_rpc(rpc, request_timeout, "dumpassetlabels", json!([]), deadline)?;
+    let bitcoin_label_asset = parse_builtin_bitcoin_asset_label(&labels)?;
+    if bitcoin_label_asset != pegged_asset {
+        return Err(ElementsCoreSourceError::BitcoinAssetLabelMismatch {
+            pegged_asset,
+            label_asset: bitcoin_label_asset,
+        });
+    }
+    let tip_height = u32::try_from(tip.blocks)
+        .map_err(|_| ElementsCoreSourceError::InvalidChainStatus("chain height exceeds u32"))?;
+    let canonical_tip = call_rpc(
+        rpc,
+        request_timeout,
+        "getblockhash",
+        json!([tip_height]),
+        deadline,
+    )?;
+    if canonical_tip != tip.best_block {
+        return Err(ElementsCoreSourceError::InconsistentChainTip {
+            height: tip_height,
+            reported: tip.best_block,
+            actual: canonical_tip,
+        });
+    }
+    let indexes: JsonValue = call_rpc(rpc, request_timeout, "getindexinfo", json!([]), deadline)?;
+    validate_txindex_result(&indexes)?;
+    deadline.check()?;
+    Ok(ElementsCoreChainStatus {
+        network,
+        genesis_hash,
+        pegged_asset,
+        tip_height,
+        tip_hash: tip.best_block,
+    })
+}
+
 struct HttpRpcTransport {
     client: Client,
     url: Url,
@@ -371,7 +538,7 @@ impl HttpRpcTransport {
             }
             ElementsCoreAuth::CookieFile(path) => {
                 let (username, password) = read_cookie(path)?;
-                Ok(request.basic_auth(username, Some(password)))
+                Ok(request.basic_auth(username.as_str(), Some(password.as_str())))
             }
         }
     }
@@ -553,17 +720,13 @@ impl ElementsCoreSource {
         params: JsonValue,
         deadline: OperationDeadline,
     ) -> Result<T, ElementsCoreSourceError> {
-        deadline.check()?;
-        let value = self.inner.rpc.call(
+        call_rpc(
+            self.inner.rpc.as_ref(),
+            self.inner.limits.request_timeout,
             method,
             params,
-            deadline.rpc_budget(self.inner.limits.request_timeout),
-        )?;
-        let result = serde_json::from_value(value).map_err(|error| {
-            ElementsCoreSourceError::InvalidRpcResponse(format!("invalid {method} result: {error}"))
-        })?;
-        deadline.check()?;
-        Ok(result)
+            deadline,
+        )
     }
 
     fn block_hash(
@@ -595,15 +758,7 @@ impl ElementsCoreSource {
 
     fn validate_txindex(&self, deadline: OperationDeadline) -> Result<(), ElementsCoreSourceError> {
         let indexes: JsonValue = self.call("getindexinfo", json!([]), deadline)?;
-        let txindex = indexes
-            .as_object()
-            .and_then(|indexes| indexes.get("txindex"))
-            .and_then(JsonValue::as_object)
-            .ok_or(ElementsCoreSourceError::TxIndexUnavailable)?;
-        if txindex.get("synced").and_then(JsonValue::as_bool) != Some(true) {
-            return Err(ElementsCoreSourceError::TxIndexNotSynced);
-        }
-        Ok(())
+        validate_txindex_result(&indexes)
     }
 
     fn gettxout(
@@ -1004,9 +1159,12 @@ struct ScanResult {
 
 #[derive(Deserialize)]
 struct BlockchainInfo {
+    chain: String,
     blocks: u64,
     #[serde(rename = "bestblockhash")]
     best_block: BlockHash,
+    #[serde(rename = "initialblockdownload")]
+    initial_block_download: bool,
 }
 
 #[derive(Deserialize)]
@@ -1033,6 +1191,56 @@ struct GetTxOutScript {
     hex: String,
 }
 
+fn parse_elements_core_network(
+    chain: &str,
+) -> Result<ElementsCoreNetwork, ElementsCoreSourceError> {
+    if chain == ELEMENTS_REGTEST_CHAIN {
+        Ok(ElementsCoreNetwork::ElementsRegtest)
+    } else {
+        Err(ElementsCoreSourceError::UnsupportedChain {
+            actual: bounded_excerpt(chain),
+        })
+    }
+}
+
+fn parse_pegged_asset(sidechain_info: &JsonValue) -> Result<AssetId, ElementsCoreSourceError> {
+    let sidechain_info = sidechain_info
+        .as_object()
+        .ok_or(ElementsCoreSourceError::InvalidPeggedAsset)?;
+    let encoded = sidechain_info
+        .get("pegged_asset")
+        .ok_or(ElementsCoreSourceError::MissingPeggedAsset)?
+        .as_str()
+        .ok_or(ElementsCoreSourceError::InvalidPeggedAsset)?;
+    AssetId::from_str(encoded).map_err(|_| ElementsCoreSourceError::InvalidPeggedAsset)
+}
+
+fn parse_builtin_bitcoin_asset_label(
+    labels: &JsonValue,
+) -> Result<AssetId, ElementsCoreSourceError> {
+    let labels = labels
+        .as_object()
+        .ok_or(ElementsCoreSourceError::InvalidBitcoinAssetLabel)?;
+    let encoded = labels
+        .get("bitcoin")
+        .ok_or(ElementsCoreSourceError::MissingBitcoinAssetLabel)?
+        .as_str()
+        .ok_or(ElementsCoreSourceError::InvalidBitcoinAssetLabel)?;
+    AssetId::from_str(encoded).map_err(|_| ElementsCoreSourceError::InvalidBitcoinAssetLabel)
+}
+
+fn validate_txindex_result(indexes: &JsonValue) -> Result<(), ElementsCoreSourceError> {
+    let txindex = indexes
+        .as_object()
+        .and_then(|indexes| indexes.get("txindex"))
+        .and_then(JsonValue::as_object)
+        .ok_or(ElementsCoreSourceError::TxIndexUnavailable)?;
+    if txindex.get("synced").and_then(JsonValue::as_bool) != Some(true) {
+        return Err(ElementsCoreSourceError::TxIndexNotSynced);
+    }
+    Ok(())
+}
+
 fn validate_outpoint(outpoint: OutPoint) -> Result<(), ElementsCoreSourceError> {
     if outpoint.is_null() || outpoint.vout & 0xc000_0000 != 0 {
         return Err(ElementsCoreSourceError::InvalidOutpoint(outpoint));
@@ -1040,27 +1248,46 @@ fn validate_outpoint(outpoint: OutPoint) -> Result<(), ElementsCoreSourceError> 
     Ok(())
 }
 
-fn read_cookie(path: &PathBuf) -> Result<(String, String), ElementsCoreSourceError> {
-    let file = File::open(path).map_err(|error| {
+fn read_cookie(
+    path: &PathBuf,
+) -> Result<(Zeroizing<String>, Zeroizing<String>), ElementsCoreSourceError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(path).map_err(|error| {
         ElementsCoreSourceError::BackendUnavailable(format!(
             "cannot open Elements RPC cookie {}: {error}",
             path.display()
         ))
     })?;
-    if file
-        .metadata()
-        .map_err(|error| {
-            ElementsCoreSourceError::BackendUnavailable(format!(
-                "cannot inspect Elements RPC cookie {}: {error}",
-                path.display()
-            ))
-        })?
-        .len()
-        > MAX_COOKIE_BYTES as u64
-    {
+    let metadata = file.metadata().map_err(|error| {
+        ElementsCoreSourceError::BackendUnavailable(format!(
+            "cannot inspect Elements RPC cookie {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() {
         return Err(ElementsCoreSourceError::InvalidCookie);
     }
-    let mut bytes = Vec::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        if metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o777 != 0o600
+        {
+            return Err(ElementsCoreSourceError::InvalidCookie);
+        }
+    }
+    if metadata.len() > MAX_COOKIE_BYTES as u64 {
+        return Err(ElementsCoreSourceError::InvalidCookie);
+    }
+    let mut bytes = Zeroizing::new(Vec::new());
     file.take((MAX_COOKIE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|error| {
@@ -1081,7 +1308,10 @@ fn read_cookie(path: &PathBuf) -> Result<(String, String), ElementsCoreSourceErr
     if username.is_empty() || password.is_empty() || password.contains(['\r', '\n']) {
         return Err(ElementsCoreSourceError::InvalidCookie);
     }
-    Ok((username.to_owned(), password.to_owned()))
+    Ok((
+        Zeroizing::new(username.to_owned()),
+        Zeroizing::new(password.to_owned()),
+    ))
 }
 
 fn read_bounded(
@@ -1234,6 +1464,35 @@ pub enum ElementsCoreSourceError {
     #[error("Elements source is on genesis {actual}, expected {expected}")]
     WrongChain {
         expected: BlockHash,
+        actual: BlockHash,
+    },
+    #[error("Elements Core chain `{actual}` is unsupported; expected `liquidregtest`")]
+    UnsupportedChain { actual: String },
+    #[error("Elements Core is still in initial block download")]
+    InitialBlockDownload,
+    #[error("Elements Core sidechain info does not contain `pegged_asset`")]
+    MissingPeggedAsset,
+    #[error("Elements Core's `pegged_asset` sidechain-info field is invalid")]
+    InvalidPeggedAsset,
+    #[error("Elements Core asset labels do not contain the built-in `bitcoin` label")]
+    MissingBitcoinAssetLabel,
+    #[error("Elements Core's built-in `bitcoin` asset-label mapping is invalid")]
+    InvalidBitcoinAssetLabel,
+    #[error(
+        "Elements Core's built-in `bitcoin` asset label {label_asset} does not match its sidechain pegged asset {pegged_asset}"
+    )]
+    BitcoinAssetLabelMismatch {
+        pegged_asset: AssetId,
+        label_asset: AssetId,
+    },
+    #[error("invalid Elements Core chain status: {0}")]
+    InvalidChainStatus(&'static str),
+    #[error(
+        "Elements Core reported tip {reported} at height {height}, but getblockhash returned {actual}"
+    )]
+    InconsistentChainTip {
+        height: u32,
+        reported: BlockHash,
         actual: BlockHash,
     },
     #[error("wallet catalog has {actual} scripts; scan maximum is {maximum}")]

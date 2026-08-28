@@ -105,6 +105,10 @@ struct ScanEntry {
 struct MockState {
     block_hashes: BTreeMap<u32, VecDeque<BlockHash>>,
     best_blocks: VecDeque<BlockHash>,
+    chain: String,
+    initial_block_download: bool,
+    sidechain_info: JsonValue,
+    asset_labels: JsonValue,
     blockchain_height: u32,
     scan_best_block: BlockHash,
     scan_success: bool,
@@ -131,6 +135,10 @@ impl MockState {
                 (SCAN_HEIGHT, VecDeque::from([tip])),
             ]),
             best_blocks: VecDeque::from([tip]),
+            chain: ELEMENTS_REGTEST_CHAIN.to_owned(),
+            initial_block_download: false,
+            sidechain_info: json!({"pegged_asset": identity().policy_asset().to_string()}),
+            asset_labels: json!({"bitcoin": identity().policy_asset().to_string()}),
             blockchain_height: SCAN_HEIGHT,
             scan_best_block: tip,
             scan_success: true,
@@ -238,9 +246,13 @@ impl RpcTransport for MockRpc {
                 }
                 "getbestblockhash" => json!(state.next_best_block()),
                 "getblockchaininfo" => json!({
+                    "chain": state.chain,
                     "blocks": state.blockchain_height,
                     "bestblockhash": state.scan_best_block,
+                    "initialblockdownload": state.initial_block_download,
                 }),
+                "getsidechaininfo" => state.sidechain_info.clone(),
+                "dumpassetlabels" => state.asset_labels.clone(),
                 "getindexinfo" => match state.txindex {
                     Some(synced) => json!({"txindex": {"synced": synced}}),
                     None => json!({}),
@@ -320,6 +332,13 @@ fn test_source(wallet: SharedRfqWallet, rpc: Arc<MockRpc>) -> ElementsCoreSource
     ElementsCoreSource::from_parts(&config(), wallet, rpc)
 }
 
+fn test_probe(
+    config: &ElementsCoreConfig,
+    rpc: &MockRpc,
+) -> Result<ElementsCoreChainStatus, ElementsCoreSourceError> {
+    probe_elements_core_with_transport(rpc, config.request_timeout, config.startup_timeout)
+}
+
 fn funded_inventory_fixture(
     wallet: &SharedRfqWallet,
 ) -> (
@@ -333,6 +352,163 @@ fn funded_inventory_fixture(
     let transaction = confidential_transaction(&destination, asset(71), 42_000);
     let outpoint = OutPoint::new(transaction.txid(), 0);
     (destination, transaction, outpoint)
+}
+
+#[test]
+fn startup_probe_is_wallet_independent_and_pins_the_reported_tip() {
+    let rpc = MockRpc::new(MockState::new());
+    let status = test_probe(&config(), &rpc).expect("healthy Elements Core");
+
+    assert_eq!(status.network(), ElementsCoreNetwork::ElementsRegtest);
+    assert_eq!(status.genesis_hash(), identity().genesis_hash());
+    assert_eq!(status.pegged_asset(), identity().policy_asset());
+    assert_eq!(status.tip_height(), SCAN_HEIGHT);
+    assert_eq!(status.tip_hash(), hash(90));
+    assert_eq!(
+        rpc.calls(),
+        vec![
+            ("getblockhash", json!([0])),
+            ("getblockchaininfo", json!([])),
+            ("getsidechaininfo", json!([])),
+            ("dumpassetlabels", json!([])),
+            ("getblockhash", json!([SCAN_HEIGHT])),
+            ("getindexinfo", json!([])),
+        ]
+    );
+}
+
+#[test]
+fn startup_probe_requires_exact_regtest_chain_and_completed_ibd() {
+    let mut wrong_network = MockState::new();
+    wrong_network.chain = "liquidv1".to_owned();
+    assert!(matches!(
+        test_probe(&config(), &MockRpc::new(wrong_network)),
+        Err(ElementsCoreSourceError::UnsupportedChain { actual }) if actual == "liquidv1"
+    ));
+
+    let mut downloading = MockState::new();
+    downloading.initial_block_download = true;
+    assert!(matches!(
+        test_probe(&config(), &MockRpc::new(downloading)),
+        Err(ElementsCoreSourceError::InitialBlockDownload)
+    ));
+}
+
+#[test]
+fn startup_probe_requires_a_valid_sidechain_pegged_asset() {
+    let mut missing = MockState::new();
+    missing.sidechain_info = json!({});
+    assert!(matches!(
+        test_probe(&config(), &MockRpc::new(missing)),
+        Err(ElementsCoreSourceError::MissingPeggedAsset)
+    ));
+
+    let mut malformed = MockState::new();
+    malformed.sidechain_info = json!({"pegged_asset": "not-an-asset-id"});
+    assert!(matches!(
+        test_probe(&config(), &MockRpc::new(malformed)),
+        Err(ElementsCoreSourceError::InvalidPeggedAsset)
+    ));
+
+    let mut wrong_shape = MockState::new();
+    wrong_shape.sidechain_info = json!([]);
+    assert!(matches!(
+        test_probe(&config(), &MockRpc::new(wrong_shape)),
+        Err(ElementsCoreSourceError::InvalidPeggedAsset)
+    ));
+}
+
+#[test]
+fn startup_probe_requires_a_valid_builtin_bitcoin_asset_label() {
+    let mut missing = MockState::new();
+    missing.asset_labels = json!({"not-bitcoin": asset(99).to_string()});
+    assert!(matches!(
+        test_probe(&config(), &MockRpc::new(missing)),
+        Err(ElementsCoreSourceError::MissingBitcoinAssetLabel)
+    ));
+
+    let mut malformed = MockState::new();
+    malformed.asset_labels = json!({"bitcoin": "not-an-asset-id"});
+    assert!(matches!(
+        test_probe(&config(), &MockRpc::new(malformed)),
+        Err(ElementsCoreSourceError::InvalidBitcoinAssetLabel)
+    ));
+
+    let mut wrong_type = MockState::new();
+    wrong_type.asset_labels = json!({"bitcoin": 42});
+    assert!(matches!(
+        test_probe(&config(), &MockRpc::new(wrong_type)),
+        Err(ElementsCoreSourceError::InvalidBitcoinAssetLabel)
+    ));
+}
+
+#[test]
+fn startup_probe_requires_the_builtin_bitcoin_label_to_match_the_pegged_asset() {
+    let mut mismatch = MockState::new();
+    mismatch.asset_labels = json!({"bitcoin": asset(99).to_string()});
+
+    assert!(matches!(
+        test_probe(&config(), &MockRpc::new(mismatch)),
+        Err(ElementsCoreSourceError::BitcoinAssetLabelMismatch {
+            pegged_asset,
+            label_asset,
+        }) if pegged_asset == identity().policy_asset() && label_asset == asset(99)
+    ));
+}
+
+#[test]
+fn startup_probe_rejects_an_inconsistent_tip_and_unusable_txindex() {
+    let mut inconsistent = MockState::new();
+    inconsistent
+        .block_hashes
+        .insert(SCAN_HEIGHT, VecDeque::from([hash(91)]));
+    let error = test_probe(&config(), &MockRpc::new(inconsistent))
+        .expect_err("reported tip must be pinned by height");
+    assert!(matches!(
+        error,
+        ElementsCoreSourceError::InconsistentChainTip {
+            height: SCAN_HEIGHT,
+            reported,
+            actual,
+        } if reported == hash(90) && actual == hash(91)
+    ));
+
+    let mut missing = MockState::new();
+    missing.txindex = None;
+    assert!(matches!(
+        test_probe(&config(), &MockRpc::new(missing)),
+        Err(ElementsCoreSourceError::TxIndexUnavailable)
+    ));
+
+    let mut unsynced = MockState::new();
+    unsynced.txindex = Some(false);
+    assert!(matches!(
+        test_probe(&config(), &MockRpc::new(unsynced)),
+        Err(ElementsCoreSourceError::TxIndexNotSynced)
+    ));
+}
+
+#[test]
+fn startup_probe_has_one_bounded_whole_operation_deadline() {
+    let mut bounded = config();
+    bounded.request_timeout = Duration::from_secs(1);
+    bounded.startup_timeout = Duration::from_millis(20);
+    let mut state = MockState::new();
+    state
+        .call_delays
+        .insert("getblockhash", Duration::from_secs(1));
+    let rpc = MockRpc::new(state);
+
+    assert!(matches!(
+        test_probe(&bounded, &rpc),
+        Err(ElementsCoreSourceError::OperationTimedOut {
+            operation: STARTUP_OPERATION
+        })
+    ));
+    let timeouts = rpc.rpc_timeouts();
+    assert_eq!(timeouts.len(), 1);
+    assert!(timeouts[0].1.operation_limited);
+    assert!(timeouts[0].1.duration <= bounded.startup_timeout);
 }
 
 #[test]
@@ -928,6 +1104,32 @@ fn authentication_and_source_debug_are_redacted() {
     assert!(!source_debug.contains("passphrase"));
 }
 
+#[cfg(unix)]
+#[test]
+fn cookie_reloads_require_an_owner_only_real_file() {
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let directory = tempdir().expect("temporary cookie directory");
+    let cookie = directory.path().join(".cookie");
+    fs::write(&cookie, b"provider:secret\n").expect("write cookie");
+    fs::set_permissions(&cookie, fs::Permissions::from_mode(0o600)).expect("secure cookie");
+    let (username, password) = read_cookie(&cookie).expect("read secure cookie");
+    assert_eq!(username.as_str(), "provider");
+    assert_eq!(password.as_str(), "secret");
+
+    fs::set_permissions(&cookie, fs::Permissions::from_mode(0o640)).expect("widen cookie mode");
+    assert!(matches!(
+        read_cookie(&cookie),
+        Err(ElementsCoreSourceError::InvalidCookie)
+    ));
+
+    fs::set_permissions(&cookie, fs::Permissions::from_mode(0o600)).expect("restore cookie mode");
+    let alias = directory.path().join("cookie-link");
+    symlink(&cookie, &alias).expect("create cookie symlink");
+    assert!(read_cookie(&alias).is_err());
+}
+
 #[test]
 fn invalid_transport_configuration_is_rejected_without_network_access() {
     let (_directory, wallet) = test_wallet();
@@ -950,6 +1152,13 @@ fn invalid_transport_configuration_is_rejected_without_network_access() {
     no_inventory_deadline.inventory_timeout = Duration::ZERO;
     assert!(matches!(
         ElementsCoreSource::new(no_inventory_deadline, wallet.clone()),
+        Err(ElementsCoreSourceError::InvalidConfiguration(_))
+    ));
+
+    let mut no_startup_deadline = config();
+    no_startup_deadline.startup_timeout = Duration::ZERO;
+    assert!(matches!(
+        probe_elements_core(&no_startup_deadline),
         Err(ElementsCoreSourceError::InvalidConfiguration(_))
     ));
 
