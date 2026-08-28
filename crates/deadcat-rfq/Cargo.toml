@@ -9,14 +9,21 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+deadcat-rfq-iroh.workspace = true
 deadcat-rfq-provider.workspace = true
+deadcat-rfq-rpc.workspace = true
 deadcat-rfq-wallet.workspace = true
+deadcat-types.workspace = true
 elements.workspace = true
 hex.workspace = true
+iroh.workspace = true
+rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 bitcoind = "0.36"
