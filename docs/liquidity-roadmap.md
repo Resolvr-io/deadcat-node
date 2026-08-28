@@ -660,12 +660,14 @@ capability for the durable commit. Its signing coordinator then exact-matches
 the durable job, invokes the backend-neutral signer outside database locks,
 verifies and inserts every provider signature, proves all other PSET data is
 unchanged, rechecks proofs and fee facts, and stores one canonical signed PSET
-before returning or replaying it. The API remains provisional until the custom
-wallet is connected to an authoritative Elements-backed inventory/chain
-scanner and daemon runtime and authenticated signed remote RFQ evidence
-exercises the complete flow end to end. Protected passphrase delivery,
-external backup-freshness and coordinated provider-state recovery, live
-wallet-backed regtest coverage, and HSM support also remain outside the current
+before returning or replaying it. The custom wallet is now connected to a
+bounded authoritative Elements-backed inventory/chain adapter. Its mandatory
+live gate proves confirmed confidential discovery and unblinding, ordered
+full-witness settlement prevouts, and the same scan after wallet restart. The
+API remains provisional until daemon runtime and authenticated signed remote
+RFQ evidence exercise the complete flow end to end. Protected passphrase
+delivery, external backup-freshness and coordinated provider-state recovery,
+process-level daemon coverage, and HSM support also remain outside the current
 slice.
 The initial profile verifies every non-provider input as a finalized tree-less
 P2TR key-path `SIGHASH_ALL` spend. Simplicity covenant inputs and more than one

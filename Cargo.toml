@@ -10,6 +10,7 @@ members = [
     "crates/deadcat-cli",
     "crates/deadcat-rfq-provider",
     "crates/deadcat-rfq-wallet",
+    "crates/deadcat-rfq",
 ]
 
 [workspace.package]
@@ -32,7 +33,7 @@ libc = "0.2"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 rand = "0.8"
 redb = "4"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "charset"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "charset"] }
 rustix = { version = "1", features = ["process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -53,6 +54,7 @@ deadcat-rpc = { path = "crates/deadcat-rpc" }
 deadcat-iroh = { path = "crates/deadcat-iroh" }
 deadcat-rfq-provider = { path = "crates/deadcat-rfq-provider" }
 deadcat-rfq-wallet = { path = "crates/deadcat-rfq-wallet" }
+deadcat-rfq = { path = "crates/deadcat-rfq" }
 
 # The CLI and Rust libraries must remain on the exact same smplx release.
 # smplx 0.0.9 caps simplicityhl at 0.6.x; Cargo.lock pins the newest

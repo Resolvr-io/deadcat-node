@@ -54,6 +54,13 @@ regtest-rfq-settlement: generate
         two_wallet_confidential_p2tr_rfq_settlement_is_accepted_and_spendable \
         -- --ignored --nocapture --test-threads=1
 
+# Drive the production RFQ Elements adapter against the persistent custom
+# wallet, including confidential discovery, ordered prevouts, and restart.
+regtest-rfq-wallet-source: generate
+    cargo test --locked -p deadcat-rfq --test elements_regtest \
+        persistent_wallet_inventory_is_discovered_unblinded_and_recovered_after_restart \
+        -- --ignored --nocapture --test-threads=1
+
 # Cross actual daemon/CLI process boundaries over direct Iroh, including
 # restart identity persistence, deep-reorg refusal, and operator rebuild.
 regtest-process-boundary: generate
@@ -63,7 +70,7 @@ regtest-process-boundary: generate
         -- --ignored --nocapture --test-threads=1
 
 # Every isolated live-chain protocol gate required before CI succeeds.
-regtest: regtest-market-ab regtest-multi-market regtest-backend-equivalence regtest-rfq-settlement regtest-process-boundary
+regtest: regtest-market-ab regtest-multi-market regtest-backend-equivalence regtest-rfq-settlement regtest-rfq-wallet-source regtest-process-boundary
 
 wasm-check:
     NIX_HARDENING_ENABLE=pic cargo check --locked -p deadcat-iroh --lib --target wasm32-unknown-unknown
