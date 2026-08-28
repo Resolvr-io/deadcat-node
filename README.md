@@ -52,13 +52,18 @@ one canonical signed PSET before returning it. Exact retries replay that
 durable winner without re-signing; concurrently in-flight valid signature
 encodings may both sign, but every caller returns the same stored winner. Its
 `FirmQuote` is still an internal, unauthenticated artifact, not yet a provider-
-signed network quote. The first custom provider-wallet slice adds a versioned
-encrypted keystore, in-memory BIP32/SLIP-77 key derivation, fresh confidential
-tree-less P2TR destinations, output recovery, exact durable-job signing, and a
-provider-side non-last blinding coordinator. It deliberately has no arbitrary
-signing API, and Elements Core remains only the intended chain, mempool, policy,
-and relay authority. Filesystem/passphrase operations, an authoritative
-inventory scanner, daemon and live-regtest integration, backup-recovery tooling,
+signed network quote. The custom provider wallet now adds a versioned encrypted
+keystore, in-memory BIP32/SLIP-77 key derivation, fresh confidential tree-less
+P2TR destinations, output recovery, exact durable-job signing, and a
+provider-side non-last blinding coordinator. Its identity-bound `wallet.redb`
+catalog durably records each random locator before returning a destination,
+publishes new and restored wallets through a same-directory staging file in a
+trusted path hierarchy on a lock-supporting local Unix filesystem, and exports
+an authenticated logical wallet-only snapshot. The naked cryptographic wallet
+deliberately cannot issue production destinations or sign arbitrary data.
+Elements Core remains only the intended chain, mempool, policy, and relay
+authority. Protected passphrase delivery, an authoritative inventory scanner,
+daemon and live-regtest integration, coordinated provider-state recovery,
 market-data pricing, the authenticated remote protocol, relay reconciliation,
 and HSM support remain future work. [ADR 0008](docs/adr/0008-rfq-service-owned-wallet.md)
 records that boundary.

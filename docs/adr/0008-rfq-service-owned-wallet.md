@@ -73,6 +73,50 @@ caused solely by restoring a stale "next-address" counter. It does not by
 itself provide a complete backup or chain-discovery system; the root alone is
 not a complete backup of the random wallet identity or issued-locator catalog.
 
+The production destination capability is therefore implemented only by an
+identity-bound persistent wrapper. It commits the nonce, complete locator, and
+monotonic issuance revision to an append-only redb catalog with immediate
+durability before returning the destination. A wallet-derived checkpoint chain
+authenticates the exact encrypted envelope and ordered catalog. Revisioned
+snapshots let a later chain scanner detect destination issuance that raced its
+external chain observation. The unlocked cryptographic core can derive a
+candidate internally, but it does not implement the provider's destination
+source and cannot bypass this persist-before-return boundary.
+
+New and restored wallet files are built and validated in a restrictive
+same-directory staging file, then published without replacing an existing
+target while the same redb handle remains open. Publication verifies that the
+final path names the exact staged inode. The current durable implementation is
+Unix-only: wallet files are mode `0600`, and their immediate parent must be a
+real directory owned by the effective user with no group or world write bits.
+The configured path's full hierarchy must be trusted against rename or
+replacement; retaining validated directory handles is deferred runtime
+hardening, so an otherwise-secure immediate parent beneath an untrusted
+non-sticky ancestor is unsupported.
+Opening symlinks, special or empty files, insecure files or parents, wrong
+provider or chain identity, swapped keystore state, malformed locators, or a
+broken revision/checkpoint chain fails closed. Deployments must use a local
+filesystem on which redb's exclusive file lock is supported; unsupported or
+network filesystems are outside this boundary.
+
+No-clobber publication is a one-way boundary. If publication reaches the final
+path but the subsequent inode check, parent-directory sync, or validation
+fails, the API reports `PublishedButUnconfirmed`. Operators must inspect and
+reopen an existing target; they must never blindly delete or recreate it,
+because it may contain the complete generated wallet.
+
+The wallet can export a bounded, versioned logical snapshot containing the
+exact encrypted envelope and complete catalog at one revision. The snapshot's
+checkpoint authenticates edits, deletion, insertion, and reordering after
+unlock, and restore preserves the original wallet identity and derivation.
+This is a wallet-only artifact, not complete RFQ-service recovery. An authentic
+older snapshot is indistinguishable from the latest one without an externally
+retained checkpoint and cannot discover random locators issued later. It also
+contains no reservations, committed signing jobs, signed artifacts, relay
+state, or chain observations. A restored wallet must not quote or sign until
+the provider database and authoritative chain view have been reconciled, and
+the source wallet and its restored clone must never run concurrently.
+
 ### Narrow capabilities
 
 The wallet exposes only the provider capabilities needed by the state machine:
@@ -114,32 +158,37 @@ This blinding step remains pre-commit and does not cross ADR 0007's point of no
 return. Only later final-PSET validation and durable commitment can authorize
 signing.
 
-## Initial implementation boundary
+## Implemented boundary
 
-The first implementation slice is intentionally a cryptographic and
-transport-free capability layer. It adds the encrypted keystore, destination
-derivation, output recovery, durable-job signer, and provider-side non-last
-blinding coordinator with focused adversarial tests.
+The implementation remains transport-free. It now includes the encrypted
+keystore, destination derivation, identity-bound durable locator catalog,
+staged no-clobber file publication, logical wallet-only export and restore,
+output recovery, durable-job signer, and provider-side non-last blinding
+coordinator with focused adversarial tests.
 
 It does **not** yet provide:
 
-- atomic filesystem replacement, permissions, directory synchronization,
-  passphrase delivery, unattended unlock, memory locking, or process-dump
-  policy;
+- protected passphrase delivery, unattended unlock, memory locking, swap or
+  process-dump policy;
 - an authoritative chain scanner or concrete `InventorySource`;
 - RFQ-daemon startup/configuration wiring, bounded and rate-limited remote
   destination issuance, or a live wallet-backed regtest flow;
-- a complete backup catalog, stale-backup discovery and recovery workflow, or
-  key rotation;
+- continuous/off-host backup transport, external backup-freshness checkpoints,
+  coordinated wallet/provider-state recovery, or key rotation;
 - the authenticated remote RFQ protocol, signed network quote, pricing source,
   relay and outspend reconciliation; or
 - an HSM or external-signer backend.
 
+The current persistent store also does not implement Windows ACLs or a durable
+Windows publication primitive; constructing or opening it on non-Unix systems
+fails explicitly rather than silently weakening these guarantees.
+
 Those are launch requirements or later hardening work, not properties implied
-by the existence of the wallet library. In particular, a serializable encrypted
-envelope is not yet production backup tooling, and a self-authenticating locator
-does not discover an output whose script is absent from every restored catalog
-and chain scan.
+by the existence of the wallet library. In particular, a valid wallet-only
+snapshot is not evidence that it is the newest snapshot or that the matching
+provider state was restored, and a self-authenticating locator does not discover
+an output whose script is absent from every restored catalog and external
+record.
 
 ## Consequences
 
@@ -153,4 +202,5 @@ and chain scan.
 - The capability boundary remains suitable for a later out-of-process signer or
   HSM without changing ADR 0007's reservation and commit-before-sign semantics.
 - The service must not be described as production-ready until the deferred
-  durability, scanning, runtime, recovery, and live acceptance work is complete.
+  passphrase, scanning, runtime, coordinated recovery, and live acceptance work
+  is complete.

@@ -1042,9 +1042,13 @@ dependencies = [
  "deadcat-rfq-provider",
  "elements",
  "hmac",
+ "libc",
  "rand 0.8.7",
+ "redb",
+ "rustix 1.1.4",
  "sha2 0.10.9",
  "subtle",
+ "tempfile",
  "thiserror 2.0.18",
  "zeroize",
 ]
