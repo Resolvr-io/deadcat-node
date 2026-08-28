@@ -304,9 +304,12 @@ prove them. The provider crate deliberately supplies no concrete wallet
 backend. ADR 0008's adjacent `deadcat-rfq-wallet` crate implements destination,
 output-recovery, and durable-job signing capabilities using an encrypted,
 in-memory-unlocked provider seed plus an identity-bound persistent locator
-catalog and wallet-only logical snapshot. Protected passphrase delivery,
-authoritative inventory scanning, coordinated provider-state recovery, and
-runtime integration remain separate work.
+catalog and wallet-only logical snapshot. The adjacent `deadcat-rfq` runtime
+crate now implements the authoritative Elements-backed inventory and
+settlement-chain adapter, including confirmed catalog scans, mempool-aware
+unspent checks, complete confidential prevouts, and chain/catalog coherence
+fences. Protected passphrase delivery, coordinated provider-state recovery,
+and daemon integration remain separate work.
 
 The settlement layer also implements the provider's non-last collaborative
 blinding stage. It binds the complete unblinded PSET to the exact live reserved
@@ -344,10 +347,10 @@ nonempty witness would not be participant authorization.
 
 The remaining provider milestones are:
 
-1. add the authoritative Elements-backed inventory/chain adapter, protected
-   passphrase and unattended-unlock operations, coordinated provider-state
-   recovery, and RFQ-daemon integration for the implemented persistent custom
-   wallet, blinding, validator, and signer capabilities;
+1. add protected passphrase and unattended-unlock operations, coordinated
+   provider-state recovery, and RFQ-daemon integration for the implemented
+   persistent custom wallet, Elements adapter, blinding, validator, and signer
+   capabilities;
 2. define a dedicated authenticated RFQ protocol, signed quote envelope,
    identity, and ALPN;
 3. persist relay and chain-reconciliation observations without ever reopening

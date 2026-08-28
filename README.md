@@ -61,12 +61,20 @@ publishes new and restored wallets through a same-directory staging file in a
 trusted path hierarchy on a lock-supporting local Unix filesystem, and exports
 an authenticated logical wallet-only snapshot. The naked cryptographic wallet
 deliberately cannot issue production destinations or sign arbitrary data.
-Elements Core remains only the intended chain, mempool, policy, and relay
-authority. Protected passphrase delivery, an authoritative inventory scanner,
-daemon and live-regtest integration, coordinated provider-state recovery,
-market-data pricing, the authenticated remote protocol, relay reconciliation,
-and HSM support remain future work. [ADR 0008](docs/adr/0008-rfq-service-owned-wallet.md)
-records that boundary.
+The adjacent `deadcat-rfq` runtime crate connects that wallet to an
+authoritative, walletless Elements Core adapter. It discovers confirmed
+inventory from the durable script catalog, filters it through mempool-aware
+unspent checks, preserves complete confidential output witnesses, and supplies
+ordered authoritative prevouts to final settlement validation. Chain anchors,
+wallet-catalog revisions, RPC payloads, scans, and settlement batches are all
+bounded and checked fail-closed; operation-wide deadlines and coinbase-maturity
+checks keep slow or not-yet-spendable observations out of the signing path. A
+mandatory liquidregtest gate exercises
+confidential discovery, unblinding, settlement lookup, and restart recovery.
+Protected passphrase delivery, daemon wiring, coordinated provider-state
+recovery, market-data pricing, the authenticated remote protocol, relay
+reconciliation, and HSM support remain future work.
+[ADR 0008](docs/adr/0008-rfq-service-owned-wallet.md) records that boundary.
 This initial validator accepts ordinary finalized tree-less P2TR
 `SIGHASH_ALL` inputs outside the current RFQ leg; Simplicity covenant inputs
 and a second interactive RFQ signer need a later authenticated venue/script

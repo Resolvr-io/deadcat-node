@@ -1,0 +1,25 @@
+[package]
+name = "deadcat-rfq"
+description = "Runtime adapters for the Deadcat RFQ liquidity service."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+deadcat-rfq-provider.workspace = true
+deadcat-rfq-wallet.workspace = true
+elements.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+bitcoind = "0.36"
+serde_json.workspace = true
+smplx-sdk.workspace = true
+tempfile.workspace = true

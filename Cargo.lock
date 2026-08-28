@@ -1018,6 +1018,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "deadcat-rfq"
+version = "0.1.0-alpha"
+dependencies = [
+ "bitcoind",
+ "deadcat-rfq-provider",
+ "deadcat-rfq-wallet",
+ "elements",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "smplx-sdk",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "deadcat-rfq-provider"
 version = "0.1.0-alpha"
 dependencies = [
@@ -3532,6 +3549,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",

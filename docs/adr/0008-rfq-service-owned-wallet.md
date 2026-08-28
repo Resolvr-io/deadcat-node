@@ -140,9 +140,18 @@ result is returned.
 Elements Core remains the provider's intended authority for chain state,
 mempool and relay policy, transaction acceptance, and broadcast. It does not
 derive provider destinations, hold provider keys or blinding secrets, unblind
-inventory, or sign provider inputs. A later runtime adapter will translate
-authoritative Elements RPC observations into the provider's chain and inventory
-interfaces.
+inventory, or sign provider inputs. The adjacent `deadcat-rfq` runtime adapter
+translates bounded, walletless Elements RPC observations into the provider's
+chain and inventory interfaces. It scans the confirmed UTXO set for the
+authenticated persistent script catalog, filters candidates through
+mempool-aware unspent checks, fetches complete creating transactions, delegates
+authentication and unblinding to this wallet, and returns ordered complete
+prevouts immediately before final settlement commitment. It fails closed on
+chain-anchor, catalog-revision, transaction, script, or configured-bound
+inconsistencies. Inventory scans and settlement lookups have separate
+operation-wide deadlines, long scans cannot block final prevout validation,
+and immature coinbase outputs are never represented as spendable inventory or
+authoritative settlement inputs.
 
 ### Collaborative blinding
 
@@ -160,19 +169,22 @@ signing.
 
 ## Implemented boundary
 
-The implementation remains transport-free. It now includes the encrypted
-keystore, destination derivation, identity-bound durable locator catalog,
-staged no-clobber file publication, logical wallet-only export and restore,
-output recovery, durable-job signer, and provider-side non-last blinding
-coordinator with focused adversarial tests.
+The implementation remains remote-transport-free. It now includes the
+encrypted keystore, destination derivation, identity-bound durable locator
+catalog, staged no-clobber file publication, logical wallet-only export and
+restore, output recovery, durable-job signer, provider-side non-last blinding
+coordinator, and the bounded authoritative Elements inventory/settlement
+adapter with focused adversarial tests. Its live liquidregtest gate funds
+confidential custom-wallet destinations, discovers and unblinds them after
+confirmation, recovers ordered full-witness prevouts, and repeats the scan
+after reopening the wallet.
 
 It does **not** yet provide:
 
 - protected passphrase delivery, unattended unlock, memory locking, swap or
   process-dump policy;
-- an authoritative chain scanner or concrete `InventorySource`;
-- RFQ-daemon startup/configuration wiring, bounded and rate-limited remote
-  destination issuance, or a live wallet-backed regtest flow;
+- RFQ-daemon startup/configuration wiring or bounded and rate-limited remote
+  destination issuance;
 - continuous/off-host backup transport, external backup-freshness checkpoints,
   coordinated wallet/provider-state recovery, or key rotation;
 - the authenticated remote RFQ protocol, signed network quote, pricing source,
@@ -202,5 +214,5 @@ record.
 - The capability boundary remains suitable for a later out-of-process signer or
   HSM without changing ADR 0007's reservation and commit-before-sign semantics.
 - The service must not be described as production-ready until the deferred
-  passphrase, scanning, runtime, coordinated recovery, and live acceptance work
-  is complete.
+  passphrase, daemon, coordinated recovery, remote protocol, relay, and
+  process-level acceptance work is complete.
