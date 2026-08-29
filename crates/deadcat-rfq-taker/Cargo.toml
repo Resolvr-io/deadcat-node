@@ -9,6 +9,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
 deadcat-client.workspace = true
 deadcat-rfq-client.workspace = true
 deadcat-rfq-rpc.workspace = true

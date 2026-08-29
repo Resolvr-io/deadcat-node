@@ -1,18 +1,23 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::pending;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use deadcat_client::composition::CompositionLimits;
 use deadcat_client::validation::validate_contract_view;
 use deadcat_client::venue::{AssetAmount, VenueContext};
 use deadcat_contracts::binary_market::BinaryMarketSlot;
 use deadcat_rfq_client::{
     AuthoritativeTakerPrevout, ExecutionJournal as _, ExecutionJournalBinding,
-    ExecutionJournalObservation, ProviderTarget, RedbExecutionJournal, RfqSession, SessionConfig,
-    TakerSettlementSnapshot, TakerSettlementSource, TradingMarket,
+    ExecutionJournalError, ExecutionJournalObservation, ProviderTarget, RedbExecutionJournal,
+    RfqSession, SessionConfig, TakerAuthorizationError, TakerSettlementSnapshot,
+    TakerSettlementSnapshotRequest, TakerSettlementSource, TradingMarket,
 };
-use deadcat_rfq_iroh::{ClientConfig, DiscoveryMode, RequestHandler, Server, ServerConfig};
+use deadcat_rfq_iroh::{
+    ClientConfig, DiscoveryMode, RequestHandler, Server, ServerConfig, SpawnedServer,
+};
 use deadcat_rfq_rpc::{
     AssetAmountDto, BlinderRoleDto, FeePolicyDto, FeeSizeMetricDto, FirmQuoteDto, FixedBytes32,
     FixedBytes33, IdempotencyKeyDto, PricingDecisionDto, ProviderCapability, ProviderInfo,
@@ -25,8 +30,8 @@ use deadcat_rfq_taker::{
     RfqTakerConfig, RfqTakerError, RfqTakerRuntime, TakerInventorySource,
 };
 use deadcat_rfq_wallet::{
-    KdfParams, PersistentRfqWallet, TakerFundingError, TakerFundingLimits, TakerWalletIdentity,
-    TakerWalletUtxo,
+    KdfParams, PersistentRfqWallet, TakerFundingError, TakerFundingLimits, TakerFundingPool,
+    TakerWalletIdentity, TakerWalletUtxo,
 };
 use deadcat_rpc::{ContractParametersView, ContractStateView, ContractView, LiveOutpoint};
 use deadcat_types::{
@@ -40,6 +45,7 @@ use elements::{AssetId, BlockHash, OutPoint, Script, TxOut, TxOutSecrets, TxOutW
 use iroh::{EndpointId, SecretKey};
 use rand::SeedableRng as _;
 use rand::rngs::StdRng;
+use tokio::sync::Notify;
 
 const CREATED_AT_MILLIS: u64 = 1_000;
 const ACCEPT_BEFORE_MILLIS: u64 = 31_000;
@@ -424,33 +430,33 @@ struct TestSource {
     prevouts: BTreeMap<OutPoint, TxOut>,
 }
 
+#[async_trait]
 impl TakerInventorySource for TestSource {
     type Error = std::io::Error;
 
-    fn inventory(&self) -> Result<Vec<TakerWalletUtxo>, Self::Error> {
+    async fn inventory(&self) -> Result<Vec<TakerWalletUtxo>, Self::Error> {
         Ok(self.inventory.clone())
     }
 }
 
+#[async_trait]
 impl TakerSettlementSource for TestSource {
     type Error = std::io::Error;
 
-    fn settlement_snapshot(
+    async fn settlement_snapshot(
         &self,
-        chain: ChainIdentity,
-        market: ContractId,
-        quote_anchor: ChainAnchor,
-        outpoints: &[OutPoint],
+        request: TakerSettlementSnapshotRequest,
     ) -> Result<TakerSettlementSnapshot, Self::Error> {
-        if chain != self.chain
-            || market != self.market.contract_id()
-            || quote_anchor != self.market.observed_at()
+        if request.chain() != self.chain
+            || request.market() != self.market.contract_id()
+            || request.quote_anchor() != self.market.observed_at()
         {
             return Err(std::io::Error::other(
                 "settlement snapshot binding mismatch",
             ));
         }
-        let prevouts = outpoints
+        let prevouts = request
+            .outpoints()
             .iter()
             .map(|outpoint| {
                 self.prevouts
@@ -658,6 +664,7 @@ async fn run_runtime_route(
         journal,
         config,
     )
+    .await
     .expect("authoritative inventory and empty journal initialize funding");
     let context = VenueContext {
         chain,
@@ -772,6 +779,7 @@ async fn run_runtime_route(
             foreign_journal,
             config,
         )
+        .await
         .expect("second runtime has independent provenance");
 
         assert!(matches!(
@@ -899,7 +907,8 @@ async fn run_runtime_route(
                 &source,
                 foreign_client_journal,
                 config,
-            ),
+            )
+            .await,
             Err(RfqTakerError::FundingRecovery(
                 FundingRecoveryError::JournalBindingClientEndpointMismatch
             ))
@@ -922,7 +931,8 @@ async fn run_runtime_route(
                 &source,
                 foreign_chain_journal,
                 config,
-            ),
+            )
+            .await,
             Err(RfqTakerError::FundingRecovery(
                 FundingRecoveryError::JournalBindingGenesisHashMismatch
             ))
@@ -945,7 +955,8 @@ async fn run_runtime_route(
                 &source,
                 foreign_policy_journal,
                 config,
-            ),
+            )
+            .await,
             Err(RfqTakerError::FundingRecovery(
                 FundingRecoveryError::JournalBindingPolicyAssetMismatch
             ))
@@ -961,7 +972,8 @@ async fn run_runtime_route(
                 &source,
                 foreign_wallet_journal,
                 config,
-            ),
+            )
+            .await,
             Err(RfqTakerError::FundingRecovery(
                 FundingRecoveryError::JournalBindingWalletInstanceMismatch
             ))
@@ -996,6 +1008,7 @@ async fn run_runtime_route(
         reopened,
         config,
     )
+    .await
     .expect("restart reconstructs exclusions from the complete journal");
     let pending = restarted
         .pending_executions()
@@ -1057,4 +1070,642 @@ async fn runtime_rejects_a_trade_prepared_by_another_runtime_before_blinding() {
 #[tokio::test(flavor = "multi_thread")]
 async fn runtime_rejects_a_non_wallet_session_before_requesting_a_quote() {
     run_runtime_route(0, false, true, RuntimeRouteKind::ExactIn, 100).await;
+}
+
+struct PendingInventorySource {
+    started: Notify,
+}
+
+#[async_trait]
+impl TakerInventorySource for PendingInventorySource {
+    type Error = std::io::Error;
+
+    async fn inventory(&self) -> Result<Vec<TakerWalletUtxo>, Self::Error> {
+        self.started.notify_one();
+        pending().await
+    }
+}
+
+#[derive(Default)]
+struct CountingInventorySource {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl TakerInventorySource for CountingInventorySource {
+    type Error = std::io::Error;
+
+    async fn inventory(&self) -> Result<Vec<TakerWalletUtxo>, Self::Error> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(Vec::new())
+    }
+}
+
+fn empty_runtime_fixture(
+    owner_marker: u8,
+) -> (
+    tempfile::TempDir,
+    Arc<PersistentRfqWallet>,
+    TakerWalletIdentity,
+    ChainIdentity,
+    AssetId,
+    RfqTakerConfig,
+) {
+    let endpoint = SecretKey::from_bytes(&[owner_marker; 32]).public();
+    let policy_asset = asset(owner_marker.wrapping_add(1));
+    let chain = ChainIdentity {
+        network: LiquidNetwork::ElementsRegtest,
+        genesis_hash: BlockHash::from_byte_array([owner_marker.wrapping_add(2); 32]),
+    };
+    let identity = TakerWalletIdentity::new(*endpoint.as_bytes(), chain.genesis_hash, policy_asset)
+        .expect("empty runtime identity");
+    let (directory, wallet) = empty_taker_wallet(identity);
+    let config = RfqTakerConfig::new(
+        TakerFundingLimits::default(),
+        CompositionLimits::default(),
+        1,
+    )
+    .expect("empty runtime configuration");
+    (directory, wallet, identity, chain, policy_asset, config)
+}
+
+struct GatedInventorySource {
+    started: Notify,
+    release: Notify,
+    inventory: Vec<TakerWalletUtxo>,
+}
+
+impl GatedInventorySource {
+    fn new(inventory: Vec<TakerWalletUtxo>) -> Self {
+        Self {
+            started: Notify::new(),
+            release: Notify::new(),
+            inventory,
+        }
+    }
+}
+
+#[async_trait]
+impl TakerInventorySource for GatedInventorySource {
+    type Error = std::io::Error;
+
+    async fn inventory(&self) -> Result<Vec<TakerWalletUtxo>, Self::Error> {
+        self.started.notify_one();
+        self.release.notified().await;
+        Ok(self.inventory.clone())
+    }
+}
+
+struct FailingInventorySource;
+
+#[async_trait]
+impl TakerInventorySource for FailingInventorySource {
+    type Error = std::io::Error;
+
+    async fn inventory(&self) -> Result<Vec<TakerWalletUtxo>, Self::Error> {
+        Err(std::io::Error::other("fixture inventory failure"))
+    }
+}
+
+struct PendingSettlementSource {
+    started: Notify,
+}
+
+#[async_trait]
+impl TakerSettlementSource for PendingSettlementSource {
+    type Error = std::io::Error;
+
+    async fn settlement_snapshot(
+        &self,
+        _request: TakerSettlementSnapshotRequest,
+    ) -> Result<TakerSettlementSnapshot, Self::Error> {
+        self.started.notify_one();
+        pending().await
+    }
+}
+
+struct FailingSettlementSource;
+
+#[async_trait]
+impl TakerSettlementSource for FailingSettlementSource {
+    type Error = std::io::Error;
+
+    async fn settlement_snapshot(
+        &self,
+        _request: TakerSettlementSnapshotRequest,
+    ) -> Result<TakerSettlementSnapshot, Self::Error> {
+        Err(std::io::Error::other("fixture settlement failure"))
+    }
+}
+
+type AsyncTestRuntime = RfqTakerRuntime<rand::rngs::OsRng, RedbExecutionJournal>;
+
+struct AsyncRuntimeFixture {
+    _wallet_directory: tempfile::TempDir,
+    _journal_directory: tempfile::TempDir,
+    identity: TakerWalletIdentity,
+    policy_asset: AssetId,
+    runtime: AsyncTestRuntime,
+    source: TestSource,
+    market: TradingMarket,
+    trade: ExactInRfqTrade,
+    session: RfqSession,
+    server: SpawnedServer,
+    observed: Arc<Mutex<ObservedRequests>>,
+}
+
+impl AsyncRuntimeFixture {
+    async fn shutdown(self) {
+        self.session.close().await;
+        self.server
+            .shutdown_and_join()
+            .await
+            .expect("fixture server shutdown");
+    }
+}
+
+async fn async_runtime_fixture(marker: u8, input_count: usize) -> AsyncRuntimeFixture {
+    let provider_key = SecretKey::from_bytes(&[marker; 32]);
+    let client_key = SecretKey::from_bytes(&[marker.wrapping_add(1); 32]);
+    let client_endpoint = client_key.public();
+    let policy_asset = asset(0x41);
+    let outcome_asset = asset(0x42);
+    let (market, chain) = trading_market(policy_asset, outcome_asset);
+    let (provider_prevout, provider_input_secrets) = confidential_p2tr_txout(outcome_asset, 200);
+    let observed = Arc::new(Mutex::new(ObservedRequests::default()));
+    let handler = Arc::new(FixtureHandler {
+        provider_key: provider_key.clone(),
+        chain,
+        policy_asset,
+        market: market.clone(),
+        provider_prevout: provider_prevout.clone(),
+        provider_input_secrets,
+        observed: Arc::clone(&observed),
+        committed: AtomicBool::new(false),
+        execute_delay_millis: AtomicUsize::new(0),
+    });
+    let server = Server::bind(
+        provider_key,
+        DiscoveryMode::Disabled,
+        ServerConfig::default(),
+        handler,
+    )
+    .await
+    .expect("bind async runtime fixture server");
+    let target = ProviderTarget::new(server.endpoint_addr(), chain, policy_asset);
+    let server = server.spawn();
+    let session = RfqSession::dial_direct(
+        target,
+        client_key,
+        SessionConfig::new(ClientConfig::default(), 60_000, 1_000)
+            .expect("async runtime fixture session config"),
+    )
+    .await
+    .expect("dial async runtime fixture server");
+
+    let identity = TakerWalletIdentity::new(
+        *client_endpoint.as_bytes(),
+        chain.genesis_hash,
+        policy_asset,
+    )
+    .expect("async runtime fixture identity");
+    let wallet_directory = tempfile::tempdir().expect("async runtime fixture wallet directory");
+    let wallet = Arc::new(
+        PersistentRfqWallet::create_taker_with_kdf(
+            wallet_directory.path().join("wallet.redb"),
+            identity,
+            b"async-runtime-fixture-passphrase",
+            KdfParams::new(8 * 1_024, 1, 1).expect("test KDF"),
+        )
+        .expect("async runtime fixture wallet"),
+    );
+    let mut inventory = Vec::with_capacity(input_count);
+    let mut prevouts = BTreeMap::from([(outpoint(0x67, 0), provider_prevout)]);
+    for index in 0..input_count {
+        let index = u8::try_from(index).expect("fixture input count fits u8");
+        let (outpoint, txout, utxo) = taker_funding_utxo(
+            &wallet,
+            policy_asset,
+            200,
+            marker.wrapping_add(0x10).wrapping_add(index),
+            marker.wrapping_add(0x20).wrapping_add(index),
+        );
+        inventory.push(utxo);
+        prevouts.insert(outpoint, txout);
+    }
+    let source = TestSource {
+        chain,
+        market: market.clone(),
+        inventory,
+        prevouts,
+    };
+    let journal_directory = tempfile::tempdir().expect("async runtime fixture journal directory");
+    let binding = ExecutionJournalBinding::new(
+        FixedBytes32::new([marker.wrapping_add(2); 32]),
+        FixedBytes32::new(wallet.instance_id().to_bytes()),
+        client_endpoint,
+        chain,
+        policy_asset,
+    )
+    .expect("async runtime fixture journal binding");
+    let journal =
+        RedbExecutionJournal::create(journal_directory.path().join("executions.redb"), binding)
+            .expect("async runtime fixture journal");
+    let runtime = RfqTakerRuntime::from_source(
+        Arc::clone(&wallet),
+        identity,
+        &source,
+        journal,
+        RfqTakerConfig::new(
+            TakerFundingLimits::default(),
+            CompositionLimits::default(),
+            1,
+        )
+        .expect("async runtime fixture configuration"),
+    )
+    .await
+    .expect("initialize async runtime fixture");
+    let trade = ExactInRfqTrade::new(
+        VenueContext {
+            chain,
+            market: contract_id(),
+            policy_asset,
+        },
+        AssetAmount::new(policy_asset, 100).expect("fixture exact-in amount"),
+        outcome_asset,
+        170,
+        10,
+        100,
+    );
+
+    AsyncRuntimeFixture {
+        _wallet_directory: wallet_directory,
+        _journal_directory: journal_directory,
+        identity,
+        policy_asset,
+        runtime,
+        source,
+        market,
+        trade,
+        session,
+        server,
+        observed,
+    }
+}
+
+#[tokio::test]
+async fn pending_startup_holds_and_cancellation_releases_wallet_funding_authority() {
+    let (_wallet_directory, wallet, identity, chain, policy_asset, config) =
+        empty_runtime_fixture(0xa1);
+    let journal_directory = tempfile::tempdir().expect("pending startup journal directory");
+    let binding = ExecutionJournalBinding::new(
+        FixedBytes32::new([0xa4; 32]),
+        FixedBytes32::new(wallet.instance_id().to_bytes()),
+        SecretKey::from_bytes(&[0xa1; 32]).public(),
+        chain,
+        policy_asset,
+    )
+    .expect("pending startup journal binding");
+    let journal =
+        RedbExecutionJournal::create(journal_directory.path().join("executions.redb"), binding)
+            .expect("pending startup journal");
+    let source = PendingInventorySource {
+        started: Notify::new(),
+    };
+    let started = source.started.notified();
+    tokio::pin!(started);
+
+    {
+        let startup =
+            RfqTakerRuntime::from_source(Arc::clone(&wallet), identity, &source, journal, config);
+        tokio::pin!(startup);
+        tokio::select! {
+            result = &mut startup => panic!("pending inventory unexpectedly completed: {result:?}"),
+            () = &mut started => {}
+        }
+        assert!(matches!(
+            TakerFundingPool::claim(Arc::clone(&wallet), identity),
+            Err(TakerFundingError::FundingPoolAuthorityAlreadyClaimed)
+        ));
+    }
+
+    let claim = TakerFundingPool::claim(wallet, identity)
+        .expect("cancelling startup releases the singleton funding authority");
+    drop(claim);
+}
+
+#[tokio::test]
+async fn mismatched_empty_journal_fails_before_async_inventory_is_polled() {
+    let (_wallet_directory, wallet, identity, chain, policy_asset, config) =
+        empty_runtime_fixture(0xb1);
+    let journal_directory = tempfile::tempdir().expect("mismatched journal directory");
+    let binding = ExecutionJournalBinding::new(
+        FixedBytes32::new([0xb4; 32]),
+        FixedBytes32::new(wallet.instance_id().to_bytes()),
+        SecretKey::from_bytes(&[0xb5; 32]).public(),
+        chain,
+        policy_asset,
+    )
+    .expect("mismatched journal binding");
+    let journal =
+        RedbExecutionJournal::create(journal_directory.path().join("executions.redb"), binding)
+            .expect("mismatched empty journal");
+    let source = CountingInventorySource::default();
+
+    assert!(matches!(
+        RfqTakerRuntime::from_source(wallet, identity, &source, journal, config).await,
+        Err(RfqTakerError::FundingRecovery(
+            FundingRecoveryError::JournalBindingClientEndpointMismatch
+        ))
+    ));
+    assert_eq!(source.calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_or_failed_inventory_refresh_preserves_the_prior_usable_inventory() {
+    let fixture = async_runtime_fixture(0xc1, 1).await;
+    let pending_source = PendingInventorySource {
+        started: Notify::new(),
+    };
+
+    {
+        let started = pending_source.started.notified();
+        tokio::pin!(started);
+        let refresh = fixture.runtime.refresh_inventory(&pending_source);
+        tokio::pin!(refresh);
+        tokio::select! {
+            result = &mut refresh => panic!("pending refresh unexpectedly completed: {result:?}"),
+            () = &mut started => {}
+        }
+    }
+
+    let after_cancellation = fixture
+        .runtime
+        .reserve_exact_in(&fixture.market, fixture.trade.clone())
+        .expect("cancelled refresh leaves the previous inventory usable");
+    drop(after_cancellation);
+
+    assert!(matches!(
+        fixture
+            .runtime
+            .refresh_inventory(&FailingInventorySource)
+            .await,
+        Err(RfqTakerError::InventorySource(_))
+    ));
+    let after_source_error = fixture
+        .runtime
+        .reserve_exact_in(&fixture.market, fixture.trade.clone())
+        .expect("failed refresh leaves the previous inventory usable");
+    drop(after_source_error);
+    assert!(
+        fixture
+            .runtime
+            .pending_executions()
+            .expect("empty journal remains readable")
+            .is_empty()
+    );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_arm_while_inventory_refresh_is_pending_rejects_the_stale_snapshot() {
+    let fixture = async_runtime_fixture(0xc2, 1).await;
+    let refresh_source = GatedInventorySource::new(fixture.source.inventory.clone());
+
+    {
+        let started = refresh_source.started.notified();
+        tokio::pin!(started);
+        let refresh = fixture.runtime.refresh_inventory(&refresh_source);
+        tokio::pin!(refresh);
+        tokio::select! {
+            result = &mut refresh => panic!("gated refresh unexpectedly completed: {result:?}"),
+            () = &mut started => {}
+        }
+
+        let reserved = fixture
+            .runtime
+            .reserve_exact_in(&fixture.market, fixture.trade.clone())
+            .expect("reserve funding while refresh is pending");
+        let prepared = reserved
+            .request_quote_at(
+                &fixture.session,
+                IdempotencyKeyDto::new([0xc3; 32]),
+                1_500,
+                1_500,
+            )
+            .await
+            .expect("prepare trade while refresh is pending");
+        let armed = fixture
+            .runtime
+            .accept_at(&fixture.session, &fixture.source, prepared, 1_600, 1_700)
+            .await
+            .expect("durably arm and execute trade while refresh is pending");
+        assert!(matches!(
+            armed.observation(),
+            ExecutionJournalObservation::Committed(_)
+        ));
+
+        refresh_source.release.notify_one();
+        assert!(matches!(
+            refresh.await,
+            Err(RfqTakerError::Funding(
+                TakerFundingError::StaleInventoryRefresh
+            ))
+        ));
+    }
+
+    assert!(matches!(
+        fixture
+            .runtime
+            .reserve_exact_in(&fixture.market, fixture.trade.clone()),
+        Err(RfqTakerError::Funding(
+            TakerFundingError::InsufficientFunds { .. }
+        ))
+    ));
+    assert_eq!(
+        fixture
+            .runtime
+            .pending_executions()
+            .expect("durably armed execution is discoverable")
+            .len(),
+        1
+    );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn readiness_revoked_while_inventory_refresh_is_pending_prevents_snapshot_install() {
+    let fixture = async_runtime_fixture(0xc4, 2).await;
+    let first = fixture
+        .runtime
+        .reserve_exact_in(&fixture.market, fixture.trade.clone())
+        .expect("reserve first disjoint input");
+    let second = fixture
+        .runtime
+        .reserve_exact_in(&fixture.market, fixture.trade.clone())
+        .expect("reserve second disjoint input");
+    let first = first
+        .request_quote_at(
+            &fixture.session,
+            IdempotencyKeyDto::new([0xc5; 32]),
+            1_500,
+            1_500,
+        )
+        .await
+        .expect("prepare first trade");
+    let second = second
+        .request_quote_at(
+            &fixture.session,
+            IdempotencyKeyDto::new([0xc6; 32]),
+            1_500,
+            1_500,
+        )
+        .await
+        .expect("prepare conflicting trade");
+    fixture
+        .runtime
+        .accept_at(&fixture.session, &fixture.source, first, 1_600, 1_700)
+        .await
+        .expect("first attempt establishes the journal key");
+
+    let (foreign_directory, foreign_wallet) = empty_taker_wallet(fixture.identity);
+    let (_, _, foreign_utxo) =
+        taker_funding_utxo(&foreign_wallet, fixture.policy_asset, 200, 0xf1, 0xf2);
+    let refresh_source = GatedInventorySource::new(vec![foreign_utxo]);
+    {
+        let started = refresh_source.started.notified();
+        tokio::pin!(started);
+        let refresh = fixture.runtime.refresh_inventory(&refresh_source);
+        tokio::pin!(refresh);
+        tokio::select! {
+            result = &mut refresh => panic!("gated refresh unexpectedly completed: {result:?}"),
+            () = &mut started => {}
+        }
+
+        assert!(matches!(
+            fixture
+                .runtime
+                .accept_at(&fixture.session, &fixture.source, second, 1_600, 1_700)
+                .await,
+            Err(RfqTakerError::JournalArmAmbiguous {
+                source: ExecutionJournalError::AttemptConflict,
+                ..
+            })
+        ));
+        assert!(!fixture.runtime.is_ready());
+
+        refresh_source.release.notify_one();
+        assert!(matches!(refresh.await, Err(RfqTakerError::RestartRequired)));
+    }
+    drop(foreign_wallet);
+    drop(foreign_directory);
+
+    assert_eq!(
+        fixture
+            .runtime
+            .pending_executions()
+            .expect("pending executions remain readable after readiness revocation")
+            .len(),
+        1
+    );
+    let observed = fixture.observed.lock().expect("observed request lock");
+    assert_eq!(observed.blind_count, 2);
+    assert_eq!(observed.execute_count, 1);
+    drop(observed);
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_or_failed_settlement_snapshot_leaves_trade_unarmed_and_funding_reusable() {
+    let fixture = async_runtime_fixture(0xc7, 1).await;
+    let pending_source = PendingSettlementSource {
+        started: Notify::new(),
+    };
+    let first = fixture
+        .runtime
+        .reserve_exact_in(&fixture.market, fixture.trade.clone())
+        .expect("reserve first settlement attempt")
+        .request_quote_at(
+            &fixture.session,
+            IdempotencyKeyDto::new([0xc8; 32]),
+            1_500,
+            1_500,
+        )
+        .await
+        .expect("prepare first settlement attempt");
+
+    {
+        let started = pending_source.started.notified();
+        tokio::pin!(started);
+        let acceptance =
+            fixture
+                .runtime
+                .accept_at(&fixture.session, &pending_source, first, 1_600, 1_700);
+        tokio::pin!(acceptance);
+        tokio::select! {
+            result = &mut acceptance => panic!("pending settlement unexpectedly completed: {result:?}"),
+            () = &mut started => {}
+        }
+        let observed = fixture.observed.lock().expect("observed request lock");
+        assert_eq!(observed.blind_count, 1);
+        assert_eq!(observed.execute_count, 0);
+    }
+
+    assert!(
+        fixture
+            .runtime
+            .pending_executions()
+            .expect("journal remains readable after cancellation")
+            .is_empty()
+    );
+    let second = fixture
+        .runtime
+        .reserve_exact_in(&fixture.market, fixture.trade.clone())
+        .expect("cancelled settlement snapshot releases the funding lease")
+        .request_quote_at(
+            &fixture.session,
+            IdempotencyKeyDto::new([0xc9; 32]),
+            1_500,
+            1_500,
+        )
+        .await
+        .expect("prepare source-error settlement attempt");
+    assert!(matches!(
+        fixture
+            .runtime
+            .accept_at(
+                &fixture.session,
+                &FailingSettlementSource,
+                second,
+                1_600,
+                1_700,
+            )
+            .await,
+        Err(RfqTakerError::Authorization(
+            TakerAuthorizationError::Source(_)
+        ))
+    ));
+
+    assert!(
+        fixture
+            .runtime
+            .pending_executions()
+            .expect("journal remains readable after source failure")
+            .is_empty()
+    );
+    let after_source_error = fixture
+        .runtime
+        .reserve_exact_in(&fixture.market, fixture.trade.clone())
+        .expect("settlement source failure releases the funding lease");
+    drop(after_source_error);
+    let observed = fixture.observed.lock().expect("observed request lock");
+    assert_eq!(observed.quote_count, 2);
+    assert_eq!(observed.blind_count, 2);
+    assert_eq!(observed.execute_count, 0);
+    drop(observed);
+
+    fixture.shutdown().await;
 }

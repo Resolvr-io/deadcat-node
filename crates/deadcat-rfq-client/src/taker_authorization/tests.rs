@@ -1,7 +1,9 @@
-//! Offline whole-PSET coordinator tests.
+//! Offline whole-PSET authorization tests.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use async_trait::async_trait;
 use deadcat_client::composition::{
     BlinderRef, CompositionLimits, InputId, InputSequence, InputSpec, LockTimeConstraint,
     NetworkFee, OutputId, OutputSpec, TransactionContribution,
@@ -527,6 +529,7 @@ fn fixture(wallet_mode: WalletMode, minimum_absolute_fee: u64) -> Fixture {
         now: 2_000,
         market,
         prevouts: authoritative,
+        calls: AtomicUsize::new(0),
     };
     let wallet = TestWallet {
         user,
@@ -551,18 +554,18 @@ struct TestSource {
     now: u64,
     market: TradingMarket,
     prevouts: Vec<AuthoritativeTakerPrevout>,
+    calls: AtomicUsize,
 }
 
+#[async_trait]
 impl TakerSettlementSource for TestSource {
     type Error = TestFailure;
 
-    fn settlement_snapshot(
+    async fn settlement_snapshot(
         &self,
-        _: ChainIdentity,
-        _: ContractId,
-        _: ChainAnchor,
-        _: &[OutPoint],
+        _: TakerSettlementSnapshotRequest,
     ) -> Result<TakerSettlementSnapshot, Self::Error> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(TakerSettlementSnapshot::new(
             self.now,
             self.market.clone(),
@@ -671,65 +674,76 @@ impl TakerWalletFinalizer for TestWallet {
     }
 }
 
-fn authorize(fixture: &Fixture) -> Result<SettlementPset, TakerAuthorizationError> {
-    TakerSettlementCoordinator::new(fixture.plan.clone(), &fixture.source, &fixture.wallet)
-        .validate_and_sign(&fixture.binding, &fixture.layout, &fixture.provider_blinded)
+async fn authorize(fixture: &Fixture) -> Result<SettlementPset, TakerAuthorizationError> {
+    let response = ProviderBlindedPset::from_test_parts(
+        fixture.binding,
+        fixture.layout.clone(),
+        fixture.provider_blinded.clone(),
+    );
+    let preflight = response.preflight_with(fixture.plan.clone())?;
+    let observed = preflight.observe(&fixture.source).await?;
+    Ok(observed.authorize(&fixture.wallet)?.pset().clone())
 }
 
-#[test]
-fn authorizes_valid_confidential_settlement() {
+#[tokio::test]
+async fn authorizes_valid_confidential_settlement() {
     let fixture = fixture(WalletMode::Valid, 1);
-    let signed = authorize(&fixture).expect("valid settlement");
+    let signed = authorize(&fixture).await.expect("valid settlement");
     let pset = signed.to_pset().expect("signed PSET");
     assert!(pset.inputs()[0].tap_key_sig.is_some());
     assert!(pset.inputs()[1].tap_key_sig.is_some());
     assert!(pset.inputs()[2].tap_key_sig.is_none());
 }
 
-#[test]
-fn rejects_expired_quote_before_wallet_work() {
+#[tokio::test]
+async fn rejects_expired_quote_before_wallet_work() {
     let mut fixture = fixture(WalletMode::Valid, 1);
     fixture.source.now = 30_000;
     assert!(matches!(
-        authorize(&fixture),
+        authorize(&fixture).await,
         Err(TakerAuthorizationError::QuoteNotLive { .. })
     ));
 }
 
-#[test]
-fn rejects_authoritative_prevout_mismatch() {
+#[tokio::test]
+async fn rejects_authoritative_prevout_mismatch() {
     let mut fixture = fixture(WalletMode::Valid, 1);
     fixture.source.prevouts[0].txout.value = Value::Explicit(123);
     assert!(matches!(
-        authorize(&fixture),
+        authorize(&fixture).await,
         Err(TakerAuthorizationError::InvalidInput { index: 0, .. })
     ));
 }
 
-#[test]
-fn rejects_authoritative_provider_proof_mismatch() {
+#[tokio::test]
+async fn rejects_authoritative_provider_proof_mismatch() {
     let mut fixture = fixture(WalletMode::Valid, 1);
     fixture.source.prevouts[2].txout.witness.surjection_proof = None;
     assert!(matches!(
-        authorize(&fixture),
+        authorize(&fixture).await,
         Err(TakerAuthorizationError::InvalidInput { index: 2, .. })
     ));
 }
 
-#[test]
-fn rejects_provider_mutation_outside_blinding_scope() {
+#[tokio::test]
+async fn rejects_provider_mutation_outside_blinding_scope() {
     let mut fixture = fixture(WalletMode::Valid, 1);
     let mut provider = fixture.provider_blinded.to_pset().expect("provider PSET");
     provider.inputs_mut()[0].final_script_witness = Some(vec![vec![0x01]]);
     fixture.provider_blinded = SettlementPset::from_pset(&provider).expect("mutated PSET");
     assert!(matches!(
-        authorize(&fixture),
+        authorize(&fixture).await,
         Err(TakerAuthorizationError::ProviderMutation(_))
     ));
+    assert_eq!(
+        fixture.source.calls.load(Ordering::Relaxed),
+        0,
+        "local preflight must reject before authoritative source I/O"
+    );
 }
 
-#[test]
-fn rejects_provider_poisoned_owned_output_nonce() {
+#[tokio::test]
+async fn rejects_provider_poisoned_owned_output_nonce() {
     let mut fixture = fixture(WalletMode::Valid, 1);
     let mut provider = fixture.provider_blinded.to_pset().expect("provider PSET");
     let receive_index = usize::from(
@@ -748,45 +762,50 @@ fn rejects_provider_poisoned_owned_output_nonce() {
         )));
     fixture.provider_blinded = SettlementPset::from_pset(&provider).expect("mutated PSET");
     assert!(matches!(
-        authorize(&fixture),
+        authorize(&fixture).await,
         Err(TakerAuthorizationError::Wallet(_))
     ));
 }
 
-#[test]
-fn rejects_wallet_mutation_during_blinding() {
+#[tokio::test]
+async fn rejects_wallet_mutation_during_blinding() {
     let fixture = fixture(WalletMode::MutateDuringBlinding, 1);
     assert!(matches!(
-        authorize(&fixture),
+        authorize(&fixture).await,
         Err(TakerAuthorizationError::WalletMutation(_))
     ));
 }
 
-#[test]
-fn rejects_wallet_mutation_during_signing() {
+#[tokio::test]
+async fn rejects_wallet_mutation_during_signing() {
     let fixture = fixture(WalletMode::MutateDuringSigning, 1);
     assert!(matches!(
-        authorize(&fixture),
+        authorize(&fixture).await,
         Err(TakerAuthorizationError::WalletMutation(_))
     ));
 }
 
-#[test]
-fn rejects_invalid_wallet_signature() {
+#[tokio::test]
+async fn rejects_invalid_wallet_signature() {
     let fixture = fixture(WalletMode::InvalidSignature, 1);
     assert!(matches!(
-        authorize(&fixture),
+        authorize(&fixture).await,
         Err(TakerAuthorizationError::InvalidSignature { index: 0, .. })
     ));
 }
 
-#[test]
-fn rejects_fee_policy_before_wallet_blinding() {
+#[tokio::test]
+async fn rejects_fee_policy_before_wallet_blinding() {
     let fixture = fixture(WalletMode::Valid, FEE + 1);
     assert!(matches!(
-        authorize(&fixture),
+        authorize(&fixture).await,
         Err(TakerAuthorizationError::FeePolicy(_))
     ));
+    assert_eq!(
+        fixture.source.calls.load(Ordering::Relaxed),
+        0,
+        "fee policy is part of local preflight"
+    );
 }
 
 #[test]

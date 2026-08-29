@@ -750,9 +750,14 @@ ambiguous-send, conflict/outspend, and reorganization process coverage, host
 memory hardening, and HSM support remain outside the current slice. A dedicated
 live liquidregtest gate now crosses the shipped provider process, direct Iroh,
 Elements Core, hard restart, durable exact-relay recovery, and confirmation.
-The taker integration now implements the keyless whole-PSET authorization, the
-first concrete custom-wallet funding boundary, and a high-level one-provider
-quote-to-journal runtime. The wallet authenticates caller-supplied confidential
+The taker integration now implements a two-phase keyless whole-PSET
+authorization boundary, the first concrete custom-wallet funding boundary, and
+a high-level one-provider quote-to-journal runtime. Local preflight rejects
+provider binding, mutation, disclosure, shape, and fee-policy failures before
+requesting external evidence. It then yields an owned exact request for an
+asynchronous authoritative source; after the coherent snapshot returns, there
+is no yield before current-state validation, wallet blinding, full proof checks,
+and signing. The wallet authenticates caller-supplied confidential
 inventory, exclusively leases the complete worst-case input set before a quote
 fixes the fee and shape, creates exact confidential change, and scopes blinding,
 owned-output recovery, and one-shot signing to the final route and composition
@@ -766,7 +771,9 @@ retry reuses the journaled bytes; ambiguity at either durable boundary revokes
 readiness and requires restart recovery.
 
 Startup and inventory refresh reconstruct funding exclusions from the complete
-journal before admitting new reservations. Only an authenticated `Released`
+journal bound to the exact state bundle, wallet generation, client, chain, and
+policy asset before awaiting authoritative inventory and admitting new
+reservations. Only an authenticated `Released`
 observation permits reuse; `Armed`, `Reserved`, `Committed`, and `Signed` all
 remain excluded. In particular, provider-terminal `Signed` is not wallet-
 terminal because that valid transaction may still be broadcast. Explicit

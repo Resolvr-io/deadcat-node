@@ -17,6 +17,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use bitcoind::bitcoincore_rpc::{Auth, Client, RpcApi as _};
 use bitcoind::{BitcoinD, Conf, P2P};
 use deadcat_client::composition::CompositionLimits;
@@ -28,7 +29,7 @@ use deadcat_rfq::elements::{ElementsCoreAuth, ElementsCoreConfig, ElementsCoreSo
 use deadcat_rfq_client::{
     AuthoritativeTakerPrevout, ExecutionJournalBinding, ExecutionJournalKey,
     ExecutionJournalObservation, ProviderTarget, RedbExecutionJournal, RfqSession, SessionConfig,
-    TakerSettlementSnapshot, TakerSettlementSource, TradingMarket,
+    TakerSettlementSnapshot, TakerSettlementSnapshotRequest, TakerSettlementSource, TradingMarket,
 };
 use deadcat_rfq_iroh::{ClientConfig, EndpointAddr, SecretKey};
 use deadcat_rfq_provider::{
@@ -127,12 +128,8 @@ impl LiveTakerSource {
             .ok_or_else(|| io::Error::other(format!("missing RFQ prevout {outpoint}")))?;
         Ok(AuthoritativeTakerPrevout::new(outpoint, txout))
     }
-}
 
-impl TakerInventorySource for LiveTakerSource {
-    type Error = io::Error;
-
-    fn inventory(&self) -> Result<Vec<TakerWalletUtxo>, Self::Error> {
+    fn inventory_sync(&self) -> Result<Vec<TakerWalletUtxo>, io::Error> {
         let rpc = self.rpc()?;
         let initial_tip = Self::best_block_hash(&rpc)?;
         for utxo in &self.inventory {
@@ -146,34 +143,27 @@ impl TakerInventorySource for LiveTakerSource {
         }
         Ok(self.inventory.clone())
     }
-}
 
-impl TakerSettlementSource for LiveTakerSource {
-    type Error = io::Error;
-
-    fn settlement_snapshot(
+    fn settlement_snapshot_sync(
         &self,
-        chain: ChainIdentity,
-        market: ContractId,
-        quote_anchor: ChainAnchor,
-        outpoints: &[OutPoint],
-    ) -> Result<TakerSettlementSnapshot, Self::Error> {
-        if chain != self.chain
-            || market != self.market.contract_id()
-            || quote_anchor != self.market.observed_at()
+        request: TakerSettlementSnapshotRequest,
+    ) -> Result<TakerSettlementSnapshot, io::Error> {
+        if request.chain() != self.chain
+            || request.market() != self.market.contract_id()
+            || request.quote_anchor() != self.market.observed_at()
         {
             return Err(io::Error::other("RFQ settlement snapshot binding mismatch"));
         }
         let rpc = self.rpc()?;
         let initial_tip = Self::best_block_hash(&rpc)?;
-        if initial_tip != quote_anchor.hash {
+        if initial_tip != request.quote_anchor().hash {
             return Err(io::Error::other(
                 "RFQ settlement snapshot is not at the quoted chain anchor",
             ));
         }
         let mut unique = BTreeSet::new();
-        let mut prevouts = Vec::with_capacity(outpoints.len());
-        for outpoint in outpoints {
+        let mut prevouts = Vec::with_capacity(request.outpoints().len());
+        for outpoint in request.outpoints() {
             if !unique.insert(*outpoint) {
                 return Err(io::Error::other("duplicate RFQ settlement prevout"));
             }
@@ -190,6 +180,33 @@ impl TakerSettlementSource for LiveTakerSource {
             self.market.clone(),
             prevouts,
         ))
+    }
+}
+
+#[async_trait]
+impl TakerInventorySource for LiveTakerSource {
+    type Error = io::Error;
+
+    async fn inventory(&self) -> Result<Vec<TakerWalletUtxo>, Self::Error> {
+        let source = self.clone();
+        tokio::task::spawn_blocking(move || source.inventory_sync())
+            .await
+            .map_err(source_error)?
+    }
+}
+
+#[async_trait]
+impl TakerSettlementSource for LiveTakerSource {
+    type Error = io::Error;
+
+    async fn settlement_snapshot(
+        &self,
+        request: TakerSettlementSnapshotRequest,
+    ) -> Result<TakerSettlementSnapshot, Self::Error> {
+        let source = self.clone();
+        tokio::task::spawn_blocking(move || source.settlement_snapshot_sync(request))
+            .await
+            .map_err(source_error)?
     }
 }
 
@@ -1066,6 +1083,7 @@ async fn provider_daemon_quotes_signs_relays_and_recovers_after_restart() {
         )
         .expect("valid taker runtime configuration"),
     )
+    .await
     .expect("initialize taker runtime from live Core evidence");
     let context = VenueContext {
         chain,

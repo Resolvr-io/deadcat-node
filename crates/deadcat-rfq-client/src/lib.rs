@@ -5,10 +5,12 @@
 //! remote provider and chain, verifies quote attestations and validity, and
 //! converts an accepted quote into a symbolic transaction contribution.
 //!
-//! It never owns taker wallet keys. Its keyless whole-PSET coordinator validates
-//! the provider's blinding turn, delegates balancing blinding and taker signing
-//! through caller-owned wallet capabilities, and independently validates the
-//! result. Broadcast and confirmation monitoring remain caller responsibilities.
+//! It never owns taker wallet keys. Its keyless two-phase whole-PSET
+//! authorization validates the provider's blinding turn, crosses an
+//! authoritative asynchronous state source, delegates balancing blinding and
+//! taker signing through caller-owned wallet capabilities, and independently
+//! validates the result. Broadcast and confirmation monitoring remain caller
+//! responsibilities.
 
 #![forbid(unsafe_code)]
 
@@ -33,14 +35,14 @@ pub use session::{
 pub use settlement::{
     EXECUTION_ATTEMPT_RECORD_VERSION, ExecutionAttempt, ExecutionAttemptDigest,
     ExecutionAttemptError, ExecutionAttemptRecord, ExecutionBinding, ProviderBlindedPset,
-    SignedExecutionError, TakerAuthorizedSettlement, TakerSettlementAuthorizer,
-    VerifiedSignedExecution,
+    SignedExecutionError, TakerAuthorizedSettlement, VerifiedSignedExecution,
 };
 pub use taker_authorization::{
-    AuthoritativeTakerPrevout, OwnedOutputExpectation, OwnedOutputKind, OwnedOutputValidation,
-    TakerAuthorizationError, TakerSettlementCoordinator, TakerSettlementPlan,
-    TakerSettlementPlanError, TakerSettlementSnapshot, TakerSettlementSource,
-    TakerWalletBlindingJob, TakerWalletFinalizer, TakerWalletSigningJob,
+    AuthoritativeTakerPrevout, ObservedTakerAuthorization, OwnedOutputExpectation, OwnedOutputKind,
+    OwnedOutputValidation, PreparedTakerAuthorization, TakerAuthorizationError,
+    TakerSettlementPlan, TakerSettlementPlanError, TakerSettlementSnapshot,
+    TakerSettlementSnapshotRequest, TakerSettlementSource, TakerWalletBlindingJob,
+    TakerWalletFinalizer, TakerWalletSigningJob,
 };
 pub use venue::{
     PreparedRfqLeg, QuoteBounds, RfqLegBinding, RfqQuoteIntent, RfqVenueError, TradingMarket,

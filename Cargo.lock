@@ -1030,6 +1030,7 @@ name = "deadcat-rfq"
 version = "0.1.0-alpha"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bitcoind",
  "clap",
  "deadcat-client",
@@ -1064,6 +1065,7 @@ dependencies = [
 name = "deadcat-rfq-client"
 version = "0.1.0-alpha"
 dependencies = [
+ "async-trait",
  "deadcat-client",
  "deadcat-contracts",
  "deadcat-liquid-settlement",
@@ -1137,6 +1139,7 @@ dependencies = [
 name = "deadcat-rfq-taker"
 version = "0.1.0-alpha"
 dependencies = [
+ "async-trait",
  "deadcat-client",
  "deadcat-contracts",
  "deadcat-rfq-client",

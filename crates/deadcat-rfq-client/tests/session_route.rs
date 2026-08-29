@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use deadcat_client::composition::{
     BlinderRef, CompositionLimits, InputId, InputSequence, InputSpec, LockTimeConstraint,
     NetworkFee, OutputId, OutputSpec, TransactionContribution,
@@ -13,8 +14,8 @@ use deadcat_contracts::binary_market::BinaryMarketSlot;
 use deadcat_rfq_client::{
     AuthoritativeTakerPrevout, ExecuteError, ExecutionJournal as _, ExecutionJournalBinding,
     PreparedRfqLeg, ProviderTarget, QuoteBounds, RedbExecutionJournal, RfqQuoteIntent, RfqSession,
-    SessionConfig, SessionError, TakerAuthorizationError, TakerSettlementCoordinator,
-    TakerSettlementPlan, TakerSettlementSnapshot, TakerSettlementSource, TradingMarket,
+    SessionConfig, SessionError, TakerAuthorizationError, TakerSettlementPlan,
+    TakerSettlementSnapshot, TakerSettlementSnapshotRequest, TakerSettlementSource, TradingMarket,
 };
 use deadcat_rfq_iroh::{ClientConfig, DiscoveryMode, RequestHandler, Server, ServerConfig};
 use deadcat_rfq_rpc::{
@@ -421,25 +422,24 @@ struct TestSettlementSource {
     prevouts: BTreeMap<OutPoint, TxOut>,
 }
 
+#[async_trait]
 impl TakerSettlementSource for TestSettlementSource {
     type Error = std::io::Error;
 
-    fn settlement_snapshot(
+    async fn settlement_snapshot(
         &self,
-        chain: ChainIdentity,
-        market: ContractId,
-        quote_anchor: ChainAnchor,
-        outpoints: &[OutPoint],
+        request: TakerSettlementSnapshotRequest,
     ) -> Result<TakerSettlementSnapshot, Self::Error> {
-        if chain != self.chain
-            || market != self.market.contract_id()
-            || quote_anchor != self.market.observed_at()
+        if request.chain() != self.chain
+            || request.market() != self.market.contract_id()
+            || request.quote_anchor() != self.market.observed_at()
         {
             return Err(std::io::Error::other(
                 "settlement snapshot binding mismatch",
             ));
         }
-        let prevouts = outpoints
+        let prevouts = request
+            .outpoints()
             .iter()
             .map(|outpoint| {
                 self.prevouts
@@ -766,12 +766,23 @@ async fn authenticated_session_prepares_composes_and_executes_an_exact_rfq_route
             .as_ref(),
         "the authenticated response survives the provider serialization round trip"
     );
-    let coordinator = TakerSettlementCoordinator::new(plan, &source, &settlement_wallet);
-    let authorized = blinded
-        .authorize_with(&coordinator)
+    let first_observed = blinded
+        .preflight_with(plan.clone())
+        .expect("local provider-response preflight")
+        .observe(&source)
+        .await
+        .expect("authoritative settlement snapshot");
+    let second_observed = blinded
+        .preflight_with(plan)
+        .expect("repeat local provider-response preflight")
+        .observe(&source)
+        .await
+        .expect("repeat authoritative settlement snapshot");
+    let authorized = first_observed
+        .authorize(&settlement_wallet)
         .expect("authoritative wallet-backed taker authorization");
-    let second_signing_error = blinded
-        .authorize_with(&coordinator)
+    let second_signing_error = second_observed
+        .authorize(&settlement_wallet)
         .expect_err("one settlement-scoped wallet capability signs only once");
     assert!(matches!(
         second_signing_error,
@@ -781,7 +792,6 @@ async fn authenticated_session_prepares_composes_and_executes_an_exact_rfq_route
                 Some(PersistentWalletError::TakerSettlementAlreadySigned)
             )
     ));
-    drop(coordinator);
     let attempt = authorized.into_execution_attempt();
     let journal_directory = tempfile::tempdir().expect("execution journal directory");
     let journal_binding = ExecutionJournalBinding::new(

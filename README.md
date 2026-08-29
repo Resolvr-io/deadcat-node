@@ -81,11 +81,13 @@ and chain, verifies signed quote authenticity separately from current liveness,
 normalizes exact RFQ intents into venue-neutral legs, retains durable recovery
 bindings, resolves quote-local IDs against the final global route layout, and
 separates provider-blinded PSETs from wallet-authorized, journalable execution
-attempts. Its keyless whole-PSET coordinator binds the exact route, RFQ, and
-validated market; checks provider-only mutation scope, coherent fresh market
-and chain state, authoritative prevouts, economics, owned-output openings,
-confidential proofs/balance, signatures, and fee/weight policy; then delegates
-balancing blinding and taker signing as two separate caller-wallet capabilities.
+attempts. Its keyless whole-PSET authorization first binds the exact route, RFQ,
+and validated market and locally checks provider-only mutation scope,
+disclosures, structure, economics, and fee/weight policy. Only then does it
+yield an owned exact request for asynchronous authoritative market, chain, and
+prevout evidence. Once that evidence returns, current-state validation,
+owned-output recovery, balancing blinding, confidential proof/balance checks,
+and taker signing run without another asynchronous cancellation point.
 The durable client journal arms exact attempts before Execute, performs
 status-first byte-identical recovery, and verifies the provider-signed result.
 Execute transport failures remain ambiguous until that recovery reconciles
@@ -97,7 +99,8 @@ local fee floor, and never exceeds the user's absolute fee authorization. The
 first Execute is sent only after the exact taker-signed PSET is durably
 journaled and its wallet inputs are promoted into the durable exclusion set.
 Startup and inventory refresh rebuild those exclusions from the complete
-identity-matched journal:
+journal bound to the exact wallet generation, client, chain, and policy asset,
+then obtain authoritative inventory through an asynchronous source boundary:
 every observation except an opaque session-authenticated `Released` remains
 excluded, including `Signed`, because the valid transaction may still be
 broadcast later. The redb journal

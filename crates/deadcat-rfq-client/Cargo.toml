@@ -9,6 +9,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
 deadcat-client.workspace = true
 deadcat-liquid-settlement.workspace = true
 deadcat-rfq-iroh.workspace = true
