@@ -783,7 +783,7 @@ async fn authenticated_session_prepares_composes_and_executes_an_exact_rfq_route
     drop(coordinator);
     let attempt = authorized.into_execution_attempt();
     let journal_directory = tempfile::tempdir().expect("execution journal directory");
-    let journal = RedbExecutionJournal::open(journal_directory.path().join("executions.redb"))
+    let journal = RedbExecutionJournal::create(journal_directory.path().join("executions.redb"))
         .expect("durable execution journal");
     let recovery = replay
         .to_recovery_record()
@@ -825,8 +825,15 @@ async fn authenticated_session_prepares_composes_and_executes_an_exact_rfq_route
         .await
         .expect("typed provider execute request");
     assert!(matches!(
-        executed.state,
+        executed.status().state,
         ReservationStateDto::Committed { .. }
+    ));
+    let observed_execution = journal
+        .observe(journaled.key(), journaled.revision(), &executed)
+        .expect("persist authenticated Execute observation");
+    assert!(matches!(
+        observed_execution.observation(),
+        deadcat_rfq_client::ExecutionJournalObservation::Committed(_)
     ));
     assert!(matches!(
         session
@@ -840,7 +847,7 @@ async fn authenticated_session_prepares_composes_and_executes_an_exact_rfq_route
         .status(binding.handle())
         .await
         .expect("typed durable status request");
-    assert_eq!(recovered, executed);
+    assert_eq!(&recovered, executed.status());
 
     let mismatch = session
         .status(binding.handle())
@@ -960,7 +967,7 @@ async fn authenticated_session_prepares_composes_and_executes_an_exact_rfq_route
         .await
         .expect("status-first exact retry after local expiry");
     assert!(matches!(
-        retried.state,
+        retried.status().state,
         ReservationStateDto::Committed { .. }
     ));
     {

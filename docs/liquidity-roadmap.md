@@ -572,8 +572,9 @@ that future RFQ, AMM, and DLOB layouts will compose safely.
 
 ### Current implementation footholds
 
-The current client contains the first venue-neutral and RFQ-specific seams, but
-not yet the wallet-bearing end-to-end router proposed here:
+The current workspace contains the first venue-neutral and RFQ-specific seams
+plus a one-provider wallet-bearing facade, but not yet the complete runnable,
+multi-venue end-to-end router proposed here:
 
 - [`BinaryMarketTransitionPlan`](../crates/deadcat-client/src/market_builder.rs)
   exposes mandatory outputs at a caller-chosen base and finalizes only against
@@ -665,6 +666,37 @@ not yet the wallet-bearing end-to-end router proposed here:
   results. A direct-Iroh test covers the
   quote-to-compose-to-blind/execute/status boundary with nonzero RFQ offsets
   and proves that provider work may finish after a client timeout.
+- The adjacent
+  [`deadcat-rfq-taker`](../crates/deadcat-rfq-taker/src/lib.rs) facade supplies
+  the high-level one-provider quote-to-journal ordering for the initial launch
+  profile. It leases the complete worst-case taker input set before quote I/O,
+  selects a conservative policy-asset network fee from the authenticated
+  quote's maximum weight, provider fee floors, local rate floor, and the user's
+  absolute cap, and composes, blinds, validates, and signs the final PSET. The
+  exact-input amount and exact-output maximum input are gross trade-asset
+  debits that already include the input-asset venue fee; the policy-asset
+  network fee is additional. Pricing the provider's maximum-weight ceiling is
+  deliberately fail-safe but can materially overpay when that ceiling is much
+  broader than the realized transaction, so the absolute cap remains a hard
+  user authorization and the selected fee must be surfaced. A later
+  shape-aware planner should replace this launch-time conservatism. The facade
+  durably arms that exact attempt, promotes its wallet inputs into the durable
+  exclusion set, and only then permits Execute. Any later clock, transport, or
+  journal-observation failure returns an exact post-arm recovery handle; an
+  ambiguous arm or promotion instead revokes readiness and requires restart
+  recovery. Pending handles remain discoverable through a complete fresh
+  journal scan after task cancellation or restart.
+- Taker journal lifecycle is explicit: creation is no-clobber and opening
+  requires an existing execution table. Runtime startup and inventory refresh
+  page and validate the complete journal against the wallet owner, chain, and
+  policy asset before admitting funding work. Journal observations require an
+  opaque capability minted by an authenticated Execute or exact-retry session
+  path, so a caller cannot manufacture a raw `Released` DTO to clear funding.
+  Every observation except authenticated `Released` keeps the attempt's taker
+  inputs excluded. This deliberately includes `Signed`, because a valid signed
+  transaction may still be broadcast after the observed provider state became
+  terminal. A wallet-wide singleton authority also prevents two runtimes from
+  maintaining independent input-lock maps over one open wallet.
 - The retired
   [`MakerFillPlan`](https://github.com/Resolvr-io/deadcat-node/blob/d7be35b27a020a61333e471b2ded5f59e3a0a039/crates/deadcat-client/src/maker_builder.rs)
   and
@@ -697,25 +729,39 @@ market evidence, a production pricing source, relay/reconciliation,
 authenticated-owner request-rate limits, external backup freshness,
 process-kill acceptance coverage, host memory hardening, and HSM support remain
 outside the current slice.
-The taker integration now implements both the keyless whole-PSET authorization
-and the first concrete custom-wallet funding boundary. The wallet authenticates
-confidential inventory, exclusively leases the complete worst-case input set
-before a quote fixes the fee and shape, creates exact confidential change, and
-scopes blinding, owned-output recovery, and one-shot signing to the final route
-and composition layout. Once the exact wallet-signed PSET is journaled, its
-inputs are promoted into a revision-guarded durable exclusion set; stale chain
-or journal refreshes cannot make an ambiguous attempt spendable again.
+The taker integration now implements the keyless whole-PSET authorization, the
+first concrete custom-wallet funding boundary, and a high-level one-provider
+quote-to-journal runtime. The wallet authenticates caller-supplied confidential
+inventory, exclusively leases the complete worst-case input set before a quote
+fixes the fee and shape, creates exact confidential change, and scopes blinding,
+owned-output recovery, and one-shot signing to the final route and composition
+layout. The runtime selects a conservative fee from authenticated provider
+bounds and the local fee policy, subject to the user's absolute cap. It then
+enforces the irreversible ordering: durably arm the exact wallet-signed PSET,
+promote its inputs into the revision-guarded durable exclusion set, and only
+then dispatch Execute. After journal arm and funding promotion have both
+succeeded, subsequent failures preserve a recovery handle and status-first
+retry reuses the journaled bytes; ambiguity at either durable boundary revokes
+readiness and requires restart recovery.
 
-The remaining production taker runtime must supply the authoritative chain
-scan, fee selection, and the high-level quote-to-journal coordinator. That
-coordinator must obtain the durable-funding proof before the first Execute
-dispatch and restore exclusions from every non-terminal journal record before
-serving new funding work after restart. Broadcast and confirmation monitoring
-also remain future work.
-The initial profile accepts exactly one RFQ leg plus ordinary tree-less P2TR
-key-path inputs with explicit `SIGHASH_ALL`. Simplicity covenant inputs and more
-than one interactive RFQ signer remain later router/venue-verification work;
-they are not accepted merely because they carry a witness.
+Startup and inventory refresh reconstruct funding exclusions from the complete
+journal before admitting new reservations. Only an authenticated `Released`
+observation permits reuse; `Armed`, `Reserved`, `Committed`, and `Signed` all
+remain excluded. In particular, provider-terminal `Signed` is not wallet-
+terminal because that valid transaction may still be broadcast. Explicit
+no-clobber journal creation and open-existing recovery prevent a missing journal
+from being silently replaced during restart.
+
+The remaining production taker work is the concrete authoritative chain-backed
+inventory and settlement source, persisted process configuration and a runnable
+entrypoint that securely creates, opens, and pairs the wallet and journal as one
+process-state bundle, taker broadcast plus confirmation and reorganization
+monitoring, and live regtest coverage across real provider and taker process
+boundaries. The first facade remains a
+one-provider profile; Simplicity covenant inputs and more than one interactive
+RFQ signer are later router/venue-verification work and are not accepted merely
+because they carry a witness. It accepts exactly one RFQ leg plus ordinary
+tree-less P2TR key-path inputs with explicit `SIGHASH_ALL`.
 
 The provider database remains disposable preproduction state during this
 work. Its schema and private record-layout versions intentionally stay at `1`;

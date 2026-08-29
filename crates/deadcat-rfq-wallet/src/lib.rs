@@ -29,7 +29,8 @@ pub use persistent::{
 };
 pub use taker::{
     DurablyArmedTakerFunding, FundedTakerRoute, TakerFundingError, TakerFundingLease,
-    TakerFundingLimits, TakerFundingPool, TakerInventoryRefreshToken, TakerReceiveDestination,
-    TakerSettlementWallet, TakerWalletIdentity, TakerWalletIdentityError, TakerWalletUtxo,
+    TakerFundingLimits, TakerFundingPool, TakerFundingPoolClaim, TakerInventoryRefreshToken,
+    TakerReceiveDestination, TakerSettlementWallet, TakerWalletIdentity, TakerWalletIdentityError,
+    TakerWalletUtxo,
 };
 pub use wallet::{RfqWallet, RfqWalletError};

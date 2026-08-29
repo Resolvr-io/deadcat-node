@@ -1,5 +1,6 @@
 //! Durable taker execution records and exact-retry capabilities.
 
+use std::fs::OpenOptions;
 use std::path::Path;
 
 use deadcat_rfq_rpc::{
@@ -14,7 +15,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
-use crate::session::{QUOTE_RECOVERY_RECORD_VERSION, QuoteRecoveryRecord, ReservationHandle};
+use crate::session::{
+    AuthenticatedExecutionStatus, QUOTE_RECOVERY_RECORD_VERSION, QuoteRecoveryRecord,
+    ReservationHandle,
+};
 use crate::settlement::{
     ExecutionAttempt, ExecutionAttemptError, ExecutionAttemptRecord, ExecutionBinding,
     SignedExecutionError,
@@ -42,6 +46,14 @@ impl ExecutionJournalKey {
             client_endpoint: binding.client_endpoint(),
             reservation_id: binding.reservation_id(),
         }
+    }
+
+    /// Derive the deterministic journal lookup key before attempting a durable
+    /// arm. This carries no execution authority; it lets callers locate a
+    /// record after an ambiguous storage result.
+    #[must_use]
+    pub fn for_attempt(attempt: &ExecutionAttempt) -> Self {
+        Self::from_binding(attempt.binding())
     }
 
     #[must_use]
@@ -92,6 +104,17 @@ impl ExecutionJournalObservation {
             | Self::Committed(status)
             | Self::Signed(status) => Some(status),
         }
+    }
+
+    /// Whether wallet inputs associated with this attempt must remain
+    /// unavailable to new taker settlements.
+    ///
+    /// Only an authenticated, durably recorded `Released` observation proves
+    /// that the provider can no longer sign the attempt. Every other state is
+    /// therefore conservatively treated as still owning the taker funding.
+    #[must_use]
+    pub const fn requires_taker_funding_exclusion(&self) -> bool {
+        !matches!(self, Self::Released(_))
     }
 
     fn from_status(status: ReservationStatusDto) -> Self {
@@ -318,16 +341,16 @@ pub trait ExecutionJournal: sealed::Sealed {
         limit: usize,
     ) -> Result<Vec<JournaledExecution>, ExecutionJournalError>;
 
-    /// Compare-and-swap one authenticated provider status observation.
+    /// Compare-and-swap one authenticated provider execution observation.
     ///
-    /// `status` must come from the session's authenticated status or Execute
-    /// response path. The journal validates its binding and state transition,
-    /// but the DTO alone does not carry transport authentication.
+    /// The opaque capability proves the status came from an authenticated
+    /// execution or exact-retry session path. The journal independently
+    /// validates its binding and state transition before persisting it.
     fn observe(
         &self,
         key: ExecutionJournalKey,
         expected_revision: u64,
-        status: ReservationStatusDto,
+        observation: &AuthenticatedExecutionStatus,
     ) -> Result<JournaledExecution, ExecutionJournalError>;
 }
 
@@ -346,14 +369,61 @@ pub struct RedbExecutionJournal {
 impl sealed::Sealed for RedbExecutionJournal {}
 
 impl RedbExecutionJournal {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, ExecutionJournalError> {
-        let database = Database::create(path)?;
+    /// Bootstrap a new execution journal without replacing any existing file.
+    ///
+    /// Failure after the file is created may leave an invalid file behind. A
+    /// subsequent call will still fail rather than silently replacing it.
+    /// This is an explicit initialization operation, never a fallback after
+    /// [`Self::open`] fails. The embedding process owns secure path selection,
+    /// permissions, directory durability, and wallet/journal lifecycle pairing.
+    pub fn create(path: impl AsRef<Path>) -> Result<Self, ExecutionJournalError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(DatabaseError::from)?;
+        let database = Database::builder().create_file(file)?;
         let journal = Self { database };
         let mut write = journal.database.begin_write()?;
         write.set_durability(Durability::Immediate)?;
         write.open_table(EXECUTIONS)?;
         write.commit()?;
         Ok(journal)
+    }
+
+    /// Open an existing execution journal without creating a missing file or
+    /// initializing a missing table.
+    ///
+    /// redb may repair an unclean existing database while opening it. The
+    /// embedding process remains responsible for detecting stale or replaced
+    /// state and for pairing this journal with the correct wallet generation.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, ExecutionJournalError> {
+        let database = Database::open(path)?;
+        let journal = Self { database };
+        {
+            let read = journal.database.begin_read()?;
+            let _executions = read.open_table(EXECUTIONS)?;
+        }
+        Ok(journal)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn overwrite_record_at_storage_key_for_test(
+        &self,
+        key: ExecutionJournalKey,
+        record: &ExecutionJournalRecord,
+    ) -> Result<(), ExecutionJournalError> {
+        let key = key.to_bytes();
+        let encoded = encode_record(record)?;
+        let mut write = self.database.begin_write()?;
+        write.set_durability(Durability::Immediate)?;
+        {
+            let mut table = write.open_table(EXECUTIONS)?;
+            table.insert(key.as_slice(), encoded.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
     }
 }
 
@@ -418,11 +488,11 @@ impl ExecutionJournal for RedbExecutionJournal {
         for row in table.iter()? {
             let (key, value) = row?;
             let record = JournaledExecution::from_record(decode_record(value.value())?)?;
-            if after.is_some_and(|after| record.key() <= after) {
-                continue;
-            }
             if key.value() != record.key().to_bytes() {
                 return Err(ExecutionJournalError::KeyMismatch);
+            }
+            if after.is_some_and(|after| record.key() <= after) {
+                continue;
             }
             records.push(record);
             if records.len() == limit {
@@ -436,8 +506,9 @@ impl ExecutionJournal for RedbExecutionJournal {
         &self,
         key: ExecutionJournalKey,
         expected_revision: u64,
-        status: ReservationStatusDto,
+        authenticated: &AuthenticatedExecutionStatus,
     ) -> Result<JournaledExecution, ExecutionJournalError> {
+        let status = authenticated.status();
         let key_bytes = key.to_bytes();
         let mut write = self.database.begin_write()?;
         write.set_durability(Durability::Immediate)?;
@@ -451,14 +522,19 @@ impl ExecutionJournal for RedbExecutionJournal {
             if current.key() != key {
                 return Err(ExecutionJournalError::KeyMismatch);
             }
+            if authenticated.journal_key() != key
+                || authenticated.attempt_digest() != current.attempt().digest()
+            {
+                return Err(ExecutionJournalError::AuthenticatedStatusAttemptMismatch);
+            }
             if current.revision() != expected_revision {
                 return Err(ExecutionJournalError::RevisionConflict {
                     expected: expected_revision,
                     actual: current.revision(),
                 });
             }
-            current.validate_next_status(&status)?;
-            let observation = validate_transition(current.observation(), &status)?;
+            current.validate_next_status(status)?;
+            let observation = validate_transition(current.observation(), status)?;
             if &observation == current.observation() {
                 return Ok(current);
             }
@@ -715,6 +791,8 @@ pub enum ExecutionJournalError {
     NotFound,
     #[error("execution-journal lookup key differs from the stored record")]
     KeyMismatch,
+    #[error("authenticated reservation status belongs to a different execution attempt")]
+    AuthenticatedStatusAttemptMismatch,
     #[error("execution-journal revision conflict: expected {expected}, actual {actual}")]
     RevisionConflict { expected: u64, actual: u64 },
     #[error("execution-journal revision space is exhausted")]
@@ -735,4 +813,141 @@ pub enum ExecutionJournalError {
     Commit(#[from] CommitError),
     #[error("redb durability configuration error: {0}")]
     Durability(#[from] SetDurabilityError),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::ErrorKind;
+
+    use super::*;
+    use deadcat_rfq_rpc::{ReleaseReasonDto, SettlementPset};
+    use elements::pset::PartiallySignedTransaction;
+    use redb::TableHandle as _;
+
+    fn status(state: ReservationStateDto) -> ReservationStatusDto {
+        ReservationStatusDto {
+            reservation_id: ReservationIdDto::new([0x11; 32]),
+            quote_commitment: FixedBytes32::new([0x22; 32]),
+            created_at_millis: 100,
+            accept_before_millis: 200,
+            state,
+        }
+    }
+
+    fn assert_database_io_kind(
+        result: Result<RedbExecutionJournal, ExecutionJournalError>,
+        expected: ErrorKind,
+    ) {
+        assert!(matches!(
+            result,
+            Err(ExecutionJournalError::Database(DatabaseError::Storage(
+                StorageError::Io(error)
+            ))) if error.kind() == expected
+        ));
+    }
+
+    #[test]
+    fn journal_create_is_no_clobber_and_open_requires_an_existing_journal() {
+        let directory = tempfile::tempdir().expect("journal directory");
+        let path = directory.path().join("executions.redb");
+
+        assert_database_io_kind(RedbExecutionJournal::open(&path), ErrorKind::NotFound);
+        assert!(!path.exists(), "open must not create a missing journal");
+
+        let journal = RedbExecutionJournal::create(&path).expect("create new journal");
+        assert!(path.exists());
+        assert_database_io_kind(
+            RedbExecutionJournal::create(&path),
+            ErrorKind::AlreadyExists,
+        );
+        drop(journal);
+
+        assert_database_io_kind(
+            RedbExecutionJournal::create(&path),
+            ErrorKind::AlreadyExists,
+        );
+        let reopened = RedbExecutionJournal::open(&path).expect("open existing journal");
+        assert!(
+            reopened
+                .list_after(None, 1)
+                .expect("read initialized journal")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn open_rejects_an_existing_non_journal_database_without_mutating_it() {
+        let directory = tempfile::tempdir().expect("journal directory");
+        let path = directory.path().join("not-a-journal.redb");
+        drop(Database::create(&path).expect("create unrelated redb database"));
+
+        assert!(matches!(
+            RedbExecutionJournal::open(&path),
+            Err(ExecutionJournalError::Table(TableError::TableDoesNotExist(name)))
+                if name == EXECUTIONS.name()
+        ));
+        assert_database_io_kind(
+            RedbExecutionJournal::create(&path),
+            ErrorKind::AlreadyExists,
+        );
+
+        let database = Database::open(&path).expect("reopen unrelated database");
+        let read = database.begin_read().expect("read unrelated database");
+        assert!(
+            read.list_tables()
+                .expect("list unrelated database tables")
+                .next()
+                .is_none(),
+            "opening as a journal must not create the executions table"
+        );
+    }
+
+    #[test]
+    fn open_rejects_an_empty_replacement_without_initializing_it() {
+        let directory = tempfile::tempdir().expect("journal directory");
+        let path = directory.path().join("replaced.redb");
+        drop(std::fs::File::create(&path).expect("create empty replacement"));
+
+        assert!(RedbExecutionJournal::open(&path).is_err());
+        assert_database_io_kind(
+            RedbExecutionJournal::create(&path),
+            ErrorKind::AlreadyExists,
+        );
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("replacement metadata")
+                .len(),
+            0,
+            "opening an empty replacement must not initialize it as a journal"
+        );
+    }
+
+    #[test]
+    fn only_released_observations_allow_taker_funding_reuse() {
+        let reserved = ExecutionJournalObservation::Reserved(status(ReservationStateDto::Reserved));
+        let released =
+            ExecutionJournalObservation::Released(status(ReservationStateDto::Released {
+                reason: ReleaseReasonDto::ClientCancelled,
+                at_millis: 150,
+            }));
+        let committed =
+            ExecutionJournalObservation::Committed(status(ReservationStateDto::Committed {
+                signing_commitment: FixedBytes32::new([0x33; 32]),
+                committed_at_millis: 150,
+            }));
+        let signed = ExecutionJournalObservation::Signed(status(ReservationStateDto::Signed {
+            signing_commitment: FixedBytes32::new([0x33; 32]),
+            artifact_digest: FixedBytes32::new([0x44; 32]),
+            committed_at_millis: 150,
+            signed_at_millis: 160,
+            signed_pset: SettlementPset::from_pset(&PartiallySignedTransaction::new_v2())
+                .expect("empty fixture PSET"),
+        }));
+
+        assert!(ExecutionJournalObservation::Armed.requires_taker_funding_exclusion());
+        assert!(reserved.requires_taker_funding_exclusion());
+        assert!(!released.requires_taker_funding_exclusion());
+        assert!(committed.requires_taker_funding_exclusion());
+        assert!(signed.requires_taker_funding_exclusion());
+    }
 }

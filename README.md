@@ -89,9 +89,31 @@ balancing blinding and taker signing as two separate caller-wallet capabilities.
 The durable client journal arms exact attempts before Execute, performs
 status-first byte-identical recovery, and verifies the provider-signed result.
 Execute transport failures remain ambiguous until that recovery reconciles
-them. A production taker wallet backend, coordinated provider-state recovery,
-canonical market-data pricing, immediate provider relay/reconciliation, rate
-limits, and HSM support remain future work.
+them. The adjacent `deadcat-rfq-taker` library now composes those primitives
+into a fail-closed one-provider orchestration core. It reserves the taker's
+complete worst-case input set before quote I/O, chooses a conservative
+policy-asset fee from the authenticated quote's weight and fee bounds plus the
+local fee floor, and never exceeds the user's absolute fee authorization. The
+first Execute is sent only after the exact taker-signed PSET is durably
+journaled and its wallet inputs are promoted into the durable exclusion set.
+Startup and inventory refresh rebuild those exclusions from the complete
+identity-matched journal:
+every observation except an opaque session-authenticated `Released` remains
+excluded, including `Signed`, because the valid transaction may still be
+broadcast later. The redb journal
+also separates no-clobber creation from open-existing recovery. An ambiguous
+journal arm or wallet promotion revokes runtime readiness; after both durable
+boundaries succeed, later clock, Execute, or observation failures return an
+exact recovery handle instead of making the attempt appear safe to abandon.
+Pending handles remain discoverable after task cancellation or restart, and a
+wallet-wide singleton authority prevents two runtimes from creating independent
+input-lock maps over the same open wallet.
+
+A concrete authoritative taker inventory/settlement source, a securely paired
+wallet/journal process-state lifecycle and runnable taker entrypoint, canonical
+market-data pricing, provider relay/reconciliation, taker
+broadcast/confirmation/reorg monitoring, live regtest process coverage,
+authenticated-owner rate limits, and HSM support remain future work.
 [ADR 0008](docs/adr/0008-rfq-service-owned-wallet.md) records that boundary.
 This initial taker profile accepts exactly one RFQ leg plus ordinary tree-less
 P2TR inputs with explicit `SIGHASH_ALL`. Simplicity covenant inputs and a

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use deadcat_client::composition::CompositionLayout;
 use deadcat_client::venue::RouteAuthorization;
@@ -193,6 +193,28 @@ pub struct PersistentRfqWallet<R = OsRng> {
     identity: ProviderIdentity,
     operation_lock: Mutex<()>,
     poisoned: AtomicBool,
+    taker_funding_authority_claimed: AtomicBool,
+}
+
+/// Process-local proof that one caller exclusively coordinates taker funding
+/// for this open wallet.
+///
+/// The registration is deliberately tied to the wallet object rather than a
+/// database path. The persistent backend's file lock already prevents a
+/// second open handle for the same database, while this guard prevents two
+/// independent funding pools from racing through one shared open handle.
+pub(crate) struct TakerFundingAuthority<R> {
+    wallet: Arc<PersistentRfqWallet<R>>,
+}
+
+impl<R> Drop for TakerFundingAuthority<R> {
+    fn drop(&mut self) {
+        let was_claimed = self
+            .wallet
+            .taker_funding_authority_claimed
+            .swap(false, Ordering::AcqRel);
+        debug_assert!(was_claimed, "taker funding authority released twice");
+    }
 }
 
 impl PersistentRfqWallet<OsRng> {
@@ -310,6 +332,7 @@ impl<R: RngCore + CryptoRng + Send> PersistentRfqWallet<R> {
             identity,
             operation_lock: Mutex::new(()),
             poisoned: AtomicBool::new(false),
+            taker_funding_authority_claimed: AtomicBool::new(false),
         })
     }
 
@@ -329,6 +352,7 @@ impl<R: RngCore + CryptoRng + Send> PersistentRfqWallet<R> {
             identity,
             operation_lock: Mutex::new(()),
             poisoned: AtomicBool::new(false),
+            taker_funding_authority_claimed: AtomicBool::new(false),
         })
     }
 
@@ -368,12 +392,26 @@ impl<R: RngCore + CryptoRng + Send> PersistentRfqWallet<R> {
             identity,
             operation_lock: Mutex::new(()),
             poisoned: AtomicBool::new(false),
+            taker_funding_authority_claimed: AtomicBool::new(false),
         })
     }
 
     #[must_use]
     pub const fn identity(&self) -> ProviderIdentity {
         self.identity
+    }
+
+    /// Atomically acquire the single process-local taker funding authority for
+    /// this open wallet. Dropping the returned registration releases it.
+    pub(crate) fn try_acquire_taker_funding_authority(
+        self: &Arc<Self>,
+    ) -> Option<TakerFundingAuthority<R>> {
+        self.taker_funding_authority_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(TakerFundingAuthority {
+            wallet: Arc::clone(self),
+        })
     }
 
     /// Issue a durable confidential destination for initial or replenishment

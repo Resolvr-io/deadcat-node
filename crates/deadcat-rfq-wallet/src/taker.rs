@@ -36,6 +36,7 @@ use rand::{CryptoRng, RngCore};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+use crate::persistent::TakerFundingAuthority;
 use crate::{PersistentRfqWallet, PersistentWalletError};
 
 /// Taker-facing identity binding for one encrypted RFQ wallet.
@@ -269,37 +270,32 @@ pub struct TakerFundingPool<R> {
     wallet: Arc<PersistentRfqWallet<R>>,
     state: Arc<Mutex<FundingState>>,
     marker: Arc<()>,
+    authority: Arc<TakerFundingAuthority<R>>,
 }
 
-impl<R> Clone for TakerFundingPool<R> {
-    fn clone(&self) -> Self {
-        Self {
-            wallet: Arc::clone(&self.wallet),
-            state: Arc::clone(&self.state),
-            marker: Arc::clone(&self.marker),
-        }
-    }
+/// Exclusive wallet-wide claim held while startup funding state is rebuilt.
+///
+/// Acquire this before reading external inventory or execution-journal state.
+/// Converting it into a [`TakerFundingPool`] transfers the same authority into
+/// every pool clone and outstanding lease, closing the handoff window in which
+/// a prior runtime could mutate exclusions between recovery reads and pool
+/// construction.
+pub struct TakerFundingPoolClaim<R> {
+    wallet: Arc<PersistentRfqWallet<R>>,
+    authority: Arc<TakerFundingAuthority<R>>,
 }
 
-impl<R: RngCore + CryptoRng + Send> TakerFundingPool<R> {
-    /// Create a pool from one complete authoritative wallet scan.
-    ///
-    /// `durable_exclusions` must contain the wallet outpoints referenced by
-    /// every non-terminal execution-journal record restored at startup. An
-    /// excluded outpoint need not remain in `inventory`: our exact transaction
-    /// may already spend it in the mempool.
-    pub fn new(
-        wallet: Arc<PersistentRfqWallet<R>>,
-        identity: TakerWalletIdentity,
+impl<R: RngCore + CryptoRng + Send> TakerFundingPoolClaim<R> {
+    /// Validate the completed authoritative snapshot and transfer this claim
+    /// into a live funding pool.
+    pub fn initialize(
+        self,
         inventory: Vec<TakerWalletUtxo>,
         durable_exclusions: BTreeSet<OutPoint>,
-    ) -> Result<Self, TakerFundingError> {
-        if wallet.identity() != identity.wallet_identity() {
-            return Err(TakerFundingError::TakerWalletIdentityMismatch);
-        }
-        let inventory = validate_inventory(&wallet, inventory)?;
-        Ok(Self {
-            wallet,
+    ) -> Result<TakerFundingPool<R>, TakerFundingError> {
+        let inventory = validate_inventory(&self.wallet, inventory)?;
+        Ok(TakerFundingPool {
+            wallet: self.wallet,
             state: Arc::new(Mutex::new(FundingState {
                 inventory,
                 locks: BTreeMap::new(),
@@ -309,7 +305,71 @@ impl<R: RngCore + CryptoRng + Send> TakerFundingPool<R> {
                 next_lease: 1,
             })),
             marker: Arc::new(()),
+            authority: self.authority,
         })
+    }
+}
+
+impl<R> fmt::Debug for TakerFundingPoolClaim<R> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TakerFundingPoolClaim")
+            .field("wallet", &"[shared and redacted]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R> Clone for TakerFundingPool<R> {
+    fn clone(&self) -> Self {
+        Self {
+            wallet: Arc::clone(&self.wallet),
+            state: Arc::clone(&self.state),
+            marker: Arc::clone(&self.marker),
+            authority: Arc::clone(&self.authority),
+        }
+    }
+}
+
+impl<R: RngCore + CryptoRng + Send> TakerFundingPool<R> {
+    /// Claim the wallet-wide funding authority before reading recovery state.
+    pub fn claim(
+        wallet: Arc<PersistentRfqWallet<R>>,
+        identity: TakerWalletIdentity,
+    ) -> Result<TakerFundingPoolClaim<R>, TakerFundingError> {
+        if wallet.identity() != identity.wallet_identity() {
+            return Err(TakerFundingError::TakerWalletIdentityMismatch);
+        }
+        let authority = Arc::new(
+            wallet
+                .try_acquire_taker_funding_authority()
+                .ok_or(TakerFundingError::FundingPoolAuthorityAlreadyClaimed)?,
+        );
+        Ok(TakerFundingPoolClaim { wallet, authority })
+    }
+
+    /// Create a pool from one complete authoritative wallet scan.
+    ///
+    /// A runtime that reads inventory or journal state during startup should
+    /// call [`Self::claim`] before those reads and then
+    /// [`TakerFundingPoolClaim::initialize`]. This convenience constructor is
+    /// for snapshots whose coherence is already protected by the caller.
+    ///
+    /// `durable_exclusions` must contain the wallet outpoints referenced by
+    /// every execution-journal observation except an authenticated `Released`
+    /// record restored at startup. An excluded outpoint need not remain in
+    /// `inventory`: our exact transaction may already spend it in the mempool.
+    ///
+    /// Only one funding-pool authority may exist for an open wallet at a time.
+    /// Pool clones and outstanding leases retain that authority; a subsequent
+    /// call returns [`TakerFundingError::FundingPoolAuthorityAlreadyClaimed`]
+    /// until all of them are dropped.
+    pub fn new(
+        wallet: Arc<PersistentRfqWallet<R>>,
+        identity: TakerWalletIdentity,
+        inventory: Vec<TakerWalletUtxo>,
+        durable_exclusions: BTreeSet<OutPoint>,
+    ) -> Result<Self, TakerFundingError> {
+        Self::claim(wallet, identity)?.initialize(inventory, durable_exclusions)
     }
 
     #[must_use]
@@ -488,6 +548,7 @@ impl<R: RngCore + CryptoRng + Send> TakerFundingPool<R> {
             payer_blinder,
             selected,
             receive,
+            _authority: Arc::clone(&self.authority),
         })
     }
 }
@@ -512,6 +573,9 @@ pub struct TakerFundingLease<R> {
     payer_blinder: OutPoint,
     selected: BTreeSet<OutPoint>,
     receive: TakerReceiveDestination,
+    // Retain the wallet-wide authority even if every pool handle is dropped
+    // while this pre-arm reservation remains live.
+    _authority: Arc<TakerFundingAuthority<R>>,
 }
 
 impl<R: RngCore + CryptoRng + Send> TakerFundingLease<R> {
@@ -919,8 +983,8 @@ impl<R: RngCore + CryptoRng + Send> TakerWalletFinalizer for TakerSettlementWall
 ///
 /// The embedding runtime must not dispatch the corresponding journaled attempt
 /// until it has obtained this value, and must reconstruct the pool's durable
-/// exclusions from all non-terminal journal records before serving new funding
-/// requests after restart.
+/// exclusions from every journal observation except authenticated `Released`
+/// before serving new funding requests after restart.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DurablyArmedTakerFunding {
     outpoints: BTreeSet<OutPoint>,
@@ -981,6 +1045,8 @@ pub enum TakerFundingError {
     Composition(#[from] RouteCompositionError),
     #[error("taker funding lock is poisoned")]
     FundingLockPoisoned,
+    #[error("this open wallet already has a live taker funding-pool authority")]
+    FundingPoolAuthorityAlreadyClaimed,
     #[error("the persistent wallet identity is not the required taker wallet identity")]
     TakerWalletIdentityMismatch,
     #[error("the inventory refresh raced a newer exclusion or refresh and must be retried")]
@@ -1038,6 +1104,8 @@ pub enum TakerFundingError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Barrier;
+    use std::thread;
 
     use deadcat_client::composition::{InputSequence, NetworkFee};
     use deadcat_client::venue::{AssetAmount, ExactExecution, LegId, ProposedLeg, VenueContext};
@@ -1446,5 +1514,152 @@ mod tests {
             second.replace_inventory(&token, Vec::new(), BTreeSet::new()),
             Err(TakerFundingError::ForeignInventoryRefreshToken)
         ));
+    }
+
+    #[test]
+    fn funding_pool_authority_is_shared_by_clones_and_released_on_last_drop() {
+        let policy = asset(1);
+        let (_directory, wallet) = wallet(policy);
+        let pool = TakerFundingPool::new(
+            Arc::clone(&wallet),
+            taker_identity(policy),
+            Vec::new(),
+            BTreeSet::new(),
+        )
+        .expect("first funding authority");
+        let clone = pool.clone();
+
+        assert!(matches!(
+            TakerFundingPool::new(
+                Arc::clone(&wallet),
+                taker_identity(policy),
+                Vec::new(),
+                BTreeSet::new(),
+            ),
+            Err(TakerFundingError::FundingPoolAuthorityAlreadyClaimed)
+        ));
+        drop(pool);
+        assert!(matches!(
+            TakerFundingPool::new(
+                Arc::clone(&wallet),
+                taker_identity(policy),
+                Vec::new(),
+                BTreeSet::new(),
+            ),
+            Err(TakerFundingError::FundingPoolAuthorityAlreadyClaimed)
+        ));
+
+        drop(clone);
+        TakerFundingPool::new(wallet, taker_identity(policy), Vec::new(), BTreeSet::new())
+            .expect("last pool clone releases authority");
+    }
+
+    #[test]
+    fn startup_claim_excludes_other_pools_before_inventory_is_initialized() {
+        let policy = asset(1);
+        let (_directory, wallet) = wallet(policy);
+        let claim = TakerFundingPool::claim(Arc::clone(&wallet), taker_identity(policy))
+            .expect("claim startup authority before recovery reads");
+
+        assert!(matches!(
+            TakerFundingPool::new(
+                Arc::clone(&wallet),
+                taker_identity(policy),
+                Vec::new(),
+                BTreeSet::new(),
+            ),
+            Err(TakerFundingError::FundingPoolAuthorityAlreadyClaimed)
+        ));
+
+        let pool = claim
+            .initialize(Vec::new(), BTreeSet::new())
+            .expect("transfer startup authority into the pool");
+        assert!(matches!(
+            TakerFundingPool::claim(Arc::clone(&wallet), taker_identity(policy)),
+            Err(TakerFundingError::FundingPoolAuthorityAlreadyClaimed)
+        ));
+        drop(pool);
+        TakerFundingPool::claim(wallet, taker_identity(policy))
+            .expect("dropping the pool releases transferred authority");
+    }
+
+    #[test]
+    fn outstanding_lease_retains_funding_pool_authority() {
+        let policy = asset(1);
+        let (_directory, wallet) = wallet(policy);
+        let inventory = vec![utxo(&wallet, policy, 120, 51)];
+        let pool = TakerFundingPool::new(
+            Arc::clone(&wallet),
+            taker_identity(policy),
+            inventory.clone(),
+            BTreeSet::new(),
+        )
+        .expect("funding pool");
+        let (request, receive) = exact_in_request(&pool, policy, policy, 100, 20);
+        let lease = pool
+            .reserve_request(&request, receive, TakerFundingLimits::default())
+            .expect("funding lease");
+        drop(pool);
+
+        assert!(matches!(
+            TakerFundingPool::new(
+                Arc::clone(&wallet),
+                taker_identity(policy),
+                inventory.clone(),
+                BTreeSet::new(),
+            ),
+            Err(TakerFundingError::FundingPoolAuthorityAlreadyClaimed)
+        ));
+
+        drop(lease);
+        TakerFundingPool::new(wallet, taker_identity(policy), inventory, BTreeSet::new())
+            .expect("dropping the last lease releases authority");
+    }
+
+    #[test]
+    fn concurrent_funding_pool_acquisition_has_exactly_one_winner() {
+        const CONTENDERS: usize = 8;
+
+        let policy = asset(1);
+        let (_directory, wallet) = wallet(policy);
+        let start = Arc::new(Barrier::new(CONTENDERS + 1));
+        let handles = (0..CONTENDERS)
+            .map(|_| {
+                let wallet = Arc::clone(&wallet);
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    TakerFundingPool::new(
+                        wallet,
+                        taker_identity(policy),
+                        Vec::new(),
+                        BTreeSet::new(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+
+        // Keep every successful result alive while joining the remaining
+        // contenders so the winner cannot release and hand authority to a
+        // later thread in the same race.
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("contender did not panic"))
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .all(|error| matches!(
+                    error,
+                    TakerFundingError::FundingPoolAuthorityAlreadyClaimed
+                ))
+        );
+
+        drop(results);
+        TakerFundingPool::new(wallet, taker_identity(policy), Vec::new(), BTreeSet::new())
+            .expect("race winner releases authority when dropped");
     }
 }

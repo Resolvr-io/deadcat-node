@@ -24,9 +24,9 @@ pub use journal::{
     JournaledExecution, MAX_EXECUTION_JOURNAL_PAGE_SIZE, RedbExecutionJournal,
 };
 pub use session::{
-    ExecuteError, LiveQuoteReservation, ProviderTarget, QUOTE_RECOVERY_RECORD_VERSION,
-    QuoteRecoveryRecord, QuoteReplay, ReservationHandle, ResolvedRfqSettlement, RfqSession,
-    SessionConfig, SessionError,
+    AuthenticatedExecutionStatus, ExecuteError, LiveQuoteReservation, ProviderTarget,
+    QUOTE_RECOVERY_RECORD_VERSION, QuoteRecoveryRecord, QuoteReplay, ReservationHandle,
+    ResolvedRfqSettlement, RfqSession, SessionConfig, SessionError,
 };
 pub use settlement::{
     EXECUTION_ATTEMPT_RECORD_VERSION, ExecutionAttempt, ExecutionAttemptDigest,

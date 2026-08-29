@@ -1129,6 +1129,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "deadcat-rfq-taker"
+version = "0.1.0-alpha"
+dependencies = [
+ "deadcat-client",
+ "deadcat-contracts",
+ "deadcat-rfq-client",
+ "deadcat-rfq-iroh",
+ "deadcat-rfq-rpc",
+ "deadcat-rfq-wallet",
+ "deadcat-rpc",
+ "deadcat-types",
+ "elements",
+ "iroh",
+ "rand 0.8.7",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "deadcat-rfq-wallet"
 version = "0.1.0-alpha"
 dependencies = [
