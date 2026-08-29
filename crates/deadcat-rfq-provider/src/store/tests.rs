@@ -2,9 +2,11 @@ use std::fs;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
+use elements::encode::{deserialize, serialize};
 use elements::hashes::Hash as _;
+use elements::pset::PartiallySignedTransaction;
 use elements::secp256k1_zkp::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
-use elements::{AssetId, BlockHash, OutPoint, Txid};
+use elements::{AssetId, BlockHash, LockTime, OutPoint, Transaction, TxIn, Txid};
 use tempfile::TempDir;
 
 use super::*;
@@ -15,6 +17,19 @@ fn asset(marker: u8) -> AssetId {
 
 fn outpoint(marker: u8, vout: u32) -> OutPoint {
     OutPoint::new(Txid::from_byte_array([marker; 32]), vout)
+}
+
+fn signed_pset(marker: u8) -> Vec<u8> {
+    let transaction = Transaction {
+        version: 2,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: outpoint(marker, 0),
+            ..TxIn::default()
+        }],
+        output: Vec::new(),
+    };
+    serialize(&PartiallySignedTransaction::from_tx(transaction))
 }
 
 fn identity(marker: u8) -> ProviderIdentity {
@@ -598,7 +613,7 @@ fn signed_status_replays_the_exact_durable_artifact() {
         .signing_job()
         .expect("new signing job")
         .commitment();
-    let expected_bytes = vec![9, 8, 7, 6];
+    let expected_bytes = signed_pset(9);
     let recorded = book
         .record_signed(
             reservation.id(),
@@ -1176,11 +1191,12 @@ fn commitment_and_signed_response_retries_are_exact_and_restart_safe() {
         Err(ProviderError::DifferentSigningIntent(_))
     ));
 
+    let signed_bytes = signed_pset(5);
     let signed = book
         .record_signed(
             reservation.id(),
             commitment,
-            vec![5, 6, 7],
+            signed_bytes.clone(),
             &UnixMillis::new(203),
         )
         .expect("signed");
@@ -1189,7 +1205,7 @@ fn commitment_and_signed_response_retries_are_exact_and_restart_safe() {
         .record_signed(
             reservation.id(),
             commitment,
-            vec![5, 6, 7],
+            signed_bytes,
             &UnixMillis::new(204),
         )
         .expect("signed retry");
@@ -1208,7 +1224,7 @@ fn commitment_and_signed_response_retries_are_exact_and_restart_safe() {
         book.record_signed(
             reservation.id(),
             commitment,
-            vec![5, 6, 8],
+            signed_pset(6),
             &UnixMillis::new(206),
         ),
         Err(ProviderError::DifferentSignedArtifact(_))
@@ -1314,7 +1330,7 @@ fn pending_signing_jobs_are_bounded_ordered_and_survive_reopen() {
         .record_signed(
             first_job.reservation_id(),
             first_job.commitment(),
-            vec![9],
+            signed_pset(9),
             &UnixMillis::new(204),
         )
         .expect("sign first");
@@ -1361,7 +1377,7 @@ fn signed_allocation_stays_retired_and_recoverable_after_deadline_and_reopen() {
             .record_signed(
                 reservation.id(),
                 commitment,
-                vec![4, 5, 6],
+                signed_pset(4),
                 &UnixMillis::new(2_000),
             )
             .expect("signing may finish after durable acceptance deadline");
@@ -1818,7 +1834,7 @@ fn audit_log_is_ordered_and_records_the_safety_boundaries() {
             .signing_job()
             .expect("new signing job")
             .commitment(),
-        vec![2],
+        signed_pset(2),
         &UnixMillis::new(201),
     )
     .expect("signed");
@@ -1952,7 +1968,7 @@ fn startup_integrity_rejects_a_pending_entry_for_a_signed_reservation() {
         book.record_signed(
             reservation.id(),
             job.commitment(),
-            vec![4, 5, 6],
+            signed_pset(4),
             &UnixMillis::new(300),
         )
         .expect("signed");
@@ -2278,6 +2294,8 @@ fn signed_artifact_failpoints_leave_an_exact_recoverable_signing_job() {
     let failpoints = [
         (mutation_failpoints::SIGNED_AFTER_RECORD, 0),
         (mutation_failpoints::SIGNED_AFTER_PENDING_SIGNING, 0),
+        (mutation_failpoints::SIGNED_AFTER_RELAY_RECORD, 0),
+        (mutation_failpoints::SIGNED_AFTER_RELAY_DUE, 0),
         (mutation_failpoints::SIGNED_AFTER_AUDIT, 0),
     ];
     for (name, occurrence) in failpoints {
@@ -2301,7 +2319,7 @@ fn signed_artifact_failpoints_leave_an_exact_recoverable_signing_job() {
                 book.record_signed(
                     reservation.id(),
                     commitment,
-                    vec![4, 5, 6],
+                    signed_pset(4),
                     &UnixMillis::new(300),
                 ),
                 Err(ProviderError::InjectedMutationFailure(actual)) if actual == name
@@ -2330,11 +2348,673 @@ fn signed_artifact_failpoints_leave_an_exact_recoverable_signing_job() {
                 .record_signed(
                     reservation_id,
                     commitment,
-                    vec![4, 5, 6],
+                    signed_pset(4),
                     &UnixMillis::new(300),
                 )
                 .expect("retry")
                 .recorded()
         );
+    }
+}
+
+#[test]
+fn signed_artifact_queues_one_exact_bounded_relay_job() {
+    let directory = TempDir::new().expect("tempdir");
+    let identity = identity(90);
+    let book = open_book(&directory, identity);
+    let reservation = reserve_one(&book, identity, inventory(150), owner(1), 1);
+    let committed = book
+        .commit_before_sign(
+            ReservationAccess::new(reservation.id(), reservation.owner()),
+            vec![1, 2, 3],
+            transaction_fee(identity, 200),
+            &UnixMillis::new(200),
+        )
+        .expect("commit");
+    let commitment = committed.signing_job().expect("job").commitment();
+    let artifact_bytes = signed_pset(151);
+    let signed = book
+        .record_signed(
+            reservation.id(),
+            commitment,
+            artifact_bytes.clone(),
+            &UnixMillis::new(300),
+        )
+        .expect("signed")
+        .artifact()
+        .clone();
+    assert!(
+        book.due_relay_jobs(UnixMillis::new(299), usize::MAX)
+            .expect("not due")
+            .is_empty()
+    );
+    let jobs = book
+        .due_relay_jobs(UnixMillis::new(300), usize::MAX)
+        .expect("due");
+    let [job] = jobs.as_slice() else {
+        panic!("expected one relay job");
+    };
+    let transaction = deserialize::<PartiallySignedTransaction>(&artifact_bytes)
+        .expect("pset")
+        .extract_tx()
+        .expect("transaction");
+    assert_eq!(job.reservation_id(), reservation.id());
+    assert_eq!(job.commitment(), commitment);
+    assert_eq!(job.artifact(), signed.digest());
+    assert_eq!(job.txid(), transaction.txid());
+    assert_eq!(job.wtxid(), transaction.wtxid());
+    assert_eq!(job.revision(), 0);
+    assert_eq!(job.due_at(), UnixMillis::new(300));
+    assert_eq!(job.observation(), RelayObservation::Unobserved);
+    assert_eq!(job.attempt_count(), 0);
+    assert_eq!(job.reorg_count(), 0);
+    let record = book
+        .relay_record(reservation.id())
+        .expect("relay state")
+        .expect("relay record");
+    assert_eq!(record.txid(), transaction.txid());
+    assert_eq!(record.wtxid(), transaction.wtxid());
+    assert_eq!(record.next_attempt_at(), Some(UnixMillis::new(300)));
+
+    let replay = book
+        .record_signed(
+            reservation.id(),
+            commitment,
+            artifact_bytes,
+            &UnixMillis::new(301),
+        )
+        .expect("exact signed replay");
+    assert!(!replay.recorded());
+    assert_eq!(replay.artifact(), &signed);
+}
+
+#[test]
+fn relay_attempt_is_leased_before_bytes_and_stale_workers_are_rejected() {
+    let directory = TempDir::new().expect("tempdir");
+    let identity = identity(91);
+    let item = inventory(152);
+    let book = open_book(&directory, identity);
+    let reservation = reserve_one(&book, identity, item, owner(1), 1);
+    let commitment = book
+        .commit_before_sign(
+            ReservationAccess::new(reservation.id(), reservation.owner()),
+            vec![1],
+            transaction_fee(identity, 200),
+            &UnixMillis::new(200),
+        )
+        .expect("commit")
+        .signing_job()
+        .expect("job")
+        .commitment();
+    let artifact_bytes = signed_pset(153);
+    book.record_signed(
+        reservation.id(),
+        commitment,
+        artifact_bytes,
+        &UnixMillis::new(300),
+    )
+    .expect("signed");
+    let job = book
+        .due_relay_jobs(UnixMillis::new(300), 1)
+        .expect("due")
+        .pop()
+        .expect("job");
+    let attempt = book
+        .begin_relay_attempt(&job, UnixMillis::new(400), &UnixMillis::new(301))
+        .expect("lease");
+    assert_eq!(attempt.revision(), 1);
+    assert_eq!(attempt.attempt_count(), 1);
+    assert_eq!(attempt.retry_at(), UnixMillis::new(400));
+    assert!(!attempt.transaction_bytes().is_empty());
+    assert!(
+        book.due_relay_jobs(UnixMillis::new(399), 1)
+            .expect("leased")
+            .is_empty()
+    );
+    assert!(matches!(
+        book.begin_relay_attempt(&job, UnixMillis::new(500), &UnixMillis::new(302)),
+        Err(ProviderError::RelayRevisionMismatch {
+            expected: 0,
+            actual: 1,
+            ..
+        })
+    ));
+
+    let record = book
+        .record_relay_outcome(
+            &attempt,
+            RelayObservation::BroadcastAccepted,
+            None,
+            Some(UnixMillis::new(350)),
+            &UnixMillis::new(302),
+        )
+        .expect("record accepted broadcast");
+    assert_eq!(record.revision(), 2);
+    assert_eq!(record.attempt_count(), 1);
+    assert_eq!(record.observation(), RelayObservation::BroadcastAccepted);
+    assert_eq!(record.next_attempt_at(), Some(UnixMillis::new(350)));
+    assert!(matches!(
+        book.record_relay_outcome(
+            &attempt,
+            RelayObservation::Mempool,
+            None,
+            Some(UnixMillis::new(360)),
+            &UnixMillis::new(303),
+        ),
+        Err(ProviderError::RelayRevisionMismatch {
+            expected: 1,
+            actual: 2,
+            ..
+        })
+    ));
+    assert!(matches!(
+        book.inventory(item.outpoint()).expect("allocation").unwrap().state(),
+        InventoryState::Committed { reservation_id, .. } if reservation_id == reservation.id()
+    ));
+
+    let next_job = book
+        .due_relay_jobs(UnixMillis::new(350), 1)
+        .expect("next due")
+        .pop()
+        .expect("next job");
+    book.begin_relay_attempt(&next_job, UnixMillis::new(500), &UnixMillis::new(350))
+        .expect("next lease");
+    let write = book.begin_immediate_write().expect("write");
+    let mut relay: StoredRelayRecord =
+        read_record_from_write(&write, RELAY_RECORDS, &reservation.id().to_bytes())
+            .expect("read relay")
+            .expect("relay record");
+    assert_eq!(relay.revision, 3);
+    relay.next_attempt_at = None;
+    write_record(&write, RELAY_RECORDS, &reservation.id().to_bytes(), &relay)
+        .expect("corrupt relay");
+    book.commit_write(write).expect("commit corruption fixture");
+    assert!(matches!(
+        book.relay_record(reservation.id()),
+        Err(ProviderError::CorruptState(message))
+            if message.contains("counters, timestamps, or initial state")
+    ));
+}
+
+#[test]
+fn relay_reconciliation_tracks_failures_reorgs_and_exact_conflicts() {
+    let directory = TempDir::new().expect("tempdir");
+    let identity = identity(92);
+    let book = open_book(&directory, identity);
+    let reservation = reserve_one(&book, identity, inventory(154), owner(1), 1);
+    let commitment = book
+        .commit_before_sign(
+            ReservationAccess::new(reservation.id(), reservation.owner()),
+            vec![1],
+            transaction_fee(identity, 200),
+            &UnixMillis::new(200),
+        )
+        .expect("commit")
+        .signing_job()
+        .expect("job")
+        .commitment();
+    book.record_signed(
+        reservation.id(),
+        commitment,
+        signed_pset(155),
+        &UnixMillis::new(300),
+    )
+    .expect("signed");
+
+    let first = book
+        .due_relay_jobs(UnixMillis::new(300), 1)
+        .expect("due")
+        .pop()
+        .expect("job");
+    let first = book
+        .begin_relay_attempt(&first, UnixMillis::new(400), &UnixMillis::new(301))
+        .expect("first attempt");
+    assert!(matches!(
+        book.record_relay_outcome(
+            &first,
+            RelayObservation::Unobserved,
+            None,
+            Some(UnixMillis::new(320)),
+            &UnixMillis::new(302),
+        ),
+        Err(ProviderError::InvalidRelayObservation(_))
+    ));
+    assert!(matches!(
+        book.record_relay_outcome(
+            &first,
+            RelayObservation::Unobserved,
+            Some(RelayFailureClass::PolicyRejected),
+            Some(UnixMillis::new(320)),
+            &UnixMillis::new(302),
+        ),
+        Err(ProviderError::InvalidRelayObservation(_))
+    ));
+    let first_record = book
+        .record_relay_outcome(
+            &first,
+            RelayObservation::Unobserved,
+            Some(RelayFailureClass::BackendUnavailable),
+            Some(UnixMillis::new(320)),
+            &UnixMillis::new(302),
+        )
+        .expect("failure observation");
+    assert_eq!(
+        first_record.last_failure(),
+        Some(RelayFailureClass::BackendUnavailable)
+    );
+    assert_eq!(first_record.last_failure_at(), Some(UnixMillis::new(302)));
+    assert_eq!(first_record.last_observed_at(), None);
+
+    let second = book
+        .due_relay_jobs(UnixMillis::new(320), 1)
+        .expect("due")
+        .pop()
+        .expect("job");
+    let second = book
+        .begin_relay_attempt(&second, UnixMillis::new(420), &UnixMillis::new(320))
+        .expect("second attempt");
+    let first_block = BlockHash::from_byte_array([1; 32]);
+    let confirmed = book
+        .record_relay_outcome(
+            &second,
+            RelayObservation::Confirmed {
+                block_hash: first_block,
+                block_height: 10,
+            },
+            None,
+            Some(UnixMillis::new(340)),
+            &UnixMillis::new(321),
+        )
+        .expect("confirmed");
+    assert_eq!(confirmed.reorg_count(), 0);
+    assert_eq!(confirmed.last_failure(), None);
+    assert_eq!(confirmed.last_failure_at(), None);
+
+    let third = book
+        .due_relay_jobs(UnixMillis::new(340), 1)
+        .expect("due")
+        .pop()
+        .expect("job");
+    let third = book
+        .begin_relay_attempt(&third, UnixMillis::new(440), &UnixMillis::new(340))
+        .expect("third attempt");
+    let moved = book
+        .record_relay_outcome(
+            &third,
+            RelayObservation::Confirmed {
+                block_hash: BlockHash::from_byte_array([2; 32]),
+                block_height: 11,
+            },
+            None,
+            Some(UnixMillis::new(360)),
+            &UnixMillis::new(341),
+        )
+        .expect("different canonical block");
+    assert_eq!(moved.reorg_count(), 1);
+
+    let fourth = book
+        .due_relay_jobs(UnixMillis::new(360), 1)
+        .expect("due")
+        .pop()
+        .expect("job");
+    let fourth = book
+        .begin_relay_attempt(&fourth, UnixMillis::new(460), &UnixMillis::new(360))
+        .expect("fourth attempt");
+    assert!(matches!(
+        book.record_relay_outcome(
+            &fourth,
+            RelayObservation::Unobserved,
+            Some(RelayFailureClass::BackendUnavailable),
+            Some(UnixMillis::new(380)),
+            &UnixMillis::new(361),
+        ),
+        Err(ProviderError::InvalidRelayObservation(_))
+    ));
+    assert!(matches!(
+        book.record_relay_outcome(
+            &fourth,
+            RelayObservation::Conflicted {
+                spent_input: outpoint(99, 0),
+                conflicting_txid: None,
+            },
+            None,
+            Some(UnixMillis::new(380)),
+            &UnixMillis::new(361),
+        ),
+        Err(ProviderError::InvalidRelayObservation(_))
+    ));
+    let conflicted = book
+        .record_relay_outcome(
+            &fourth,
+            RelayObservation::Conflicted {
+                spent_input: outpoint(155, 0),
+                // The same non-witness txid is valid conflict metadata when
+                // Core observed a different witness serialization.
+                conflicting_txid: Some(fourth.txid()),
+            },
+            None,
+            Some(UnixMillis::new(380)),
+            &UnixMillis::new(361),
+        )
+        .expect("exact conflict");
+    assert_eq!(conflicted.reorg_count(), 2);
+    assert_eq!(conflicted.attempt_count(), 4);
+}
+
+#[test]
+fn startup_integrity_rejects_reorg_without_a_completed_outcome() {
+    let directory = TempDir::new().expect("tempdir");
+    let path = directory.path().join("provider.redb");
+    let identity = identity(98);
+    let reservation_id = {
+        let book = open_book(&directory, identity);
+        let reservation = reserve_one(&book, identity, inventory(198), owner(1), 1);
+        let commitment = book
+            .commit_before_sign(
+                ReservationAccess::new(reservation.id(), reservation.owner()),
+                vec![1],
+                transaction_fee(identity, 200),
+                &UnixMillis::new(200),
+            )
+            .expect("commit")
+            .signing_job()
+            .expect("job")
+            .commitment();
+        book.record_signed(
+            reservation.id(),
+            commitment,
+            signed_pset(199),
+            &UnixMillis::new(300),
+        )
+        .expect("signed");
+        let job = book
+            .due_relay_jobs(UnixMillis::new(300), 1)
+            .expect("due")
+            .pop()
+            .expect("job");
+        book.begin_relay_attempt(&job, UnixMillis::new(400), &UnixMillis::new(301))
+            .expect("lease");
+
+        let write = book.begin_immediate_write().expect("write");
+        let mut relay: StoredRelayRecord =
+            read_record_from_write(&write, RELAY_RECORDS, &reservation.id().to_bytes())
+                .expect("read relay")
+                .expect("relay record");
+        assert_eq!(relay.revision, 1);
+        assert_eq!(relay.attempt_count, 1);
+        relay.reorg_count = 1;
+        write_record(&write, RELAY_RECORDS, &reservation.id().to_bytes(), &relay)
+            .expect("corrupt relay");
+        book.commit_write(write).expect("commit corruption fixture");
+        reservation.id()
+    };
+
+    let error = match ReservationBook::open_existing(&path, identity) {
+        Ok(_) => panic!("reorg without a completed observation must fail closed"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, ProviderError::CorruptState(message)
+        if message.contains(&format!("{reservation_id:?}"))
+            && message.contains("counters, timestamps, or initial state")));
+}
+
+#[test]
+fn relay_due_query_is_oldest_first_and_hard_capped_at_eight() {
+    let directory = TempDir::new().expect("tempdir");
+    let identity = identity(93);
+    let book = open_book(&directory, identity);
+    let mut reservations = Vec::new();
+    for marker in 1_u8..=10 {
+        reservations.push(reserve_one(
+            &book,
+            identity,
+            inventory(160_u8.wrapping_add(marker)),
+            owner(1),
+            marker,
+        ));
+    }
+    let mut commitments = Vec::new();
+    for (position, reservation) in reservations.iter().enumerate() {
+        let position = u64::try_from(position).expect("small test position");
+        commitments.push(
+            book.commit_before_sign(
+                ReservationAccess::new(reservation.id(), reservation.owner()),
+                vec![1],
+                transaction_fee(identity, 200),
+                &UnixMillis::new(200 + position),
+            )
+            .expect("commit")
+            .signing_job()
+            .expect("job")
+            .commitment(),
+        );
+    }
+    for (position, (reservation, commitment)) in reservations.iter().zip(commitments).enumerate() {
+        let position = u64::try_from(position).expect("small test position");
+        book.record_signed(
+            reservation.id(),
+            commitment,
+            signed_pset(180_u8.wrapping_add(u8::try_from(position).expect("position"))),
+            &UnixMillis::new(300 + position),
+        )
+        .expect("signed");
+    }
+    let jobs = book
+        .due_relay_jobs(UnixMillis::new(1_000), usize::MAX)
+        .expect("jobs");
+    assert_eq!(jobs.len(), MAX_RELAY_BATCH);
+    assert_eq!(
+        jobs.iter()
+            .map(RelayJob::reservation_id)
+            .collect::<Vec<_>>(),
+        reservations[..MAX_RELAY_BATCH]
+            .iter()
+            .map(ReservationView::id)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn relay_mutation_failpoints_preserve_the_previous_exact_job() {
+    for failpoint in [
+        mutation_failpoints::RELAY_AFTER_DUE_REMOVE,
+        mutation_failpoints::RELAY_AFTER_RECORD,
+        mutation_failpoints::RELAY_AFTER_DUE_INSERT,
+    ] {
+        let directory = TempDir::new().expect("tempdir");
+        let identity = identity(94);
+        let (reservation_id, original_job) = {
+            let book = open_book(&directory, identity);
+            let reservation = reserve_one(&book, identity, inventory(191), owner(1), 1);
+            let commitment = book
+                .commit_before_sign(
+                    ReservationAccess::new(reservation.id(), reservation.owner()),
+                    vec![1],
+                    transaction_fee(identity, 200),
+                    &UnixMillis::new(200),
+                )
+                .expect("commit")
+                .signing_job()
+                .expect("job")
+                .commitment();
+            book.record_signed(
+                reservation.id(),
+                commitment,
+                signed_pset(192),
+                &UnixMillis::new(300),
+            )
+            .expect("signed");
+            let job = book
+                .due_relay_jobs(UnixMillis::new(300), 1)
+                .expect("due")
+                .pop()
+                .expect("job");
+            let guard = mutation_failpoints::arm(failpoint, 0);
+            assert!(matches!(
+                book.begin_relay_attempt(&job, UnixMillis::new(400), &UnixMillis::new(301)),
+                Err(ProviderError::InjectedMutationFailure(actual)) if actual == failpoint
+            ));
+            drop(guard);
+            (reservation.id(), job)
+        };
+        let reopened = open_book(&directory, identity);
+        assert_eq!(
+            reopened
+                .due_relay_jobs(UnixMillis::new(300), 1)
+                .expect("durable due job")
+                .as_slice(),
+            [original_job]
+        );
+        assert!(matches!(
+            reopened
+                .inventory(inventory(191).outpoint())
+                .expect("allocation")
+                .unwrap()
+                .state(),
+            InventoryState::Committed { reservation_id: actual, .. } if actual == reservation_id
+        ));
+    }
+}
+
+#[test]
+fn relay_outcome_failpoints_preserve_the_leased_attempt_for_retry() {
+    for failpoint in [
+        mutation_failpoints::RELAY_AFTER_DUE_REMOVE,
+        mutation_failpoints::RELAY_AFTER_RECORD,
+        mutation_failpoints::RELAY_AFTER_DUE_INSERT,
+    ] {
+        let directory = TempDir::new().expect("tempdir");
+        let identity = identity(95);
+        let attempt = {
+            let book = open_book(&directory, identity);
+            let reservation = reserve_one(&book, identity, inventory(193), owner(1), 1);
+            let commitment = book
+                .commit_before_sign(
+                    ReservationAccess::new(reservation.id(), reservation.owner()),
+                    vec![1],
+                    transaction_fee(identity, 200),
+                    &UnixMillis::new(200),
+                )
+                .expect("commit")
+                .signing_job()
+                .expect("job")
+                .commitment();
+            book.record_signed(
+                reservation.id(),
+                commitment,
+                signed_pset(194),
+                &UnixMillis::new(300),
+            )
+            .expect("signed");
+            let job = book
+                .due_relay_jobs(UnixMillis::new(300), 1)
+                .expect("due")
+                .pop()
+                .expect("job");
+            let attempt = book
+                .begin_relay_attempt(&job, UnixMillis::new(400), &UnixMillis::new(301))
+                .expect("lease");
+            let guard = mutation_failpoints::arm(failpoint, 0);
+            assert!(matches!(
+                book.record_relay_outcome(
+                    &attempt,
+                    RelayObservation::Mempool,
+                    None,
+                    Some(UnixMillis::new(350)),
+                    &UnixMillis::new(302),
+                ),
+                Err(ProviderError::InjectedMutationFailure(actual)) if actual == failpoint
+            ));
+            drop(guard);
+            attempt
+        };
+        let reopened = open_book(&directory, identity);
+        let record = reopened
+            .relay_record(attempt.reservation_id())
+            .expect("relay state")
+            .expect("relay record");
+        assert_eq!(record.revision(), 1);
+        assert_eq!(record.attempt_count(), 1);
+        assert_eq!(record.observation(), RelayObservation::Unobserved);
+        assert_eq!(record.next_attempt_at(), Some(UnixMillis::new(400)));
+        assert!(
+            reopened
+                .due_relay_jobs(UnixMillis::new(399), 1)
+                .expect("leased")
+                .is_empty()
+        );
+        reopened
+            .record_relay_outcome(
+                &attempt,
+                RelayObservation::Mempool,
+                None,
+                Some(UnixMillis::new(350)),
+                &UnixMillis::new(302),
+            )
+            .expect("retry exact outcome");
+    }
+}
+
+#[test]
+fn signed_replay_fails_closed_when_its_relay_record_is_missing() {
+    let directory = TempDir::new().expect("tempdir");
+    let identity = identity(96);
+    let book = open_book(&directory, identity);
+    let reservation = reserve_one(&book, identity, inventory(195), owner(1), 1);
+    let commitment = book
+        .commit_before_sign(
+            ReservationAccess::new(reservation.id(), reservation.owner()),
+            vec![1],
+            transaction_fee(identity, 200),
+            &UnixMillis::new(200),
+        )
+        .expect("commit")
+        .signing_job()
+        .expect("job")
+        .commitment();
+    let artifact = signed_pset(196);
+    book.record_signed(
+        reservation.id(),
+        commitment,
+        artifact.clone(),
+        &UnixMillis::new(300),
+    )
+    .expect("signed");
+    let write = book.begin_immediate_write().expect("write");
+    assert!(
+        write
+            .open_table(RELAY_RECORDS)
+            .expect("relay records")
+            .remove(reservation.id().to_bytes().as_slice())
+            .expect("remove")
+            .is_some()
+    );
+    book.commit_write(write).expect("tamper for test");
+    assert!(matches!(
+        book.record_signed(
+            reservation.id(),
+            commitment,
+            artifact,
+            &UnixMillis::new(301),
+        ),
+        Err(ProviderError::CorruptState(detail)) if detail.contains("no relay record")
+    ));
+}
+
+#[test]
+fn opening_an_existing_store_requires_both_relay_tables() {
+    for definition in [RELAY_RECORDS, RELAY_DUE] {
+        let directory = TempDir::new().expect("tempdir");
+        let identity = identity(97);
+        let path = directory.path().join("provider.redb");
+        let book = ReservationBook::create(&path, identity).expect("create");
+        let write = book.begin_immediate_write().expect("write");
+        assert!(write.delete_table(definition).expect("delete table"));
+        book.commit_write(write).expect("commit test corruption");
+        drop(book);
+        assert!(matches!(
+            ReservationBook::open_existing(&path, identity),
+            Err(ProviderError::Table(_))
+        ));
     }
 }

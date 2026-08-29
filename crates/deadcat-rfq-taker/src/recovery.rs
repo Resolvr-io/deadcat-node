@@ -163,8 +163,8 @@ pub enum FundingRecoveryError {
 mod tests {
     use deadcat_rfq_client::ExecutionJournalObservation;
     use deadcat_rfq_rpc::{
-        FixedBytes32, InputPlacementDto, ReleaseReasonDto, ReservationStateDto,
-        ReservationStatusDto,
+        FixedBytes32, InputPlacementDto, RelayObservationDto, RelayStatusDto, ReleaseReasonDto,
+        ReservationStateDto, ReservationStatusDto, SettlementPset,
     };
     use elements::{Txid, hashes::Hash as _, pset::Input as PsetInput};
 
@@ -269,15 +269,31 @@ mod tests {
                 signing_commitment: FixedBytes32::new([0x12; 32]),
                 committed_at_millis: 150,
             }));
+        let signed_pset = SettlementPset::from_pset(&PartiallySignedTransaction::new_v2())
+            .expect("empty fixture PSET");
+        let transaction = signed_pset
+            .to_pset()
+            .expect("fixture PSET")
+            .extract_tx()
+            .expect("fixture transaction");
         let signed = ExecutionJournalObservation::Signed(status(ReservationStateDto::Signed {
             signing_commitment: FixedBytes32::new([0x12; 32]),
             artifact_digest: FixedBytes32::new([0x13; 32]),
             committed_at_millis: 150,
             signed_at_millis: 160,
-            signed_pset: deadcat_rfq_rpc::SettlementPset::from_pset(
-                &PartiallySignedTransaction::new_v2(),
-            )
-            .expect("empty fixture PSET"),
+            relay: RelayStatusDto {
+                txid: transaction.txid(),
+                wtxid: transaction.wtxid(),
+                revision: 0,
+                observation: RelayObservationDto::Unobserved,
+                last_observed_at_millis: None,
+                next_attempt_at_millis: Some(160),
+                last_failure: None,
+                last_failure_at_millis: None,
+                attempt_count: 0,
+                reorg_count: 0,
+            },
+            signed_pset,
         }));
 
         assert!(ExecutionJournalObservation::Armed.requires_taker_funding_exclusion());

@@ -54,7 +54,7 @@ Available
   -> Reserved(reservation)
        -> Available                  only by unused cancellation or expiry
        -> CommittedToExactPayload
-            -> SignedBytesStored
+            -> SignedBytesAndRelayIntentStored
             -> relay and chain reconciliation
 ```
 
@@ -85,14 +85,15 @@ ordering:
 3. atomically retire every reserved provider outpoint and persist the exact
    pre-sign transcript plus a domain-separated commitment;
 4. invoke the wallet or HSM signer using only those persisted bytes;
-5. persist the exact signed response; and only then
-6. return or relay those same signed bytes.
+5. atomically persist the exact signed response, exact final transaction, and
+   immediately due relay record; and only then
+6. return that signed response and relay the stored final transaction bytes.
 
 A crash before step 3 leaves an ordinary reservation that may expire. A crash
 after step 3 resumes only the persisted transcript. A crash after step 5
-replays only the persisted signed response. Signer failure, timeout, mempool
-absence, fee-market movement, or reorganization never reopens committed
-outpoints.
+replays only the persisted signed response and exact relay transaction. Signer
+failure, timeout, mempool absence, fee-market movement, or reorganization never
+reopens committed outpoints.
 
 This policy deliberately sacrifices provider inventory availability rather
 than risk authorizing two transactions with the same outpoint.
@@ -243,6 +244,74 @@ signature fields, revalidates the completed PSET and fee facts, and persists
 one canonical signed PSET before exposing it. A concurrent valid Schnorr
 encoding loses to and replays the first durable artifact.
 
+### Exact relay outbox and chain reconciliation
+
+Signed-artifact persistence and relay scheduling are one atomic provider-state
+transition. Before either the signed result or raw transaction is exposed
+outside the provider state machine, the provider stores:
+
+- the canonical signed PSET and its artifact digest;
+- the exact consensus-serialized final transaction extracted from that PSET;
+- both its transaction ID and witness transaction ID; and
+- an initial `Unobserved` relay record scheduled for immediate work.
+
+Transaction ID alone is not the relay identity because it does not commit to
+witness data. The provider relays only the exact persisted bytes. In
+particular, observing another serialization with the expected transaction ID
+but a different witness transaction ID is a conflict with the durable artifact,
+not successful settlement or permission to adopt the other witness.
+
+The due-work query deliberately returns only a descriptor containing identity,
+revision, schedule, and prior observation. Before external chain or broadcast
+I/O can access raw transaction bytes, the store atomically issues a
+revision-bound relay attempt: it increments the attempt counter, moves the due
+index to a future crash-retry time, and only then returns the exact bytes. A
+crash during an ambiguous send therefore leaves the same transaction scheduled
+for retry. A stale worker cannot overwrite a newer observation because outcome
+recording must match the leased revision and retry time.
+
+Every attempt is status-first and idempotent:
+
+1. validate the persisted bytes, transaction and witness IDs, chain identity,
+   and synchronized transaction index;
+2. look up the exact transaction before attempting broadcast and exact-match
+   both its raw bytes and witness transaction ID;
+3. when it is reported in a block, verify that block is canonical at the
+   reported height;
+4. when it is absent, inspect every input with mempool-aware `gettxout` calls
+   under one stable chain tip, then look up the exact transaction again before
+   declaring an input conflict;
+5. only when the transaction is absent and every input remains unspent, run
+   `testmempoolaccept` and submit the exact raw bytes; and
+6. after an ambiguous, rejected, or unexpected send response, reconcile the
+   exact transaction and its inputs again before recording the outcome.
+
+The durable relay observation is orthogonal to the reservation state. A signed
+reservation remains `Signed`; only its observation changes among `Unobserved`,
+`BroadcastAccepted`, `Mempool`, `Confirmed(block hash, height)`, `Absent`, and
+`Conflicted(spent input, optional conflicting transaction ID)`. Confirmed and
+conflicted observations remain scheduled for periodic reconciliation rather
+than becoming allocation-state terminals; `BroadcastAccepted` records only the
+send response and is likewise not proof of mempool presence. A confirmed
+observation that later becomes mempool, absent, conflicted, or confirmed in a
+different block increments a durable reorganization counter. No observation,
+backend failure, policy rejection, or reorganization reopens a committed input.
+
+Authenticated status includes the exact signed artifact and its durable relay
+record. Clients bind the record's transaction and witness IDs back to the
+transaction extracted from that artifact and accept only revision-, counter-,
+and reorganization-consistent updates. Status remains readable while relay is
+degraded so either participant can recover and rebroadcast the same bytes.
+
+The daemon processes due relay work after signing recovery and before readiness,
+then runs a dedicated reconciliation worker. A relay backend outage or invalid
+backend evidence closes quote, blind, and execute admission without interrupting
+status reads or mutating allocations. Admission reopens only after a due item is
+successfully reconciled; an empty pass does not prove that a leased failed item
+has recovered. Transaction-specific policy rejection remains a durable
+per-transaction failure rather than evidence that the entire relay backend is
+unhealthy.
+
 ## Consequences
 
 - The provider may strand inventory after an ambiguous signing failure, but it
@@ -257,16 +326,17 @@ encoding loses to and replays the first durable artifact.
   windows, bounded outstanding inventory per owner, immediate signing/relay,
   and operational inventory fragmentation.
 - A client timeout after submitting its signature means status unknown, not
-  automatic cancellation. The later protocol must expose idempotent status and
-  replay.
+  automatic cancellation. The protocol exposes idempotent status and exact
+  signed-artifact replay, including the latest durable relay observation.
 - Immediate provider relay and optional provider-funded CPFP reduce the time
   committed inventory remains unavailable; cooperative RBF is deferred.
 - The persistence core stores no private keys. The transport-free quote engine
   owns exact arithmetic, inventory selection, and an injected pricing-policy
   boundary, with a static rational policy supplied for configuration and
   deterministic tests. The signing coordinator implements transport-free exact
-  signing/finalization and durable replay, but no production market-data
-  source, networking, relay, mempool, or reorg policy. ADR 0008 selects a narrow
+  signing/finalization and durable replay. The adjacent runtime supplies the
+  authenticated protocol and Elements-backed relay/reconciliation policy, but
+  still has no production market-data source. ADR 0008 selects a narrow
   service-owned hot-wallet implementation in a separate crate; neither the
   provider core nor `deadcat-node` gains direct key access.
 - Multiple interactive RFQ signers remain deferred. Future AMM and DLOB legs
@@ -290,7 +360,12 @@ recovery state, signed-response persistence state, clock rollback protection,
 startup integrity validation, and an audit log. The safety-critical commit is
 gated by the validator's opaque intent, and signed-artifact recording accepts
 only the signing coordinator's private cryptographically verified PSET
-capability.
+capability. The same atomic signed-artifact transaction also persists the exact
+final transaction and creates its immediately due relay record. Bounded due
+indexes, store-issued revision leases, stable failure classes, exact status
+replay, and durable observation, attempt, failure, and reorganization counters
+make ambiguous relay work recoverable without exposing bytes before its retry
+intent is durable.
 
 Its backend-neutral wallet layer provides validated confidential tree-less P2TR
 discovery, complete chain-anchored snapshots, atomic batch import followed by a
@@ -308,10 +383,14 @@ catalog and wallet-only logical snapshot. The adjacent `deadcat-rfq` runtime
 crate now implements the authoritative Elements-backed inventory and
 settlement-chain adapter, including confirmed catalog scans, mempool-aware
 unspent checks, complete confidential prevouts, and chain/catalog coherence
-fences. The supervised `deadcat-rfq` daemon now connects these capabilities to
-protected credential-file unlock, stable Iroh identity, the authenticated RFQ
-protocol, explicit initialization/restart modes, startup recovery, and graceful
-draining. Coordinated provider-state backup/restore remains separate work.
+fences. It also implements exact status-first transaction lookup,
+mempool-aware input reconciliation under a stable tip, canonical-block checks,
+`testmempoolaccept`, exact-byte relay, and post-send ambiguity reconciliation.
+The supervised `deadcat-rfq` daemon now connects these capabilities to protected
+credential-file unlock, stable Iroh identity, the authenticated RFQ protocol,
+explicit initialization/restart modes, signing and relay recovery before
+readiness, admission health gates, and graceful draining. Coordinated
+provider-state backup/restore remains separate work.
 
 The settlement layer also implements the provider's non-last collaborative
 blinding stage. It binds the complete unblinded PSET to the exact live reserved
@@ -352,9 +431,7 @@ The remaining provider milestones are:
 
 1. derive market configuration from canonical evidence and add production
    pricing plus authenticated-owner/global abuse controls and bounded history;
-2. persist relay and chain-reconciliation observations without ever reopening
-   a committed outpoint;
-3. coordinate wallet, provider-state, and Iroh-identity backup/restore with
+2. coordinate wallet, provider-state, and Iroh-identity backup/restore with
    external freshness checks; and
-4. pass process-kill, signer ambiguity, mempool, confirmation, reorg, and
-   public-network acceptance gates before deployment.
+3. pass process-kill, signer ambiguity, live-Core relay, mempool, confirmation,
+   reorg, and public-network acceptance gates before deployment.

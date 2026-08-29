@@ -47,11 +47,12 @@ const AMBIGUOUS_EXECUTE_DELAY_MILLIS: usize = 1_500;
 const AMBIGUOUS_REQUEST_TIMEOUT_MILLIS: u64 = 1_000;
 const RESERVATION_ID: FixedBytes32 = FixedBytes32::new([0x61; 32]);
 const QUOTE_COMMITMENT: FixedBytes32 = FixedBytes32::new([0x62; 32]);
-const ALL_CAPABILITIES: [ProviderCapability; 4] = [
+const ALL_CAPABILITIES: [ProviderCapability; 5] = [
     ProviderCapability::FirmQuotes,
     ProviderCapability::ProviderBlinding,
     ProviderCapability::SettlementExecution,
     ProviderCapability::DurableStatus,
+    ProviderCapability::SettlementRelay,
 ];
 
 fn asset(marker: u8) -> AssetId {

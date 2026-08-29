@@ -4,9 +4,11 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
+use elements::encode::{deserialize, serialize};
 use elements::hashes::Hash as _;
+use elements::pset::PartiallySignedTransaction;
 use elements::secp256k1_zkp::{Secp256k1, XOnlyPublicKey};
-use elements::{AssetId, BlockHash, OutPoint};
+use elements::{AssetId, BlockHash, OutPoint, Transaction, Txid, Wtxid};
 use redb::{
     Database, Durability, ReadTransaction, ReadableDatabase as _, ReadableTable as _,
     TableDefinition, WriteTransaction,
@@ -21,9 +23,10 @@ use crate::model::{
     AuditEntry, AuditEvent, Clock, FeePolicy, FeePolicyViolation, FeeSizeMetric, IdempotencyKey,
     InventoryBinding, InventoryItem, InventoryState, InventoryView, MAX_RESERVATION_INPUTS,
     MAX_SETTLEMENT_BYTES, OwnerId, ProviderId, ProviderIdentity, QuoteCommitment, RecoveryAction,
-    ReleaseReason, ReservationAccess, ReservationId, ReservationPlan, ReservationState,
-    ReservationView, SignedArtifact, SignedArtifactDigest, SigningCommitment, SigningJob,
-    SigningTarget, TransactionFee, UnixMillis, WalletKeyLocator,
+    RelayAttempt, RelayFailureClass, RelayJob, RelayObservation, RelayRecord, ReleaseReason,
+    ReservationAccess, ReservationId, ReservationPlan, ReservationState, ReservationView,
+    SignedArtifact, SignedArtifactDigest, SigningCommitment, SigningJob, SigningTarget,
+    TransactionFee, UnixMillis, WalletKeyLocator,
 };
 use crate::quote::{
     DestinationRecovery, FirmQuote, FirmQuoteDraft, FirmQuoteOutcome, FirmQuoteRequest,
@@ -53,6 +56,8 @@ pub const MAX_EXPIRATION_BATCH: usize = 256;
 /// Recovery callers should process a batch and query again. The fixed cap
 /// prevents an unbounded allocation even when a caller passes `usize::MAX`.
 pub const MAX_PENDING_SIGNING_BATCH: usize = 256;
+/// Maximum number of oldest-first relay jobs returned by one due query.
+pub const MAX_RELAY_BATCH: usize = 8;
 const RECORD_VERSION: u8 = 1;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -64,6 +69,8 @@ const EXPIRATIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("expirat
 const LIVE_QUOTES_BY_OWNER: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("live_quotes_by_owner");
 const PENDING_SIGNING: TableDefinition<&[u8], &[u8]> = TableDefinition::new("pending_signing");
+const RELAY_RECORDS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("relay_records");
+const RELAY_DUE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("relay_due");
 const AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
 
 const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -102,7 +109,12 @@ mod mutation_failpoints {
     pub(super) const COMMIT_AFTER_AUDIT: &str = "commit.after_audit";
     pub(super) const SIGNED_AFTER_RECORD: &str = "signed.after_record";
     pub(super) const SIGNED_AFTER_PENDING_SIGNING: &str = "signed.after_pending_signing";
+    pub(super) const SIGNED_AFTER_RELAY_RECORD: &str = "signed.after_relay_record";
+    pub(super) const SIGNED_AFTER_RELAY_DUE: &str = "signed.after_relay_due";
     pub(super) const SIGNED_AFTER_AUDIT: &str = "signed.after_audit";
+    pub(super) const RELAY_AFTER_DUE_REMOVE: &str = "relay.after_due_remove";
+    pub(super) const RELAY_AFTER_RECORD: &str = "relay.after_record";
+    pub(super) const RELAY_AFTER_DUE_INSERT: &str = "relay.after_due_insert";
 
     #[derive(Clone, Copy)]
     struct Active {
@@ -903,6 +915,7 @@ impl ReservationBook {
             }
             StoredReservationState::Signed { intent, artifact } => {
                 ensure_committed_allocations_read(&read, &record, intent.commitment)?;
+                ensure_relay_binding_read(&read, &record, intent, artifact)?;
                 Some(artifact.to_domain(record.id(), SigningCommitment::new(intent.commitment))?)
             }
             StoredReservationState::Reserved | StoredReservationState::Released { .. } => None,
@@ -941,6 +954,7 @@ impl ReservationBook {
             }
             StoredReservationState::Signed { intent, artifact } => {
                 ensure_committed_allocations_write(&write, &record, intent.commitment)?;
+                ensure_relay_binding_write(&write, &record, intent, artifact)?;
                 Some(artifact.to_domain(record.id(), SigningCommitment::new(intent.commitment))?)
             }
             StoredReservationState::Reserved | StoredReservationState::Released { .. } => None,
@@ -1035,6 +1049,7 @@ impl ReservationBook {
             StoredReservationState::Signed { intent, artifact } => {
                 let job = intent.to_job(record.id())?;
                 artifact.to_domain(record.id(), job.commitment())?;
+                ensure_relay_binding_read(&read, &record, intent, artifact)?;
                 SettlementContextState::Signed(job)
             }
         };
@@ -1205,6 +1220,7 @@ impl ReservationBook {
                 {
                     return Err(ProviderError::DifferentSigningIntent(record.id()));
                 }
+                ensure_relay_binding_write(&write, &record, intent, artifact)?;
                 let artifact = artifact.to_domain(record.id(), proposed)?;
                 self.commit_write(write)?;
                 return Ok(CommitOutcome::AlreadySigned(artifact));
@@ -1359,6 +1375,7 @@ impl ReservationBook {
             StoredReservationState::Signed { intent, artifact } => {
                 let durable_job = intent.to_job(record.id())?;
                 ensure_exact_signing_job(&durable_job, expected_job)?;
+                ensure_relay_binding_read(&read, &record, intent, artifact)?;
                 Ok(ExactSigningState::Signed(
                     artifact.to_domain(record.id(), durable_job.commitment())?,
                 ))
@@ -1408,6 +1425,7 @@ impl ReservationBook {
             }
         };
         ensure_committed_allocations_read(&read, &record, intent.commitment)?;
+        ensure_relay_binding_read(&read, &record, intent, artifact)?;
         let actual = artifact.to_domain(record.id(), SigningCommitment::new(intent.commitment))?;
         if actual != *expected {
             return Err(ProviderError::SignedArtifactBindingMismatch(
@@ -1505,6 +1523,7 @@ impl ReservationBook {
                 if artifact.bytes != signed_bytes && !replay_winner_on_conflict {
                     return Err(ProviderError::DifferentSignedArtifact(reservation_id));
                 }
+                ensure_relay_binding_write(&write, &record, intent, artifact)?;
                 let artifact = artifact.to_domain(reservation_id, expected_commitment)?;
                 self.commit_write(write)?;
                 return Ok(SignedOutcome {
@@ -1519,6 +1538,11 @@ impl ReservationBook {
                 return Err(ProviderError::ReservationAlreadyReleased(reservation_id));
             }
         };
+        // Derive the relay transaction only after the already-signed replay
+        // path above. A losing concurrent candidate must never prevent replay
+        // of the exact durable winner.
+        ensure_no_relay_binding_write(&write, reservation_id)?;
+        let relay_binding = relay_transaction_binding(&signed_bytes)?;
         if intent.commitment != expected_commitment.to_bytes() {
             return Err(ProviderError::SigningCommitmentMismatch {
                 reservation_id,
@@ -1553,6 +1577,36 @@ impl ReservationBook {
         }
         #[cfg(test)]
         mutation_failpoints::hit(mutation_failpoints::SIGNED_AFTER_PENDING_SIGNING)?;
+        let relay_record = StoredRelayRecord {
+            reservation_id: reservation_id.to_bytes(),
+            commitment: expected_commitment.to_bytes(),
+            artifact: digest.to_bytes(),
+            txid: relay_binding.txid.to_byte_array(),
+            wtxid: relay_binding.wtxid.to_byte_array(),
+            transaction_bytes: relay_binding.transaction_bytes,
+            revision: 0,
+            observation: StoredRelayObservation::Unobserved,
+            last_failure: None,
+            last_failure_at: None,
+            attempt_count: 0,
+            reorg_count: 0,
+            last_observed_at: None,
+            next_attempt_at: Some(now.value()),
+        };
+        write_record(
+            &write,
+            RELAY_RECORDS,
+            &reservation_id.to_bytes(),
+            &relay_record,
+        )?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::SIGNED_AFTER_RELAY_RECORD)?;
+        let empty: &[u8] = &[];
+        write
+            .open_table(RELAY_DUE)?
+            .insert(relay_due_key(now, reservation_id).as_slice(), empty)?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::SIGNED_AFTER_RELAY_DUE)?;
         append_audit(
             &write,
             now,
@@ -1606,6 +1660,7 @@ impl ReservationBook {
                     RecoveryAction::SignCommittedExact(intent.to_job(record.id())?),
                 ),
                 StoredReservationState::Signed { intent, artifact } => {
+                    ensure_relay_binding_read(&read, &record, intent, artifact)?;
                     let commitment = SigningCommitment::new(intent.commitment);
                     actions.push(RecoveryAction::ReplaySignedExact(
                         artifact.to_domain(record.id(), commitment)?,
@@ -1666,6 +1721,302 @@ impl ReservationBook {
             jobs.push(intent.to_job(record.id())?);
         }
         Ok(jobs)
+    }
+
+    /// Return an oldest-first bounded batch of exact relay jobs due no later
+    /// than `now`. Passing a limit above [`MAX_RELAY_BATCH`] is equivalent to
+    /// passing the cap.
+    pub fn due_relay_jobs(
+        &self,
+        now: UnixMillis,
+        limit: usize,
+    ) -> Result<Vec<RelayJob>, ProviderError> {
+        self.ensure_healthy()?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let read = self.database.begin_read()?;
+        let due = read.open_table(RELAY_DUE)?;
+        let records = read.open_table(RELAY_RECORDS)?;
+        let reservations = read.open_table(RESERVATIONS)?;
+        let mut jobs = Vec::new();
+        for entry in due.iter()? {
+            if jobs.len() == relay_batch_limit(limit) {
+                break;
+            }
+            let (key, value) = entry?;
+            let key = decode_table_key::<40>("relay-due", key.value())?;
+            if !value.value().is_empty() {
+                return Err(ProviderError::CorruptState(
+                    "relay-due index value is not empty".to_owned(),
+                ));
+            }
+            let (due_at, reservation_id) = decode_relay_due_key(&key);
+            if due_at > now {
+                break;
+            }
+            let stored = records
+                .get(reservation_id.to_bytes().as_slice())?
+                .ok_or_else(|| {
+                    ProviderError::CorruptState(
+                        "relay-due index references a missing relay record".to_owned(),
+                    )
+                })?;
+            let relay: StoredRelayRecord = decode_record(stored.value())?;
+            let reservation = reservations
+                .get(reservation_id.to_bytes().as_slice())?
+                .ok_or_else(|| {
+                    ProviderError::CorruptState(
+                        "relay record references a missing reservation".to_owned(),
+                    )
+                })?;
+            let reservation: StoredReservation = decode_record(reservation.value())?;
+            validate_relay_binding(&relay, &reservation)?;
+            if relay.next_attempt_at != Some(due_at.value()) {
+                return Err(ProviderError::CorruptState(format!(
+                    "relay-due index disagrees with reservation {reservation_id:?}"
+                )));
+            }
+            jobs.push(relay.to_job(due_at)?);
+        }
+        Ok(jobs)
+    }
+
+    /// Return the durable relay state for a signed reservation.
+    pub fn relay_record(
+        &self,
+        reservation_id: ReservationId,
+    ) -> Result<Option<RelayRecord>, ProviderError> {
+        self.ensure_healthy()?;
+        let read = self.database.begin_read()?;
+        let records = read.open_table(RELAY_RECORDS)?;
+        let Some(stored) = records.get(reservation_id.to_bytes().as_slice())? else {
+            return Ok(None);
+        };
+        let relay: StoredRelayRecord = decode_record(stored.value())?;
+        let reservations = read.open_table(RESERVATIONS)?;
+        let reservation = reservations
+            .get(reservation_id.to_bytes().as_slice())?
+            .ok_or_else(|| {
+                ProviderError::CorruptState(
+                    "relay record references a missing reservation".to_owned(),
+                )
+            })?;
+        let reservation: StoredReservation = decode_record(reservation.value())?;
+        validate_relay_binding(&relay, &reservation)?;
+        Ok(Some(relay.to_domain()?))
+    }
+
+    /// Durably lease one due relay job before exposing its transaction bytes.
+    ///
+    /// `retry_at` is both the attempt lease deadline and the crash-recovery
+    /// retry time. It must be later than the clock observation acquired under
+    /// the store's mutation lock.
+    pub fn begin_relay_attempt<C: Clock>(
+        &self,
+        expected: &RelayJob,
+        retry_at: UnixMillis,
+        clock: &C,
+    ) -> Result<RelayAttempt, ProviderError> {
+        let (_operation_guard, write, now) = self.begin_timed_write(clock)?;
+        if retry_at <= now {
+            return Err(ProviderError::RelayLeaseNotFuture { now, retry_at });
+        }
+        let mut relay: StoredRelayRecord =
+            read_record_from_write(&write, RELAY_RECORDS, &expected.reservation_id().to_bytes())?
+                .ok_or(ProviderError::RelayRecordNotFound(
+                expected.reservation_id(),
+            ))?;
+        let reservation = read_reservation_from_write(&write, expected.reservation_id())?
+            .ok_or_else(|| {
+                ProviderError::CorruptState("relay record has no reservation".to_owned())
+            })?;
+        validate_relay_binding(&relay, &reservation)?;
+        ensure_exact_relay_job(&relay, expected)?;
+        if relay.revision != expected.revision() {
+            return Err(ProviderError::RelayRevisionMismatch {
+                reservation_id: expected.reservation_id(),
+                expected: expected.revision(),
+                actual: relay.revision,
+            });
+        }
+        if relay.next_attempt_at != Some(expected.due_at().value()) {
+            return Err(ProviderError::RelayJobBindingMismatch(
+                expected.reservation_id(),
+            ));
+        }
+        let removed = write
+            .open_table(RELAY_DUE)?
+            .remove(relay_due_key(expected.due_at(), expected.reservation_id()).as_slice())?
+            .is_some();
+        if !removed {
+            return Err(ProviderError::CorruptState(format!(
+                "due relay record {:?} has no relay-due index entry",
+                expected.reservation_id()
+            )));
+        }
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::RELAY_AFTER_DUE_REMOVE)?;
+        relay.revision = relay
+            .revision
+            .checked_add(1)
+            .ok_or(ProviderError::RelayRevisionOverflow)?;
+        relay.attempt_count = relay
+            .attempt_count
+            .checked_add(1)
+            .ok_or(ProviderError::RelayAttemptCountOverflow)?;
+        relay.next_attempt_at = Some(retry_at.value());
+        write_record(
+            &write,
+            RELAY_RECORDS,
+            &expected.reservation_id().to_bytes(),
+            &relay,
+        )?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::RELAY_AFTER_RECORD)?;
+        let empty: &[u8] = &[];
+        write.open_table(RELAY_DUE)?.insert(
+            relay_due_key(retry_at, expected.reservation_id()).as_slice(),
+            empty,
+        )?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::RELAY_AFTER_DUE_INSERT)?;
+        let attempt = relay.to_attempt(retry_at)?;
+        self.commit_write(write)?;
+        Ok(attempt)
+    }
+
+    /// Atomically record one leased, revision-bound relay/reconciliation
+    /// result and optionally schedule the exact transaction for another
+    /// attempt.
+    ///
+    /// A stale worker cannot overwrite a newer observation. This transition
+    /// never touches allocation state or the signed reservation itself.
+    pub fn record_relay_outcome<C: Clock>(
+        &self,
+        expected: &RelayAttempt,
+        observation: RelayObservation,
+        last_failure: Option<RelayFailureClass>,
+        next_attempt_at: Option<UnixMillis>,
+        clock: &C,
+    ) -> Result<RelayRecord, ProviderError> {
+        let (_operation_guard, write, now) = self.begin_timed_write(clock)?;
+        if let Some(next_attempt_at) = next_attempt_at
+            && next_attempt_at < now
+        {
+            return Err(ProviderError::RelayScheduleInPast {
+                now,
+                next_attempt_at,
+            });
+        }
+        let mut relay: StoredRelayRecord =
+            read_record_from_write(&write, RELAY_RECORDS, &expected.reservation_id().to_bytes())?
+                .ok_or(ProviderError::RelayRecordNotFound(
+                expected.reservation_id(),
+            ))?;
+        let reservation = read_reservation_from_write(&write, expected.reservation_id())?
+            .ok_or_else(|| {
+                ProviderError::CorruptState("relay record has no reservation".to_owned())
+            })?;
+        validate_relay_binding(&relay, &reservation)?;
+        ensure_exact_relay_attempt(&relay, expected)?;
+        if relay.revision != expected.revision() {
+            return Err(ProviderError::RelayRevisionMismatch {
+                reservation_id: expected.reservation_id(),
+                expected: expected.revision(),
+                actual: relay.revision,
+            });
+        }
+        if relay.next_attempt_at != Some(expected.retry_at().value()) {
+            return Err(ProviderError::RelayJobBindingMismatch(
+                expected.reservation_id(),
+            ));
+        }
+        if observation == RelayObservation::Unobserved
+            && !matches!(
+                last_failure,
+                Some(RelayFailureClass::BackendUnavailable | RelayFailureClass::InvalidBackendData)
+            )
+        {
+            return Err(ProviderError::InvalidRelayObservation(
+                "a completed unobserved attempt must record a source failure",
+            ));
+        }
+        if last_failure == Some(RelayFailureClass::PolicyRejected)
+            && observation != RelayObservation::Absent
+        {
+            return Err(ProviderError::InvalidRelayObservation(
+                "a policy rejection requires an exact absent observation",
+            ));
+        }
+        validate_relay_observation(&relay, observation)?;
+        let due_key = relay_due_key(expected.retry_at(), expected.reservation_id());
+        let removed = write
+            .open_table(RELAY_DUE)?
+            .remove(due_key.as_slice())?
+            .is_some();
+        if !removed {
+            return Err(ProviderError::CorruptState(format!(
+                "due relay record {:?} has no relay-due index entry",
+                expected.reservation_id()
+            )));
+        }
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::RELAY_AFTER_DUE_REMOVE)?;
+
+        let reorged = match (relay.observation, observation) {
+            (
+                StoredRelayObservation::Confirmed {
+                    block_hash: old_hash,
+                    block_height: old_height,
+                },
+                RelayObservation::Confirmed {
+                    block_hash: new_hash,
+                    block_height: new_height,
+                },
+            ) => old_hash != new_hash.to_byte_array() || old_height != new_height,
+            (StoredRelayObservation::Confirmed { .. }, _) => true,
+            _ => false,
+        };
+        relay.revision = relay
+            .revision
+            .checked_add(1)
+            .ok_or(ProviderError::RelayRevisionOverflow)?;
+        if reorged {
+            relay.reorg_count = relay
+                .reorg_count
+                .checked_add(1)
+                .ok_or(ProviderError::RelayReorgCountOverflow)?;
+        }
+        let stored_observation = StoredRelayObservation::from(observation);
+        let observation_changed = relay.observation != stored_observation;
+        relay.observation = stored_observation;
+        relay.last_failure = last_failure.map(StoredRelayFailureClass::from);
+        relay.last_failure_at = last_failure.map(|_| now.value());
+        if last_failure.is_none() || observation_changed {
+            relay.last_observed_at = Some(now.value());
+        }
+        relay.next_attempt_at = next_attempt_at.map(UnixMillis::value);
+        write_record(
+            &write,
+            RELAY_RECORDS,
+            &expected.reservation_id().to_bytes(),
+            &relay,
+        )?;
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::RELAY_AFTER_RECORD)?;
+        if let Some(next_attempt_at) = next_attempt_at {
+            let empty: &[u8] = &[];
+            write.open_table(RELAY_DUE)?.insert(
+                relay_due_key(next_attempt_at, expected.reservation_id()).as_slice(),
+                empty,
+            )?;
+        }
+        #[cfg(test)]
+        mutation_failpoints::hit(mutation_failpoints::RELAY_AFTER_DUE_INSERT)?;
+        let domain = relay.to_domain()?;
+        self.commit_write(write)?;
+        Ok(domain)
     }
 
     pub fn audit_log(&self) -> Result<Vec<AuditEntry>, ProviderError> {
@@ -2505,6 +2856,293 @@ fn signed_artifact_digest(commitment: SigningCommitment, bytes: &[u8]) -> Signed
     SignedArtifactDigest::new(hasher.finalize().into())
 }
 
+struct RelayTransactionBinding {
+    txid: Txid,
+    wtxid: Wtxid,
+    transaction_bytes: Vec<u8>,
+}
+
+fn relay_transaction_binding(
+    signed_artifact_bytes: &[u8],
+) -> Result<RelayTransactionBinding, ProviderError> {
+    let pset: PartiallySignedTransaction = deserialize(signed_artifact_bytes).map_err(|error| {
+        ProviderError::InvalidSignedArtifactForRelay(format!("invalid PSET: {error}"))
+    })?;
+    if serialize(&pset) != signed_artifact_bytes {
+        return Err(ProviderError::InvalidSignedArtifactForRelay(
+            "PSET encoding is not canonical".to_owned(),
+        ));
+    }
+    let transaction = pset.extract_tx().map_err(|error| {
+        ProviderError::InvalidSignedArtifactForRelay(format!(
+            "cannot extract finalized transaction: {error}"
+        ))
+    })?;
+    let transaction_bytes = serialize(&transaction);
+    Ok(RelayTransactionBinding {
+        txid: transaction.txid(),
+        wtxid: transaction.wtxid(),
+        transaction_bytes,
+    })
+}
+
+fn validate_relay_observation(
+    relay: &StoredRelayRecord,
+    observation: RelayObservation,
+) -> Result<(), ProviderError> {
+    if observation == RelayObservation::Unobserved
+        && relay.observation != StoredRelayObservation::Unobserved
+    {
+        return Err(ProviderError::InvalidRelayObservation(
+            "an observed relay transaction cannot regress to unobserved",
+        ));
+    }
+    if let RelayObservation::Conflicted {
+        spent_input,
+        conflicting_txid: _,
+    } = observation
+    {
+        let transaction: Transaction = deserialize(&relay.transaction_bytes).map_err(|error| {
+            ProviderError::CorruptState(format!("invalid persisted relay transaction: {error}"))
+        })?;
+        if !transaction
+            .input
+            .iter()
+            .any(|input| input.previous_output == spent_input)
+        {
+            return Err(ProviderError::InvalidRelayObservation(
+                "the reported spent input is not an input of the exact relay transaction",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_relay_binding(
+    relay: &StoredRelayRecord,
+    reservation: &StoredReservation,
+) -> Result<(), ProviderError> {
+    reservation.validate()?;
+    let StoredReservationState::Signed { intent, artifact } = &reservation.state else {
+        return Err(ProviderError::CorruptState(format!(
+            "non-signed reservation {:?} has a relay record",
+            reservation.id()
+        )));
+    };
+    if relay.reservation_id != reservation.id
+        || relay.commitment != intent.commitment
+        || relay.artifact != artifact.digest
+    {
+        return Err(ProviderError::CorruptState(format!(
+            "relay record binding disagrees with signed reservation {:?}",
+            reservation.id()
+        )));
+    }
+    relay.validate_transaction()?;
+    let extracted = relay_transaction_binding(&artifact.bytes).map_err(|error| {
+        ProviderError::CorruptState(format!(
+            "signed reservation {:?} cannot reproduce its relay transaction: {error}",
+            reservation.id()
+        ))
+    })?;
+    if relay.txid != extracted.txid.to_byte_array()
+        || relay.wtxid != extracted.wtxid.to_byte_array()
+        || relay.transaction_bytes != extracted.transaction_bytes
+    {
+        return Err(ProviderError::CorruptState(format!(
+            "relay transaction disagrees with signed artifact for reservation {:?}",
+            reservation.id()
+        )));
+    }
+    let completed_revision = relay.attempt_count.checked_mul(2);
+    let in_flight_revision = completed_revision.and_then(|revision| revision.checked_sub(1));
+    let in_flight = matches!(in_flight_revision, Some(revision) if relay.revision == revision);
+    if !matches!(completed_revision, Some(revision) if relay.revision == revision) && !in_flight {
+        return Err(ProviderError::CorruptState(format!(
+            "relay revision and attempt count disagree for reservation {:?}",
+            reservation.id()
+        )));
+    }
+    let Some(completed_outcomes) = relay.revision.checked_sub(relay.attempt_count) else {
+        return Err(ProviderError::CorruptState(format!(
+            "relay revision precedes its attempt count for reservation {:?}",
+            reservation.id()
+        )));
+    };
+    if relay.reorg_count > completed_outcomes
+        || relay.last_failure.is_some() != relay.last_failure_at.is_some()
+        || (relay.revision == 0
+            && (relay.observation != StoredRelayObservation::Unobserved
+                || relay.last_failure.is_some()
+                || relay.last_failure_at.is_some()
+                || relay.last_observed_at.is_some()
+                || relay.next_attempt_at != Some(artifact.signed_at)))
+        || (in_flight && relay.next_attempt_at.is_none())
+        || ((relay.observation == StoredRelayObservation::Unobserved)
+            != relay.last_observed_at.is_none())
+        || (relay.revision != 0
+            && !in_flight
+            && relay.observation == StoredRelayObservation::Unobserved
+            && !matches!(
+                relay.last_failure,
+                Some(
+                    StoredRelayFailureClass::BackendUnavailable
+                        | StoredRelayFailureClass::InvalidBackendData
+                )
+            ))
+        || (relay.last_failure == Some(StoredRelayFailureClass::PolicyRejected)
+            && relay.observation != StoredRelayObservation::Absent)
+        || relay
+            .last_observed_at
+            .zip(relay.last_failure_at)
+            .is_some_and(|(observed, failed)| failed < observed)
+    {
+        return Err(ProviderError::CorruptState(format!(
+            "relay counters, timestamps, or initial state are invalid for reservation {:?}",
+            reservation.id()
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_exact_relay_job(
+    relay: &StoredRelayRecord,
+    expected: &RelayJob,
+) -> Result<(), ProviderError> {
+    if relay.reservation_id != expected.reservation_id().to_bytes()
+        || relay.commitment != expected.commitment().to_bytes()
+        || relay.artifact != expected.artifact().to_bytes()
+        || relay.txid != expected.txid().to_byte_array()
+        || relay.wtxid != expected.wtxid().to_byte_array()
+    {
+        return Err(ProviderError::RelayJobBindingMismatch(
+            expected.reservation_id(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_exact_relay_attempt(
+    relay: &StoredRelayRecord,
+    expected: &RelayAttempt,
+) -> Result<(), ProviderError> {
+    if relay.reservation_id != expected.reservation_id().to_bytes()
+        || relay.commitment != expected.commitment().to_bytes()
+        || relay.artifact != expected.artifact().to_bytes()
+        || relay.txid != expected.txid().to_byte_array()
+        || relay.wtxid != expected.wtxid().to_byte_array()
+        || relay.transaction_bytes != expected.transaction_bytes()
+    {
+        return Err(ProviderError::RelayJobBindingMismatch(
+            expected.reservation_id(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_relay_binding_read(
+    read: &ReadTransaction,
+    reservation: &StoredReservation,
+    intent: &StoredSigningIntent,
+    artifact: &StoredSignedArtifact,
+) -> Result<(), ProviderError> {
+    let records = read.open_table(RELAY_RECORDS)?;
+    let stored = records
+        .get(reservation.id().to_bytes().as_slice())?
+        .ok_or_else(|| {
+            ProviderError::CorruptState(format!(
+                "signed reservation {:?} has no relay record",
+                reservation.id()
+            ))
+        })?;
+    let relay: StoredRelayRecord = decode_record(stored.value())?;
+    if intent.commitment != relay.commitment || artifact.digest != relay.artifact {
+        return Err(ProviderError::CorruptState(format!(
+            "signed reservation {:?} relay record has a different artifact binding",
+            reservation.id()
+        )));
+    }
+    validate_relay_binding(&relay, reservation)?;
+    let due = read.open_table(RELAY_DUE)?;
+    if let Some(due_at) = relay.next_attempt_at {
+        let value = due
+            .get(relay_due_key(UnixMillis::new(due_at), reservation.id()).as_slice())?
+            .ok_or_else(|| {
+                ProviderError::CorruptState(format!(
+                    "signed reservation {:?} has no relay-due entry",
+                    reservation.id()
+                ))
+            })?;
+        if !value.value().is_empty() {
+            return Err(ProviderError::CorruptState(format!(
+                "signed reservation {:?} has an invalid relay-due entry",
+                reservation.id()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_relay_binding_write(
+    write: &WriteTransaction,
+    reservation: &StoredReservation,
+    intent: &StoredSigningIntent,
+    artifact: &StoredSignedArtifact,
+) -> Result<(), ProviderError> {
+    let relay: StoredRelayRecord =
+        read_record_from_write(write, RELAY_RECORDS, &reservation.id().to_bytes())?.ok_or_else(
+            || {
+                ProviderError::CorruptState(format!(
+                    "signed reservation {:?} has no relay record",
+                    reservation.id()
+                ))
+            },
+        )?;
+    if intent.commitment != relay.commitment || artifact.digest != relay.artifact {
+        return Err(ProviderError::CorruptState(format!(
+            "signed reservation {:?} relay record has a different artifact binding",
+            reservation.id()
+        )));
+    }
+    validate_relay_binding(&relay, reservation)?;
+    let due = write.open_table(RELAY_DUE)?;
+    if let Some(due_at) = relay.next_attempt_at {
+        let value = due
+            .get(relay_due_key(UnixMillis::new(due_at), reservation.id()).as_slice())?
+            .ok_or_else(|| {
+                ProviderError::CorruptState(format!(
+                    "signed reservation {:?} has no relay-due entry",
+                    reservation.id()
+                ))
+            })?;
+        if !value.value().is_empty() {
+            return Err(ProviderError::CorruptState(format!(
+                "signed reservation {:?} has an invalid relay-due entry",
+                reservation.id()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_no_relay_binding_write(
+    write: &WriteTransaction,
+    reservation_id: ReservationId,
+) -> Result<(), ProviderError> {
+    if read_record_from_write::<StoredRelayRecord>(
+        write,
+        RELAY_RECORDS,
+        &reservation_id.to_bytes(),
+    )?
+    .is_some()
+    {
+        return Err(ProviderError::CorruptState(format!(
+            "committed reservation {reservation_id:?} already has a relay record"
+        )));
+    }
+    Ok(())
+}
+
 fn request_digest(
     identity: ProviderIdentity,
     plan: &ReservationPlan,
@@ -2635,6 +3273,8 @@ fn provider_tables_are_nonempty(write: &WriteTransaction) -> Result<bool, Provid
         EXPIRATIONS,
         LIVE_QUOTES_BY_OWNER,
         PENDING_SIGNING,
+        RELAY_RECORDS,
+        RELAY_DUE,
     ] {
         let table = write.open_table(definition)?;
         if table.iter()?.next().transpose()?.is_some() {
@@ -2837,6 +3477,74 @@ fn validate_store_integrity(
         keys
     };
 
+    let relay_records = {
+        let table = write.open_table(RELAY_RECORDS)?;
+        let mut records = BTreeMap::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            let key = decode_table_key::<32>("relay record", key.value())?;
+            let record: StoredRelayRecord = decode_record(value.value())?;
+            if key != record.reservation_id {
+                return Err(ProviderError::CorruptState(
+                    "relay-record key and reservation ID disagree".to_owned(),
+                ));
+            }
+            records.insert(key, record);
+        }
+        records
+    };
+
+    let relay_due = {
+        let table = write.open_table(RELAY_DUE)?;
+        let mut keys = BTreeSet::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            let key = decode_table_key::<40>("relay-due", key.value())?;
+            if !value.value().is_empty() {
+                return Err(ProviderError::CorruptState(
+                    "relay-due index value is not empty".to_owned(),
+                ));
+            }
+            keys.insert(key);
+        }
+        keys
+    };
+
+    for (reservation_id, relay) in &relay_records {
+        let reservation = reservations.get(reservation_id).ok_or_else(|| {
+            ProviderError::CorruptState("relay record references a missing reservation".to_owned())
+        })?;
+        validate_relay_binding(relay, reservation)?;
+        let StoredReservationState::Signed { artifact, .. } = &reservation.state else {
+            unreachable!("relay binding validation already requires signed state");
+        };
+        if relay.last_observed_at.is_some_and(|at| {
+            at < artifact.signed_at
+                || last_observed_time.is_none_or(|high_watermark| at > high_watermark)
+        }) || relay.last_failure_at.is_some_and(|at| {
+            at < artifact.signed_at
+                || last_observed_time.is_none_or(|high_watermark| at > high_watermark)
+        }) {
+            return Err(ProviderError::CorruptState(format!(
+                "relay observation timestamps are invalid for reservation {:?}",
+                reservation.id()
+            )));
+        }
+        validate_relay_observation(relay, relay.observation.to_domain())?;
+        let has_due = relay.next_attempt_at.is_some_and(|due_at| {
+            relay_due.contains(&relay_due_key(
+                UnixMillis::new(due_at),
+                ReservationId::new(*reservation_id),
+            ))
+        });
+        if has_due != relay.next_attempt_at.is_some() {
+            return Err(ProviderError::CorruptState(format!(
+                "relay record {:?} has inconsistent due indexing",
+                reservation.id()
+            )));
+        }
+    }
+
     for record in reservations.values() {
         let expected_request_key = request_key(
             OwnerId::new(record.owner),
@@ -2867,6 +3575,7 @@ fn validate_store_integrity(
             record.id(),
         );
         let has_live_quote = live_quotes.contains(&expected_live_quote);
+        let has_relay_record = relay_records.contains_key(&record.id);
         if let StoredReservationState::Committed { intent } = &record.state {
             let expected_pending =
                 pending_signing_key(UnixMillis::new(intent.committed_at), record.id());
@@ -2908,6 +3617,12 @@ fn validate_store_integrity(
                     )));
                 }
             }
+        }
+        if has_relay_record != matches!(&record.state, StoredReservationState::Signed { .. }) {
+            return Err(ProviderError::CorruptState(format!(
+                "reservation {:?} has inconsistent relay-record ownership",
+                record.id()
+            )));
         }
 
         for (target_index, outpoint) in record.outpoints.iter().enumerate() {
@@ -3091,6 +3806,22 @@ fn validate_store_integrity(
             return Err(ProviderError::CorruptState(format!(
                 "pending-signing index disagrees with reservation {:?}",
                 record.id()
+            )));
+        }
+    }
+
+    for key in &relay_due {
+        let (due_at, reservation_id) = decode_relay_due_key(key);
+        let relay = relay_records
+            .get(&reservation_id.to_bytes())
+            .ok_or_else(|| {
+                ProviderError::CorruptState(
+                    "relay-due index references a missing relay record".to_owned(),
+                )
+            })?;
+        if relay.next_attempt_at != Some(due_at.value()) {
+            return Err(ProviderError::CorruptState(format!(
+                "relay-due index disagrees with reservation {reservation_id:?}"
             )));
         }
     }
@@ -3413,6 +4144,22 @@ fn decode_pending_signing_key(key: &[u8; 40]) -> (UnixMillis, ReservationId) {
     (committed_at, reservation_id)
 }
 
+fn relay_due_key(due_at: UnixMillis, reservation_id: ReservationId) -> [u8; 40] {
+    pending_signing_key(due_at, reservation_id)
+}
+
+fn decode_relay_due_key(key: &[u8; 40]) -> (UnixMillis, ReservationId) {
+    decode_pending_signing_key(key)
+}
+
+const fn relay_batch_limit(requested: usize) -> usize {
+    if requested < MAX_RELAY_BATCH {
+        requested
+    } else {
+        MAX_RELAY_BATCH
+    }
+}
+
 fn create_tables(write: &WriteTransaction) -> Result<(), ProviderError> {
     write.open_table(INVENTORY)?;
     write.open_table(ALLOCATIONS)?;
@@ -3421,6 +4168,8 @@ fn create_tables(write: &WriteTransaction) -> Result<(), ProviderError> {
     write.open_table(EXPIRATIONS)?;
     write.open_table(LIVE_QUOTES_BY_OWNER)?;
     write.open_table(PENDING_SIGNING)?;
+    write.open_table(RELAY_RECORDS)?;
+    write.open_table(RELAY_DUE)?;
     write.open_table(AUDIT)?;
     Ok(())
 }
@@ -3436,6 +4185,8 @@ fn ensure_provider_tables_exist(database: &Database) -> Result<(), ProviderError
         EXPIRATIONS,
         LIVE_QUOTES_BY_OWNER,
         PENDING_SIGNING,
+        RELAY_RECORDS,
+        RELAY_DUE,
     ] {
         read.open_table(definition)?;
     }
@@ -4110,6 +4861,186 @@ struct StoredSignedArtifact {
     digest: [u8; 32],
     bytes: Vec<u8>,
     signed_at: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum StoredRelayObservation {
+    Unobserved,
+    BroadcastAccepted,
+    Mempool,
+    Confirmed {
+        block_hash: [u8; 32],
+        block_height: u32,
+    },
+    Absent,
+    Conflicted {
+        spent_input: OutPoint,
+        conflicting_txid: Option<[u8; 32]>,
+    },
+}
+
+impl From<RelayObservation> for StoredRelayObservation {
+    fn from(value: RelayObservation) -> Self {
+        match value {
+            RelayObservation::Unobserved => Self::Unobserved,
+            RelayObservation::BroadcastAccepted => Self::BroadcastAccepted,
+            RelayObservation::Mempool => Self::Mempool,
+            RelayObservation::Confirmed {
+                block_hash,
+                block_height,
+            } => Self::Confirmed {
+                block_hash: block_hash.to_byte_array(),
+                block_height,
+            },
+            RelayObservation::Absent => Self::Absent,
+            RelayObservation::Conflicted {
+                spent_input,
+                conflicting_txid,
+            } => Self::Conflicted {
+                spent_input,
+                conflicting_txid: conflicting_txid.map(|txid| txid.to_byte_array()),
+            },
+        }
+    }
+}
+
+impl StoredRelayObservation {
+    fn to_domain(self) -> RelayObservation {
+        match self {
+            Self::Unobserved => RelayObservation::Unobserved,
+            Self::BroadcastAccepted => RelayObservation::BroadcastAccepted,
+            Self::Mempool => RelayObservation::Mempool,
+            Self::Confirmed {
+                block_hash,
+                block_height,
+            } => RelayObservation::Confirmed {
+                block_hash: BlockHash::from_byte_array(block_hash),
+                block_height,
+            },
+            Self::Absent => RelayObservation::Absent,
+            Self::Conflicted {
+                spent_input,
+                conflicting_txid,
+            } => RelayObservation::Conflicted {
+                spent_input,
+                conflicting_txid: conflicting_txid.map(Txid::from_byte_array),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum StoredRelayFailureClass {
+    BackendUnavailable,
+    PolicyRejected,
+    InvalidBackendData,
+}
+
+impl From<RelayFailureClass> for StoredRelayFailureClass {
+    fn from(value: RelayFailureClass) -> Self {
+        match value {
+            RelayFailureClass::BackendUnavailable => Self::BackendUnavailable,
+            RelayFailureClass::PolicyRejected => Self::PolicyRejected,
+            RelayFailureClass::InvalidBackendData => Self::InvalidBackendData,
+        }
+    }
+}
+
+impl StoredRelayFailureClass {
+    const fn to_domain(self) -> RelayFailureClass {
+        match self {
+            Self::BackendUnavailable => RelayFailureClass::BackendUnavailable,
+            Self::PolicyRejected => RelayFailureClass::PolicyRejected,
+            Self::InvalidBackendData => RelayFailureClass::InvalidBackendData,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredRelayRecord {
+    reservation_id: [u8; 32],
+    commitment: [u8; 32],
+    artifact: [u8; 32],
+    txid: [u8; 32],
+    wtxid: [u8; 32],
+    transaction_bytes: Vec<u8>,
+    revision: u64,
+    observation: StoredRelayObservation,
+    last_failure: Option<StoredRelayFailureClass>,
+    last_failure_at: Option<u64>,
+    attempt_count: u64,
+    reorg_count: u64,
+    last_observed_at: Option<u64>,
+    next_attempt_at: Option<u64>,
+}
+
+impl StoredRelayRecord {
+    fn to_domain(&self) -> Result<RelayRecord, ProviderError> {
+        self.validate_transaction()?;
+        Ok(RelayRecord {
+            reservation_id: ReservationId::new(self.reservation_id),
+            commitment: SigningCommitment::new(self.commitment),
+            artifact: SignedArtifactDigest::new(self.artifact),
+            txid: Txid::from_byte_array(self.txid),
+            wtxid: Wtxid::from_byte_array(self.wtxid),
+            revision: self.revision,
+            observation: self.observation.to_domain(),
+            last_failure: self.last_failure.map(StoredRelayFailureClass::to_domain),
+            last_failure_at: self.last_failure_at.map(UnixMillis::new),
+            attempt_count: self.attempt_count,
+            reorg_count: self.reorg_count,
+            last_observed_at: self.last_observed_at.map(UnixMillis::new),
+            next_attempt_at: self.next_attempt_at.map(UnixMillis::new),
+        })
+    }
+
+    fn to_job(&self, due_at: UnixMillis) -> Result<RelayJob, ProviderError> {
+        let record = self.to_domain()?;
+        Ok(RelayJob {
+            reservation_id: record.reservation_id,
+            commitment: record.commitment,
+            artifact: record.artifact,
+            txid: record.txid,
+            wtxid: record.wtxid,
+            revision: record.revision,
+            due_at,
+            observation: record.observation,
+            last_failure: record.last_failure,
+            last_failure_at: record.last_failure_at,
+            attempt_count: record.attempt_count,
+            reorg_count: record.reorg_count,
+        })
+    }
+
+    fn to_attempt(&self, retry_at: UnixMillis) -> Result<RelayAttempt, ProviderError> {
+        self.validate_transaction()?;
+        Ok(RelayAttempt {
+            reservation_id: ReservationId::new(self.reservation_id),
+            commitment: SigningCommitment::new(self.commitment),
+            artifact: SignedArtifactDigest::new(self.artifact),
+            txid: Txid::from_byte_array(self.txid),
+            wtxid: Wtxid::from_byte_array(self.wtxid),
+            transaction_bytes: self.transaction_bytes.clone(),
+            revision: self.revision,
+            retry_at,
+            attempt_count: self.attempt_count,
+        })
+    }
+
+    fn validate_transaction(&self) -> Result<(), ProviderError> {
+        let transaction: Transaction = deserialize(&self.transaction_bytes).map_err(|error| {
+            ProviderError::CorruptState(format!("invalid persisted relay transaction: {error}"))
+        })?;
+        if serialize(&transaction) != self.transaction_bytes
+            || transaction.txid().to_byte_array() != self.txid
+            || transaction.wtxid().to_byte_array() != self.wtxid
+        {
+            return Err(ProviderError::CorruptState(
+                "persisted relay transaction bytes or identifiers disagree".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl StoredSignedArtifact {
@@ -5019,6 +5950,38 @@ pub enum ProviderError {
     SignedArtifactBindingMismatch(ReservationId),
     #[error("reservation already stored a different signed artifact: {0:?}")]
     DifferentSignedArtifact(ReservationId),
+    #[error("signed artifact cannot produce one exact relay transaction: {0}")]
+    InvalidSignedArtifactForRelay(String),
+    #[error("relay record not found for signed reservation: {0:?}")]
+    RelayRecordNotFound(ReservationId),
+    #[error("relay job does not exactly match durable state: {0:?}")]
+    RelayJobBindingMismatch(ReservationId),
+    #[error(
+        "relay revision changed for reservation {reservation_id:?}: expected {expected}, found {actual}"
+    )]
+    RelayRevisionMismatch {
+        reservation_id: ReservationId,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("relay revision overflowed")]
+    RelayRevisionOverflow,
+    #[error("relay attempt count overflowed")]
+    RelayAttemptCountOverflow,
+    #[error("relay reorg count overflowed")]
+    RelayReorgCountOverflow,
+    #[error("relay attempt lease {retry_at:?} is not later than {now:?}")]
+    RelayLeaseNotFuture {
+        now: UnixMillis,
+        retry_at: UnixMillis,
+    },
+    #[error("relay retry {next_attempt_at:?} is earlier than {now:?}")]
+    RelayScheduleInPast {
+        now: UnixMillis,
+        next_attempt_at: UnixMillis,
+    },
+    #[error("invalid relay observation: {0}")]
+    InvalidRelayObservation(&'static str),
     #[error("fee policy rejected the final transaction: {0}")]
     FeePolicy(#[from] FeePolicyViolation),
 }

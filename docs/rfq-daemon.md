@@ -25,10 +25,12 @@ requirement of this profile. Older Elements tutorial material refers to a
 
 Before this profile can be enabled on a public network, the daemon must derive
 market assets from independently validated canonical creation/history evidence
-and use an operational pricing source. Immediate relay plus durable
-mempool/confirmation/reorg reconciliation, authenticated-owner request-rate
-limits, coordinated off-host backup recovery, and host memory hardening also
-remain launch work.
+and use an operational pricing source. Authenticated-owner request-rate limits,
+coordinated off-host backup recovery, host memory hardening, and production
+process-kill and live-Core relay/reorganization acceptance coverage also remain
+launch work. The durable relay state machine is implemented, but its current
+coverage is not evidence that the profile is ready for Liquid testnet or
+mainnet.
 
 ## State and secret model
 
@@ -37,7 +39,8 @@ One fixed private state directory contains:
 - `iroh-secret`: the stable Iroh identity and quote-attestation key;
 - `wallet.redb`: the encrypted, service-owned liquidity wallet;
 - `provider.redb`: reservations, inventory allocations, signing commitments,
-  signed artifacts, and audit state; and
+  signed artifacts, exact relay transactions, relay schedules and observations,
+  and audit state; and
 - `manifest.json`: the completion marker binding all three files to one
   provider, genesis hash, policy asset, and network.
 
@@ -167,10 +170,60 @@ Startup emits its JSON `ready` record only after all of the following succeed:
 1. strict configuration, filesystem, identity, clock, chain, and txindex checks;
 2. wallet and existing provider-database integrity checks;
 3. a complete authoritative inventory refresh;
-4. recovery of every durable pending signing job; and
-5. binding the authenticated Iroh endpoint with the exact provider key.
+4. recovery of every durable pending signing job;
+5. one complete pass, in bounded batches, over relay work currently due; and
+6. binding the authenticated Iroh endpoint with the exact provider key.
 
 SIGINT and SIGTERM stop the transport first, then close provider admission,
 drain accepted execute operations through their durable commit boundary, drain
-pending signing recovery, and join the daemon workers. A hard process kill is
-recovered from the same durable signing index on the next startup.
+pending signing recovery, drain relay work accepted by the worker, and join the
+daemon workers. A hard process kill is recovered from the durable signing and
+relay indexes after restart.
+
+## Relay and reconciliation
+
+Recording a signed settlement atomically stores the canonical signed PSET, the
+exact final transaction bytes derived from it, the transaction ID and witness
+transaction ID, and an immediately due `Unobserved` relay record. The daemon
+never substitutes a reconstructed or caller-provided transaction at relay time.
+
+Before Elements Core can see those raw bytes, `provider.redb` issues a durable,
+revision-bound lease and moves the same work item to a future crash-retry time.
+This ordering means a process kill or lost RPC response can cause an idempotent
+retry of the same bytes, but cannot cause the outpoints to be reassigned or a
+different settlement to be selected. A stale worker cannot overwrite a newer
+relay result.
+
+Reconciliation always checks status before sending. It exact-matches an
+existing transaction by raw bytes and witness transaction ID, verifies a
+reported confirmation against the canonical block at that height, and otherwise
+checks every input with mempool-aware `gettxout` calls under a stable tip. It
+looks up the exact transaction again before classifying a spent input as a
+conflict. Only a transaction that remains absent with every input unspent is
+submitted to `testmempoolaccept` and then relayed. An ambiguous or rejected send
+is followed by another exact status and input reconciliation.
+
+The status lifecycle is independent of allocation state:
+
+```text
+Signed allocation (irreversible)
+    + relay observation:
+        Unobserved | BroadcastAccepted | Mempool
+        | Confirmed(block hash, height) | Absent
+        | Conflicted(spent input, optional conflicting txid)
+```
+
+The same signed allocation never returns to `Available`, including after a
+policy rejection, conflicting spend, backend outage, or reorganization.
+Confirmed and conflicted observations continue to be rechecked. A confirmation
+that disappears or moves to another block increments a durable reorganization
+counter. Another transaction serialization with the same transaction ID but a
+different witness transaction ID is recorded as a conflict with the exact
+durable artifact; it is not adopted as an equivalent settlement.
+
+An Elements backend outage or invalid backend evidence marks relay degraded and
+stops new quote, blind, and execute admission. Authenticated status remains
+available for recovery. Admission is restored only after at least one due relay
+item is successfully reconciled; an empty pass does not establish recovery.
+Transaction-specific mempool policy rejection is retained on that transaction's
+status and does not by itself mark the whole backend unhealthy.

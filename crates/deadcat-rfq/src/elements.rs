@@ -21,11 +21,12 @@ use std::time::{Duration, Instant};
 
 use deadcat_rfq_provider::{
     AuthoritativePrevout, InventorySnapshot, InventorySource, ProviderIdentity,
+    RelayAttempt as DurableRelayAttempt, RelayFailureClass, RelayObservation,
     SettlementChainSource, WalletBoundaryError, WalletKeyLocator, WalletScanAnchor,
 };
 use deadcat_rfq_wallet::PersistentWalletError;
-use elements::encode::deserialize;
-use elements::{AssetId, BlockHash, OutPoint, Script, Transaction, TxOut, Txid};
+use elements::encode::{deserialize, serialize};
+use elements::{AssetId, BlockHash, OutPoint, Script, Transaction, TxOut, Txid, Wtxid};
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::{Method, StatusCode, Url};
 use serde::Deserialize;
@@ -35,6 +36,7 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::SharedRfqWallet;
+use crate::relay::{ProviderRelaySource, RelayAttemptResult, RelaySourceError};
 
 /// Default TCP/TLS connection timeout.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -71,6 +73,7 @@ const ELEMENTS_REGTEST_CHAIN: &str = "liquidregtest";
 const STARTUP_OPERATION: &str = "startup";
 const INVENTORY_OPERATION: &str = "inventory";
 const SETTLEMENT_OPERATION: &str = "settlement";
+const RELAY_OPERATION: &str = "relay";
 
 /// Authentication for the provider's trusted Elements Core RPC endpoint.
 #[derive(Clone, PartialEq, Eq)]
@@ -667,6 +670,23 @@ pub struct ElementsCoreSource {
     inner: Arc<SourceInner>,
 }
 
+#[derive(Clone, Copy)]
+struct ExactRelayTransaction<'a> {
+    txid: Txid,
+    wtxid: Wtxid,
+    bytes: &'a [u8],
+}
+
+impl<'a> From<&'a DurableRelayAttempt> for ExactRelayTransaction<'a> {
+    fn from(attempt: &'a DurableRelayAttempt) -> Self {
+        Self {
+            txid: attempt.txid(),
+            wtxid: attempt.wtxid(),
+            bytes: attempt.transaction_bytes(),
+        }
+    }
+}
+
 impl ElementsCoreSource {
     pub fn new(
         config: ElementsCoreConfig,
@@ -787,6 +807,17 @@ impl ElementsCoreSource {
             )?,
             None => self.call("getrawtransaction", json!([txid, false]), deadline)?,
         };
+        let transaction = self.decode_raw_transaction(&raw)?;
+        if transaction.txid() != txid {
+            return Err(ElementsCoreSourceError::TransactionIdMismatch {
+                requested: txid,
+                actual: transaction.txid(),
+            });
+        }
+        Ok(transaction)
+    }
+
+    fn decode_raw_transaction(&self, raw: &str) -> Result<Transaction, ElementsCoreSourceError> {
         let maximum_hex = self
             .inner
             .limits
@@ -821,12 +852,6 @@ impl ElementsCoreSource {
                 "raw transaction failed consensus decoding",
             )
         })?;
-        if transaction.txid() != txid {
-            return Err(ElementsCoreSourceError::TransactionIdMismatch {
-                requested: txid,
-                actual: transaction.txid(),
-            });
-        }
         Ok(transaction)
     }
 
@@ -1112,6 +1137,313 @@ impl ElementsCoreSource {
         deadline.check()?;
         Ok(authoritative)
     }
+
+    fn relay_transaction(
+        &self,
+        exact: ExactRelayTransaction<'_>,
+    ) -> Result<Transaction, ElementsCoreSourceError> {
+        if exact.bytes.len() > self.inner.limits.max_raw_transaction_bytes {
+            return Err(ElementsCoreSourceError::RawTransactionTooLarge {
+                maximum: self.inner.limits.max_raw_transaction_bytes,
+                actual: exact.bytes.len(),
+            });
+        }
+        let transaction = deserialize::<Transaction>(exact.bytes)
+            .map_err(|_| ElementsCoreSourceError::InvalidRelayJob("invalid consensus bytes"))?;
+        if serialize(&transaction) != exact.bytes {
+            return Err(ElementsCoreSourceError::InvalidRelayJob(
+                "transaction bytes are not canonical",
+            ));
+        }
+        if transaction.txid() != exact.txid {
+            return Err(ElementsCoreSourceError::TransactionIdMismatch {
+                requested: exact.txid,
+                actual: transaction.txid(),
+            });
+        }
+        if transaction.wtxid() != exact.wtxid {
+            return Err(ElementsCoreSourceError::RelayWitnessTransactionIdMismatch {
+                expected: exact.wtxid,
+                actual: transaction.wtxid(),
+            });
+        }
+        if transaction.input.is_empty() {
+            return Err(ElementsCoreSourceError::InvalidRelayJob(
+                "transaction has no inputs",
+            ));
+        }
+        for input in &transaction.input {
+            validate_outpoint(input.previous_output)?;
+        }
+        Ok(transaction)
+    }
+
+    fn exact_relay_observation(
+        &self,
+        exact: ExactRelayTransaction<'_>,
+        transaction: &Transaction,
+        deadline: OperationDeadline,
+    ) -> Result<Option<RelayObservation>, ElementsCoreSourceError> {
+        let status: RelayRawTransactionStatus =
+            match self.call("getrawtransaction", json!([exact.txid, true]), deadline) {
+                Ok(status) => status,
+                Err(error) if rpc_not_found(&error, "getrawtransaction") => return Ok(None),
+                Err(error) => return Err(error),
+            };
+        if status.txid != exact.txid {
+            return Err(ElementsCoreSourceError::TransactionIdMismatch {
+                requested: exact.txid,
+                actual: status.txid,
+            });
+        }
+        let raw: String = match self.call("getrawtransaction", json!([exact.txid, false]), deadline)
+        {
+            Ok(raw) => raw,
+            Err(error) if rpc_not_found(&error, "getrawtransaction") => {
+                return Err(ElementsCoreSourceError::RelayViewChanged);
+            }
+            Err(error) => return Err(error),
+        };
+        let observed = self.decode_raw_transaction(&raw)?;
+        if observed.txid() != exact.txid {
+            return Err(ElementsCoreSourceError::TransactionIdMismatch {
+                requested: exact.txid,
+                actual: observed.txid(),
+            });
+        }
+        if status.hash != observed.wtxid() {
+            return Err(ElementsCoreSourceError::InvalidRpcResponse(
+                "verbose and raw relay transaction witness IDs disagree".to_owned(),
+            ));
+        }
+        let confirmed_block = match status.blockhash {
+            Some(block_hash) => {
+                let Some(confirmations) = status.confirmations else {
+                    return Err(ElementsCoreSourceError::InvalidRpcResponse(
+                        "block-associated relay transaction has no confirmation count".to_owned(),
+                    ));
+                };
+                if confirmations <= 0 {
+                    // With txindex enabled, Core can continue returning a
+                    // same-txid transaction from a block that lost the active
+                    // chain race. Neither its witness nor its historical
+                    // presence establishes the state of our exact bytes on
+                    // the current chain, so continue through the stable-tip
+                    // input check and exact rebroadcast path.
+                    return Ok(None);
+                }
+                Some(block_hash)
+            }
+            None => {
+                if status
+                    .confirmations
+                    .is_some_and(|confirmations| confirmations > 0)
+                {
+                    return Err(ElementsCoreSourceError::InvalidRpcResponse(
+                        "unconfirmed relay transaction has positive confirmations".to_owned(),
+                    ));
+                }
+                None
+            }
+        };
+        if serialize(&observed) != exact.bytes || observed.wtxid() != exact.wtxid {
+            let spent_input = transaction
+                .input
+                .iter()
+                .map(|input| input.previous_output)
+                .min()
+                .ok_or(ElementsCoreSourceError::InvalidRelayJob(
+                    "transaction has no inputs",
+                ))?;
+            return Ok(Some(RelayObservation::Conflicted {
+                spent_input,
+                conflicting_txid: Some(exact.txid),
+            }));
+        }
+        match confirmed_block {
+            Some(block_hash) => {
+                let header: RelayBlockHeader =
+                    match self.call("getblockheader", json!([block_hash, true]), deadline) {
+                        Ok(header) => header,
+                        Err(error) if rpc_not_found(&error, "getblockheader") => {
+                            return Err(ElementsCoreSourceError::RelayViewChanged);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                if header.hash != block_hash {
+                    return Err(ElementsCoreSourceError::InvalidRpcResponse(
+                        "getblockheader returned a different relay block".to_owned(),
+                    ));
+                }
+                let canonical = self.block_hash(header.height, deadline)?;
+                if canonical != block_hash {
+                    return Err(ElementsCoreSourceError::RelayBlockNotCanonical {
+                        height: header.height,
+                        reported: block_hash,
+                        actual: canonical,
+                    });
+                }
+                Ok(Some(RelayObservation::Confirmed {
+                    block_hash,
+                    block_height: header.height,
+                }))
+            }
+            None => Ok(Some(RelayObservation::Mempool)),
+        }
+    }
+
+    /// Resolve exact absence against every input under one stable Core tip.
+    /// A spent input is checked only after looking up the exact transaction a
+    /// second time, closing the race where Core accepted it between calls.
+    fn absent_relay_observation(
+        &self,
+        exact: ExactRelayTransaction<'_>,
+        transaction: &Transaction,
+        deadline: OperationDeadline,
+    ) -> Result<RelayObservation, ElementsCoreSourceError> {
+        let tip = self.best_block_hash(deadline)?;
+        let mut spent_input = None;
+        for input in &transaction.input {
+            let outpoint = input.previous_output;
+            match self.gettxout(outpoint, deadline)? {
+                Some(observed) => {
+                    if observed.best_block != tip {
+                        return Err(ElementsCoreSourceError::RelayTipChanged {
+                            expected: tip,
+                            actual: observed.best_block,
+                        });
+                    }
+                }
+                None => {
+                    spent_input = Some(
+                        spent_input.map_or(outpoint, |current: OutPoint| current.min(outpoint)),
+                    );
+                }
+            }
+        }
+        let final_tip = self.best_block_hash(deadline)?;
+        if final_tip != tip {
+            return Err(ElementsCoreSourceError::RelayTipChanged {
+                expected: tip,
+                actual: final_tip,
+            });
+        }
+        let Some(spent_input) = spent_input else {
+            return Ok(RelayObservation::Absent);
+        };
+        if let Some(observation) = self.exact_relay_observation(exact, transaction, deadline)? {
+            return Ok(observation);
+        }
+        Ok(RelayObservation::Conflicted {
+            spent_input,
+            conflicting_txid: None,
+        })
+    }
+
+    fn reconcile_after_external_call(
+        &self,
+        exact: ExactRelayTransaction<'_>,
+        transaction: &Transaction,
+        deadline: OperationDeadline,
+    ) -> Result<RelayObservation, ElementsCoreSourceError> {
+        if let Some(observation) = self.exact_relay_observation(exact, transaction, deadline)? {
+            return Ok(observation);
+        }
+        self.absent_relay_observation(exact, transaction, deadline)
+    }
+
+    fn relay_once_inner(
+        &self,
+        attempt: &DurableRelayAttempt,
+    ) -> Result<RelayAttemptResult, ElementsCoreSourceError> {
+        self.relay_exact_once(ExactRelayTransaction::from(attempt))
+    }
+
+    fn relay_exact_once(
+        &self,
+        exact: ExactRelayTransaction<'_>,
+    ) -> Result<RelayAttemptResult, ElementsCoreSourceError> {
+        let deadline =
+            OperationDeadline::start(RELAY_OPERATION, self.inner.limits.settlement_timeout)?;
+        let transaction = self.relay_transaction(exact)?;
+        self.validate_chain_identity(deadline)?;
+        self.validate_txindex(deadline)?;
+        if let Some(observation) = self.exact_relay_observation(exact, &transaction, deadline)? {
+            return Ok(RelayAttemptResult::observed(observation));
+        }
+        let absent = self.absent_relay_observation(exact, &transaction, deadline)?;
+        if absent != RelayObservation::Absent {
+            return Ok(RelayAttemptResult::observed(absent));
+        }
+
+        let raw = hex::encode(exact.bytes);
+        let acceptance: Vec<MempoolAcceptance> =
+            self.call("testmempoolaccept", json!([[raw.clone()], 0]), deadline)?;
+        let [acceptance] = acceptance.as_slice() else {
+            return Err(ElementsCoreSourceError::InvalidRpcResponse(format!(
+                "testmempoolaccept returned {} entries for one relay transaction",
+                acceptance.len()
+            )));
+        };
+        if acceptance.txid.is_some_and(|txid| txid != exact.txid)
+            || acceptance.wtxid.is_some_and(|wtxid| wtxid != exact.wtxid)
+        {
+            return Err(ElementsCoreSourceError::InvalidRpcResponse(
+                "testmempoolaccept returned a different relay transaction".to_owned(),
+            ));
+        }
+        if !acceptance.allowed {
+            tracing::warn!(
+                txid = %exact.txid,
+                reason = %acceptance
+                    .reject_reason
+                    .as_deref()
+                    .map(bounded_excerpt)
+                    .unwrap_or_else(|| "unspecified policy rejection".to_owned()),
+                "Elements Core policy rejected exact RFQ settlement"
+            );
+            let observation = self.reconcile_after_external_call(exact, &transaction, deadline)?;
+            return Ok(if observation == RelayObservation::Absent {
+                RelayAttemptResult::policy_rejected(observation)
+            } else {
+                RelayAttemptResult::observed(observation)
+            });
+        }
+
+        let reported: Result<Txid, ElementsCoreSourceError> =
+            self.call("sendrawtransaction", json!([raw, 0]), deadline);
+        match reported {
+            Ok(reported) if reported == exact.txid => Ok(RelayAttemptResult::observed(
+                RelayObservation::BroadcastAccepted,
+            )),
+            Ok(reported) => {
+                let observation =
+                    self.reconcile_after_external_call(exact, &transaction, deadline)?;
+                if observation != RelayObservation::Absent {
+                    Ok(RelayAttemptResult::observed(observation))
+                } else {
+                    Err(ElementsCoreSourceError::TransactionIdMismatch {
+                        requested: exact.txid,
+                        actual: reported,
+                    })
+                }
+            }
+            Err(send_error) => {
+                let observation =
+                    self.reconcile_after_external_call(exact, &transaction, deadline)?;
+                if observation != RelayObservation::Absent {
+                    return Ok(RelayAttemptResult::observed(observation));
+                }
+                if relay_policy_rejected(&send_error, "sendrawtransaction") {
+                    Ok(RelayAttemptResult::policy_rejected(
+                        RelayObservation::Absent,
+                    ))
+                } else {
+                    Err(send_error)
+                }
+            }
+        }
+    }
 }
 
 impl fmt::Debug for ElementsCoreSource {
@@ -1145,6 +1477,18 @@ impl SettlementChainSource for ElementsCoreSource {
         outpoints: &[OutPoint],
     ) -> Result<Vec<AuthoritativePrevout>, Self::Error> {
         self.unspent_prevouts_inner(outpoints)
+    }
+}
+
+impl ProviderRelaySource for ElementsCoreSource {
+    type Error = ElementsCoreSourceError;
+
+    fn relay_once(
+        &self,
+        attempt: &DurableRelayAttempt,
+    ) -> Result<RelayAttemptResult, RelaySourceError<Self::Error>> {
+        self.relay_once_inner(attempt)
+            .map_err(|error| RelaySourceError::new(relay_failure_class(&error), error))
     }
 }
 
@@ -1189,6 +1533,29 @@ struct GetTxOutResult {
 #[derive(Deserialize)]
 struct GetTxOutScript {
     hex: String,
+}
+
+#[derive(Deserialize)]
+struct RelayRawTransactionStatus {
+    txid: Txid,
+    hash: Wtxid,
+    blockhash: Option<BlockHash>,
+    confirmations: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct RelayBlockHeader {
+    hash: BlockHash,
+    height: u32,
+}
+
+#[derive(Deserialize)]
+struct MempoolAcceptance {
+    txid: Option<Txid>,
+    wtxid: Option<Wtxid>,
+    allowed: bool,
+    #[serde(rename = "reject-reason")]
+    reject_reason: Option<String>,
 }
 
 fn parse_elements_core_network(
@@ -1417,6 +1784,50 @@ fn bounded_excerpt(message: &str) -> String {
     bounded
 }
 
+fn rpc_not_found(error: &ElementsCoreSourceError, expected_method: &'static str) -> bool {
+    matches!(
+        error,
+        ElementsCoreSourceError::RpcRejected {
+            method,
+            code: -5,
+            ..
+        } if *method == expected_method
+    )
+}
+
+fn relay_policy_rejected(error: &ElementsCoreSourceError, expected_method: &'static str) -> bool {
+    matches!(
+        error,
+        // `sendrawtransaction` uses these codes for transaction-specific
+        // admission failures. Treat method-not-found, warmup, decode, and
+        // other RPC failures as backend failures so the daemon stops taking
+        // new trades instead of silently accumulating unrelayable artifacts.
+        ElementsCoreSourceError::RpcRejected {
+            method,
+            code: -25 | -26,
+            ..
+        } if *method == expected_method
+    )
+}
+
+fn relay_failure_class(error: &ElementsCoreSourceError) -> RelayFailureClass {
+    match error {
+        ElementsCoreSourceError::BackendUnavailable(_)
+        | ElementsCoreSourceError::AuthenticationFailed
+        | ElementsCoreSourceError::InvalidCookie
+        | ElementsCoreSourceError::InitialBlockDownload
+        | ElementsCoreSourceError::TxIndexNotSynced
+        | ElementsCoreSourceError::OperationTimedOut { .. }
+        | ElementsCoreSourceError::RelayViewChanged
+        | ElementsCoreSourceError::RelayBlockNotCanonical { .. }
+        | ElementsCoreSourceError::RelayTipChanged { .. }
+        | ElementsCoreSourceError::RpcRejected { code: -5 | -28, .. } => {
+            RelayFailureClass::BackendUnavailable
+        }
+        _ => RelayFailureClass::InvalidBackendData,
+    }
+}
+
 fn transport_error(method: &str, error: &reqwest::Error) -> ElementsCoreSourceError {
     let kind = if error.is_timeout() {
         "request timed out"
@@ -1557,6 +1968,25 @@ pub enum ElementsCoreSourceError {
     AuthoritativeOutputMismatch(OutPoint),
     #[error("settlement chain tip changed from {expected} to {actual} during prevout lookup")]
     SettlementTipChanged {
+        expected: BlockHash,
+        actual: BlockHash,
+    },
+    #[error("durable relay job contains an invalid exact transaction: {0}")]
+    InvalidRelayJob(&'static str),
+    #[error("relay transaction witness id is {actual}, expected {expected}")]
+    RelayWitnessTransactionIdMismatch { expected: Wtxid, actual: Wtxid },
+    #[error("relay transaction view changed while reconciling the exact transaction")]
+    RelayViewChanged,
+    #[error(
+        "relay transaction claimed block {reported} at height {height}, but the canonical block is {actual}"
+    )]
+    RelayBlockNotCanonical {
+        height: u32,
+        reported: BlockHash,
+        actual: BlockHash,
+    },
+    #[error("relay input view changed tips from {expected} to {actual}")]
+    RelayTipChanged {
         expected: BlockHash,
         actual: BlockHash,
     },
