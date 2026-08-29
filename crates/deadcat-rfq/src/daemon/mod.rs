@@ -8,9 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, bail};
 use clap::{Args as ClapArgs, Parser, Subcommand};
-use deadcat_rfq::elements::{
-    ElementsCoreChainStatus, ElementsCoreNetwork, ElementsCoreSource, probe_elements_core,
-};
+use deadcat_rfq::elements::{ElementsCoreChainStatus, ElementsCoreSource, probe_elements_core};
 use deadcat_rfq::{AuthenticatedRfqHandler, ProviderRfqBackend, SharedRfqWallet, SystemClock};
 use deadcat_rfq_provider::{
     InventoryCoordinator, ProviderId, ProviderIdentity, QuoteEngine, ReservationBook,
@@ -116,8 +114,8 @@ async fn initialize(args: CommonArgs) -> anyhow::Result<()> {
         "genesis_hash": config.chain.genesis_hash,
         "policy_asset": config.policy_asset,
         "elements_tip": {
-            "height": chain.tip_height(),
-            "hash": chain.tip_hash(),
+            "height": chain.tip().height,
+            "hash": chain.tip().hash,
         },
     }))
 }
@@ -162,12 +160,14 @@ async fn run(args: CommonArgs) -> anyhow::Result<()> {
         open_existing_state(&paths, &config, &args.passphrase_file)?;
 
     let elements = config.elements.clone();
+    let source_chain = config.chain;
     let source_wallet = wallet.clone();
-    let source =
-        tokio::task::spawn_blocking(move || ElementsCoreSource::new(elements, source_wallet))
-            .await
-            .context("Elements provider source construction panicked")?
-            .context("construct authoritative Elements provider source")?;
+    let source = tokio::task::spawn_blocking(move || {
+        ElementsCoreSource::new(elements, source_chain, source_wallet)
+    })
+    .await
+    .context("Elements provider source construction panicked")?
+    .context("construct authoritative Elements provider source")?;
     let inventory = InventoryCoordinator::new(book, source.clone(), config.inventory);
     let engine = QuoteEngine::new(
         inventory,
@@ -208,8 +208,8 @@ async fn run(args: CommonArgs) -> anyhow::Result<()> {
         "genesis_hash": config.chain.genesis_hash,
         "policy_asset": config.policy_asset,
         "elements_tip": {
-            "height": chain_status.tip_height(),
-            "hash": chain_status.tip_hash(),
+            "height": chain_status.tip().height,
+            "hash": chain_status.tip().hash,
         },
     })) {
         if let Err(cleanup_error) = server.shutdown_and_join().await {
@@ -266,12 +266,13 @@ fn load_config(path: &Path) -> anyhow::Result<ValidatedConfig> {
 
 async fn preflight(config: &ValidatedConfig) -> anyhow::Result<ElementsCoreChainStatus> {
     let elements = config.elements.clone();
+    let chain = config.chain;
     let expected = config.chain.genesis_hash;
-    let status = tokio::task::spawn_blocking(move || probe_elements_core(&elements))
+    let status = tokio::task::spawn_blocking(move || probe_elements_core(&elements, chain))
         .await
         .context("Elements Core startup probe panicked")?
         .context("probe Elements Core chain and transaction index")?;
-    if status.network() != ElementsCoreNetwork::ElementsRegtest {
+    if status.network() != LiquidNetwork::ElementsRegtest {
         bail!("Elements Core is not running the required liquidregtest chain");
     }
     validate_preflight_identity(

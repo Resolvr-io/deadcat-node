@@ -816,6 +816,10 @@ fn persistent_wallet_inventory_is_discovered_unblinded_and_recovered_after_resta
     let policy_asset = default_policy_asset(&rpc);
     let inventory_asset = issue_distinct_asset(&rpc, &miner);
     assert_ne!(inventory_asset, policy_asset);
+    let chain = ChainIdentity {
+        network: LiquidNetwork::ElementsRegtest,
+        genesis_hash,
+    };
 
     let identity = ProviderIdentity::new(ProviderId::new([0x71; 32]), genesis_hash, policy_asset);
     let directory = tempdir().expect("temporary persistent wallet directory");
@@ -835,7 +839,7 @@ fn persistent_wallet_inventory_is_discovered_unblinded_and_recovered_after_resta
         .fresh_inventory_destination()
         .expect("second durable inventory destination");
     let source_config = ElementsCoreConfig::new(rpc_url, ElementsCoreAuth::CookieFile(cookie_path));
-    let source = ElementsCoreSource::new(source_config.clone(), wallet.clone())
+    let source = ElementsCoreSource::new(source_config.clone(), chain, wallet.clone())
         .expect("production Elements inventory source");
     assert_eq!(source.identity(), identity);
     assert_eq!(source.genesis_hash(), genesis_hash);
@@ -907,7 +911,7 @@ fn persistent_wallet_inventory_is_discovered_unblinded_and_recovered_after_resta
         PersistentRfqWallet::open(&wallet_path, identity, PASSPHRASE)
             .expect("reopen the same durable RFQ wallet"),
     );
-    let reopened_source = ElementsCoreSource::new(source_config, reopened_wallet)
+    let reopened_source = ElementsCoreSource::new(source_config, chain, reopened_wallet)
         .expect("Elements source after wallet restart");
     let rescanned = reopened_source
         .inventory_snapshot()

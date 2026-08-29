@@ -15,6 +15,7 @@ members = [
     "crates/deadcat-rfq-wallet",
     "crates/deadcat-rfq-taker",
     "crates/deadcat-rfq",
+    "crates/deadcat-elements-core",
     "crates/deadcat-liquid-settlement",
 ]
 
@@ -64,6 +65,7 @@ deadcat-rfq-rpc = { path = "crates/deadcat-rfq-rpc" }
 deadcat-rfq-wallet = { path = "crates/deadcat-rfq-wallet" }
 deadcat-rfq-taker = { path = "crates/deadcat-rfq-taker" }
 deadcat-rfq = { path = "crates/deadcat-rfq" }
+deadcat-elements-core = { path = "crates/deadcat-elements-core" }
 deadcat-liquid-settlement = { path = "crates/deadcat-liquid-settlement" }
 
 # The CLI and Rust libraries must remain on the exact same smplx release.
