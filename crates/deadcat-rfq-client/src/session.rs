@@ -26,11 +26,12 @@ use crate::settlement::{
 const STARTUP_REQUEST_ID: u64 = 1;
 pub const QUOTE_RECOVERY_RECORD_VERSION: u32 = 1;
 const QUOTE_RECOVERY_RECORD_DOMAIN: &[u8] = b"deadcat/rfq/client-quote-recovery/v1";
-const REQUIRED_CAPABILITIES: [ProviderCapability; 4] = [
+const REQUIRED_CAPABILITIES: [ProviderCapability; 5] = [
     ProviderCapability::FirmQuotes,
     ProviderCapability::ProviderBlinding,
     ProviderCapability::SettlementExecution,
     ProviderCapability::DurableStatus,
+    ProviderCapability::SettlementRelay,
 ];
 
 /// An execution status accepted through an authenticated RFQ session and
@@ -2188,15 +2189,12 @@ mod tests {
     }
 
     #[test]
-    fn capability_set_requires_all_four_without_duplicates() {
+    fn capability_set_requires_all_five_without_duplicates() {
         assert!(has_required_capabilities(&REQUIRED_CAPABILITIES));
-        assert!(!has_required_capabilities(&REQUIRED_CAPABILITIES[..3]));
-        assert!(!has_required_capabilities(&[
-            ProviderCapability::FirmQuotes,
-            ProviderCapability::FirmQuotes,
-            ProviderCapability::SettlementExecution,
-            ProviderCapability::DurableStatus,
-        ]));
+        assert!(!has_required_capabilities(&REQUIRED_CAPABILITIES[..4]));
+        let mut duplicated = REQUIRED_CAPABILITIES.to_vec();
+        duplicated.push(ProviderCapability::FirmQuotes);
+        assert!(!has_required_capabilities(&duplicated));
     }
 
     #[test]

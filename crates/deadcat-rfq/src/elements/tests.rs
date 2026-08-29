@@ -8,7 +8,7 @@ use deadcat_rfq_provider::{
 };
 use deadcat_rfq_wallet::{KdfParams, PersistentRfqWallet};
 use elements::confidential::{Asset, AssetBlindingFactor, Nonce, Value, ValueBlindingFactor};
-use elements::encode::serialize_hex;
+use elements::encode::{serialize, serialize_hex};
 use elements::hashes::Hash as _;
 use elements::secp256k1_zkp::Secp256k1;
 use elements::secp256k1_zkp::rand::thread_rng;
@@ -186,6 +186,71 @@ struct MockRpc {
     after_scan: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
+struct ScriptedRpcCall {
+    method: &'static str,
+    params: JsonValue,
+    result: Result<JsonValue, ElementsCoreSourceError>,
+}
+
+impl ScriptedRpcCall {
+    fn ok(method: &'static str, params: JsonValue, result: JsonValue) -> Self {
+        Self {
+            method,
+            params,
+            result: Ok(result),
+        }
+    }
+
+    fn error(method: &'static str, params: JsonValue, error: ElementsCoreSourceError) -> Self {
+        Self {
+            method,
+            params,
+            result: Err(error),
+        }
+    }
+}
+
+struct ScriptedRpc {
+    calls: Mutex<VecDeque<ScriptedRpcCall>>,
+}
+
+impl ScriptedRpc {
+    fn new(calls: impl IntoIterator<Item = ScriptedRpcCall>) -> Self {
+        Self {
+            calls: Mutex::new(calls.into_iter().collect()),
+        }
+    }
+
+    fn assert_finished(&self) {
+        let calls = self.calls.lock().expect("scripted RPC calls");
+        assert!(
+            calls.is_empty(),
+            "scripted RPC still expects {} call(s), starting with {}",
+            calls.len(),
+            calls.front().map_or("none", |call| call.method)
+        );
+    }
+}
+
+impl RpcTransport for ScriptedRpc {
+    fn call(
+        &self,
+        method: &'static str,
+        params: JsonValue,
+        _budget: RpcCallBudget,
+    ) -> Result<JsonValue, ElementsCoreSourceError> {
+        let call = self
+            .calls
+            .lock()
+            .expect("scripted RPC calls")
+            .pop_front()
+            .unwrap_or_else(|| panic!("unexpected RPC call {method} with {params}"));
+        assert_eq!(method, call.method, "unexpected scripted RPC method");
+        assert_eq!(params, call.params, "unexpected {method} parameters");
+        call.result
+    }
+}
+
 impl MockRpc {
     fn new(state: MockState) -> Self {
         Self {
@@ -332,6 +397,141 @@ fn test_source(wallet: SharedRfqWallet, rpc: Arc<MockRpc>) -> ElementsCoreSource
     ElementsCoreSource::from_parts(&config(), wallet, rpc)
 }
 
+fn scripted_source(
+    wallet: SharedRfqWallet,
+    calls: impl IntoIterator<Item = ScriptedRpcCall>,
+) -> (ElementsCoreSource, Arc<ScriptedRpc>) {
+    let rpc = Arc::new(ScriptedRpc::new(calls));
+    let source = ElementsCoreSource::from_parts(&config(), wallet, rpc.clone());
+    (source, rpc)
+}
+
+fn relay_transaction(input_markers: &[u8]) -> Transaction {
+    Transaction {
+        version: 2,
+        lock_time: LockTime::ZERO,
+        input: input_markers
+            .iter()
+            .enumerate()
+            .map(|(index, marker)| TxIn {
+                previous_output: OutPoint::new(
+                    Txid::from_byte_array([*marker; 32]),
+                    u32::try_from(index).expect("fixture input index"),
+                ),
+                ..TxIn::default()
+            })
+            .collect(),
+        output: Vec::new(),
+    }
+}
+
+fn exact_relay<'a>(transaction: &Transaction, bytes: &'a [u8]) -> ExactRelayTransaction<'a> {
+    ExactRelayTransaction {
+        txid: transaction.txid(),
+        wtxid: transaction.wtxid(),
+        bytes,
+    }
+}
+
+fn relay_prefix() -> Vec<ScriptedRpcCall> {
+    vec![
+        ScriptedRpcCall::ok("getblockhash", json!([0]), json!(identity().genesis_hash())),
+        ScriptedRpcCall::ok(
+            "getindexinfo",
+            json!([]),
+            json!({"txindex": {"synced": true}}),
+        ),
+    ]
+}
+
+fn transaction_not_found() -> ElementsCoreSourceError {
+    ElementsCoreSourceError::RpcRejected {
+        method: "getrawtransaction",
+        code: -5,
+        message: "No such mempool or blockchain transaction".to_owned(),
+    }
+}
+
+fn exact_lookup_not_found(txid: Txid) -> ScriptedRpcCall {
+    ScriptedRpcCall::error(
+        "getrawtransaction",
+        json!([txid, true]),
+        transaction_not_found(),
+    )
+}
+
+fn exact_lookup_calls(
+    expected_txid: Txid,
+    observed: &Transaction,
+    block_hash: Option<BlockHash>,
+    confirmations: i64,
+) -> [ScriptedRpcCall; 2] {
+    [
+        ScriptedRpcCall::ok(
+            "getrawtransaction",
+            json!([expected_txid, true]),
+            json!({
+                "txid": observed.txid(),
+                "hash": observed.wtxid(),
+                "blockhash": block_hash,
+                "confirmations": confirmations,
+            }),
+        ),
+        ScriptedRpcCall::ok(
+            "getrawtransaction",
+            json!([expected_txid, false]),
+            json!(serialize_hex(observed)),
+        ),
+    ]
+}
+
+fn unspent_result(tip: BlockHash) -> JsonValue {
+    json!({
+        "bestblock": tip,
+        "confirmations": 1,
+        "coinbase": false,
+        "scriptPubKey": {"hex": ""},
+    })
+}
+
+fn absent_unspent_calls(transaction: &Transaction, tip: BlockHash) -> Vec<ScriptedRpcCall> {
+    let mut calls = vec![ScriptedRpcCall::ok(
+        "getbestblockhash",
+        json!([]),
+        json!(tip),
+    )];
+    calls.extend(transaction.input.iter().map(|input| {
+        ScriptedRpcCall::ok(
+            "gettxout",
+            json!([input.previous_output.txid, input.previous_output.vout, true]),
+            unspent_result(tip),
+        )
+    }));
+    calls.push(ScriptedRpcCall::ok(
+        "getbestblockhash",
+        json!([]),
+        json!(tip),
+    ));
+    calls
+}
+
+fn mempool_acceptance(transaction: &Transaction, allowed: bool) -> JsonValue {
+    if allowed {
+        json!([{
+            "txid": transaction.txid(),
+            "wtxid": transaction.wtxid(),
+            "allowed": true,
+        }])
+    } else {
+        json!([{
+            "txid": transaction.txid(),
+            "wtxid": transaction.wtxid(),
+            "allowed": false,
+            "reject-reason": "min relay fee not met",
+        }])
+    }
+}
+
 fn test_probe(
     config: &ElementsCoreConfig,
     rpc: &MockRpc,
@@ -352,6 +552,364 @@ fn funded_inventory_fixture(
     let transaction = confidential_transaction(&destination, asset(71), 42_000);
     let outpoint = OutPoint::new(transaction.txid(), 0);
     (destination, transaction, outpoint)
+}
+
+#[test]
+fn relay_exact_mempool_observation_skips_policy_and_broadcast_calls() {
+    let (_directory, wallet) = test_wallet();
+    let transaction = relay_transaction(&[11]);
+    let bytes = serialize(&transaction);
+    let mut calls = relay_prefix();
+    calls.extend(exact_lookup_calls(
+        transaction.txid(),
+        &transaction,
+        None,
+        0,
+    ));
+    let (source, rpc) = scripted_source(wallet, calls);
+
+    let result = source
+        .relay_exact_once(exact_relay(&transaction, &bytes))
+        .expect("exact mempool transaction");
+
+    assert_eq!(result.observation(), RelayObservation::Mempool);
+    assert_eq!(result.last_failure(), None);
+    rpc.assert_finished();
+}
+
+#[test]
+fn relay_absent_unspent_transaction_is_policy_checked_and_broadcast_exactly() {
+    let (_directory, wallet) = test_wallet();
+    let transaction = relay_transaction(&[12, 13]);
+    let bytes = serialize(&transaction);
+    let raw = hex::encode(&bytes);
+    let tip = hash(91);
+    let mut calls = relay_prefix();
+    calls.push(exact_lookup_not_found(transaction.txid()));
+    calls.extend(absent_unspent_calls(&transaction, tip));
+    calls.push(ScriptedRpcCall::ok(
+        "testmempoolaccept",
+        json!([[raw.clone()], 0]),
+        mempool_acceptance(&transaction, true),
+    ));
+    calls.push(ScriptedRpcCall::ok(
+        "sendrawtransaction",
+        json!([raw, 0]),
+        json!(transaction.txid()),
+    ));
+    let (source, rpc) = scripted_source(wallet, calls);
+
+    let result = source
+        .relay_exact_once(exact_relay(&transaction, &bytes))
+        .expect("accepted exact broadcast");
+
+    assert_eq!(result.observation(), RelayObservation::BroadcastAccepted);
+    assert_eq!(result.last_failure(), None);
+    rpc.assert_finished();
+}
+
+#[test]
+fn relay_ambiguous_send_is_recovered_by_observing_the_exact_transaction() {
+    let (_directory, wallet) = test_wallet();
+    let transaction = relay_transaction(&[14]);
+    let bytes = serialize(&transaction);
+    let raw = hex::encode(&bytes);
+    let mut calls = relay_prefix();
+    calls.push(exact_lookup_not_found(transaction.txid()));
+    calls.extend(absent_unspent_calls(&transaction, hash(92)));
+    calls.push(ScriptedRpcCall::ok(
+        "testmempoolaccept",
+        json!([[raw.clone()], 0]),
+        mempool_acceptance(&transaction, true),
+    ));
+    calls.push(ScriptedRpcCall::error(
+        "sendrawtransaction",
+        json!([raw, 0]),
+        ElementsCoreSourceError::BackendUnavailable(
+            "response was lost after Core accepted the transaction".to_owned(),
+        ),
+    ));
+    calls.extend(exact_lookup_calls(
+        transaction.txid(),
+        &transaction,
+        None,
+        0,
+    ));
+    let (source, rpc) = scripted_source(wallet, calls);
+
+    let result = source
+        .relay_exact_once(exact_relay(&transaction, &bytes))
+        .expect("ambiguous send recovered from exact observation");
+
+    assert_eq!(result.observation(), RelayObservation::Mempool);
+    assert_eq!(result.last_failure(), None);
+    rpc.assert_finished();
+}
+
+#[test]
+fn relay_policy_rejection_remains_absent_and_records_a_retryable_failure() {
+    let (_directory, wallet) = test_wallet();
+    let transaction = relay_transaction(&[15]);
+    let bytes = serialize(&transaction);
+    let raw = hex::encode(&bytes);
+    let tip = hash(93);
+    let mut calls = relay_prefix();
+    calls.push(exact_lookup_not_found(transaction.txid()));
+    calls.extend(absent_unspent_calls(&transaction, tip));
+    calls.push(ScriptedRpcCall::ok(
+        "testmempoolaccept",
+        json!([[raw], 0]),
+        mempool_acceptance(&transaction, false),
+    ));
+    calls.push(exact_lookup_not_found(transaction.txid()));
+    calls.extend(absent_unspent_calls(&transaction, tip));
+    let (source, rpc) = scripted_source(wallet, calls);
+
+    let result = source
+        .relay_exact_once(exact_relay(&transaction, &bytes))
+        .expect("durable policy rejection");
+
+    assert_eq!(result.observation(), RelayObservation::Absent);
+    assert_eq!(
+        result.last_failure(),
+        Some(RelayFailureClass::PolicyRejected)
+    );
+    rpc.assert_finished();
+}
+
+#[test]
+fn relay_spent_inputs_conflict_only_after_a_second_exact_lookup() {
+    let (_directory, wallet) = test_wallet();
+    let transaction = relay_transaction(&[22, 16]);
+    let bytes = serialize(&transaction);
+    let tip = hash(94);
+    let expected_spent = transaction
+        .input
+        .iter()
+        .map(|input| input.previous_output)
+        .min()
+        .expect("fixture input");
+    let mut calls = relay_prefix();
+    calls.push(exact_lookup_not_found(transaction.txid()));
+    calls.push(ScriptedRpcCall::ok(
+        "getbestblockhash",
+        json!([]),
+        json!(tip),
+    ));
+    calls.extend(transaction.input.iter().map(|input| {
+        ScriptedRpcCall::ok(
+            "gettxout",
+            json!([input.previous_output.txid, input.previous_output.vout, true]),
+            JsonValue::Null,
+        )
+    }));
+    calls.push(ScriptedRpcCall::ok(
+        "getbestblockhash",
+        json!([]),
+        json!(tip),
+    ));
+    calls.push(exact_lookup_not_found(transaction.txid()));
+    let (source, rpc) = scripted_source(wallet, calls);
+
+    let result = source
+        .relay_exact_once(exact_relay(&transaction, &bytes))
+        .expect("confirmed conflict");
+
+    assert_eq!(
+        result.observation(),
+        RelayObservation::Conflicted {
+            spent_input: expected_spent,
+            conflicting_txid: None,
+        }
+    );
+    assert_eq!(result.last_failure(), None);
+    rpc.assert_finished();
+}
+
+#[test]
+fn relay_same_txid_with_different_witness_is_an_exact_artifact_conflict() {
+    let (_directory, wallet) = test_wallet();
+    let transaction = relay_transaction(&[17]);
+    let bytes = serialize(&transaction);
+    let mut observed = transaction.clone();
+    observed.input[0]
+        .witness
+        .script_witness
+        .push(vec![0x51, 0x21]);
+    assert_eq!(observed.txid(), transaction.txid());
+    assert_ne!(observed.wtxid(), transaction.wtxid());
+    let mut calls = relay_prefix();
+    calls.extend(exact_lookup_calls(transaction.txid(), &observed, None, 0));
+    let (source, rpc) = scripted_source(wallet, calls);
+
+    let result = source
+        .relay_exact_once(exact_relay(&transaction, &bytes))
+        .expect("same txid exact-artifact conflict");
+
+    assert_eq!(
+        result.observation(),
+        RelayObservation::Conflicted {
+            spent_input: transaction.input[0].previous_output,
+            conflicting_txid: Some(transaction.txid()),
+        }
+    );
+    assert_eq!(result.last_failure(), None);
+    rpc.assert_finished();
+}
+
+#[test]
+fn relay_confirmed_observation_requires_a_canonical_block() {
+    let (_directory, wallet) = test_wallet();
+    let transaction = relay_transaction(&[18]);
+    let bytes = serialize(&transaction);
+    let block_hash = hash(95);
+    let block_height = 44;
+    let mut calls = relay_prefix();
+    calls.extend(exact_lookup_calls(
+        transaction.txid(),
+        &transaction,
+        Some(block_hash),
+        2,
+    ));
+    calls.push(ScriptedRpcCall::ok(
+        "getblockheader",
+        json!([block_hash, true]),
+        json!({"hash": block_hash, "height": block_height}),
+    ));
+    calls.push(ScriptedRpcCall::ok(
+        "getblockhash",
+        json!([block_height]),
+        json!(block_hash),
+    ));
+    let (source, rpc) = scripted_source(wallet, calls);
+
+    let result = source
+        .relay_exact_once(exact_relay(&transaction, &bytes))
+        .expect("canonical confirmed transaction");
+
+    assert_eq!(
+        result.observation(),
+        RelayObservation::Confirmed {
+            block_hash,
+            block_height,
+        }
+    );
+    assert_eq!(result.last_failure(), None);
+    rpc.assert_finished();
+}
+
+#[test]
+fn relay_rebroadcasts_an_exact_transaction_found_only_in_a_stale_block() {
+    let (_directory, wallet) = test_wallet();
+    let transaction = relay_transaction(&[20]);
+    let bytes = serialize(&transaction);
+    let raw = hex::encode(&bytes);
+    let stale_block = hash(98);
+    let tip = hash(99);
+    let mut calls = relay_prefix();
+    calls.extend(exact_lookup_calls(
+        transaction.txid(),
+        &transaction,
+        Some(stale_block),
+        0,
+    ));
+    calls.extend(absent_unspent_calls(&transaction, tip));
+    calls.push(ScriptedRpcCall::ok(
+        "testmempoolaccept",
+        json!([[raw.clone()], 0]),
+        mempool_acceptance(&transaction, true),
+    ));
+    calls.push(ScriptedRpcCall::ok(
+        "sendrawtransaction",
+        json!([raw, 0]),
+        json!(transaction.txid()),
+    ));
+    let (source, rpc) = scripted_source(wallet, calls);
+
+    let result = source
+        .relay_exact_once(exact_relay(&transaction, &bytes))
+        .expect("stale-block transaction is relayed again");
+
+    assert_eq!(result.observation(), RelayObservation::BroadcastAccepted);
+    assert_eq!(result.last_failure(), None);
+    rpc.assert_finished();
+}
+
+#[test]
+fn relay_rebroadcasts_exact_bytes_when_a_different_witness_only_exists_in_a_stale_block() {
+    let (_directory, wallet) = test_wallet();
+    let transaction = relay_transaction(&[21]);
+    let bytes = serialize(&transaction);
+    let raw = hex::encode(&bytes);
+    let mut stale_observed = transaction.clone();
+    stale_observed.input[0]
+        .witness
+        .script_witness
+        .push(vec![0x51, 0x22]);
+    assert_eq!(stale_observed.txid(), transaction.txid());
+    assert_ne!(stale_observed.wtxid(), transaction.wtxid());
+    let stale_block = hash(100);
+    let tip = hash(101);
+    let mut calls = relay_prefix();
+    calls.extend(exact_lookup_calls(
+        transaction.txid(),
+        &stale_observed,
+        Some(stale_block),
+        0,
+    ));
+    calls.extend(absent_unspent_calls(&transaction, tip));
+    calls.push(ScriptedRpcCall::ok(
+        "testmempoolaccept",
+        json!([[raw.clone()], 0]),
+        mempool_acceptance(&transaction, true),
+    ));
+    calls.push(ScriptedRpcCall::ok(
+        "sendrawtransaction",
+        json!([raw, 0]),
+        json!(transaction.txid()),
+    ));
+    let (source, rpc) = scripted_source(wallet, calls);
+
+    let result = source
+        .relay_exact_once(exact_relay(&transaction, &bytes))
+        .expect("exact bytes are relayed after the stale witness variant disappears");
+
+    assert_eq!(result.observation(), RelayObservation::BroadcastAccepted);
+    assert_eq!(result.last_failure(), None);
+    rpc.assert_finished();
+}
+
+#[test]
+fn relay_absence_fails_closed_when_the_tip_changes() {
+    let (_directory, wallet) = test_wallet();
+    let transaction = relay_transaction(&[19]);
+    let bytes = serialize(&transaction);
+    let original_tip = hash(96);
+    let new_tip = hash(97);
+    let input = transaction.input[0].previous_output;
+    let mut calls = relay_prefix();
+    calls.push(exact_lookup_not_found(transaction.txid()));
+    calls.extend([
+        ScriptedRpcCall::ok("getbestblockhash", json!([]), json!(original_tip)),
+        ScriptedRpcCall::ok(
+            "gettxout",
+            json!([input.txid, input.vout, true]),
+            unspent_result(original_tip),
+        ),
+        ScriptedRpcCall::ok("getbestblockhash", json!([]), json!(new_tip)),
+    ]);
+    let (source, rpc) = scripted_source(wallet, calls);
+
+    let error = source
+        .relay_exact_once(exact_relay(&transaction, &bytes))
+        .expect_err("tip race must fail closed");
+
+    assert!(matches!(
+        error,
+        ElementsCoreSourceError::RelayTipChanged { expected, actual }
+            if expected == original_tip && actual == new_tip
+    ));
+    rpc.assert_finished();
 }
 
 #[test]

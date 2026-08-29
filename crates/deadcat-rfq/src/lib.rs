@@ -9,6 +9,7 @@
 
 mod clock;
 mod handler;
+mod relay;
 mod wallet;
 
 pub mod elements;
@@ -18,4 +19,5 @@ pub use handler::{
     AuthenticatedRfqHandler, HandlerConfig, HandlerStartError, ProviderRfqBackend, RfqBackend,
     RuntimeWallet,
 };
+pub use relay::{ProviderRelaySource, RelayAttemptResult, RelaySourceError};
 pub use wallet::SharedRfqWallet;

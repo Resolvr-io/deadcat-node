@@ -5,7 +5,9 @@ use elements::encode::{deserialize, serialize};
 use elements::hashes::Hash as _;
 use elements::pset::PartiallySignedTransaction;
 use elements::secp256k1_zkp::{PublicKey, RangeProof, SurjectionProof, XOnlyPublicKey};
-use elements::{AssetId, BlockHash, OutPoint, Script, TxOut, TxOutWitness};
+use elements::{
+    AssetId, BlockHash, OutPoint, Script, Transaction, TxOut, TxOutWitness, Txid, Wtxid,
+};
 use iroh::{EndpointId, SecretKey, Signature};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -703,8 +705,151 @@ pub enum ReleaseReasonDto {
     ProviderRejected,
 }
 
+/// Provider observation of the exact transaction extracted from a signed
+/// settlement artifact.
+///
+/// Relay observations are deliberately independent of the reservation state:
+/// a reorg may move an observation from `confirmed` back to `mempool` or
+/// `absent`, but can never make the signed reservation spendable again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum RelayObservationDto {
+    Unobserved,
+    BroadcastAccepted,
+    Mempool,
+    Confirmed {
+        block_hash: BlockHash,
+        block_height: u32,
+    },
+    Absent,
+    Conflicted {
+        spent_input: OutPoint,
+        conflicting_txid: Option<Txid>,
+    },
+}
+
+/// Stable, non-sensitive classification of the latest relay failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayFailureClassDto {
+    BackendUnavailable,
+    PolicyRejected,
+    InvalidBackendData,
+}
+
+/// Durable relay and chain-reconciliation status for one signed settlement.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayStatusDto {
+    pub txid: Txid,
+    pub wtxid: Wtxid,
+    #[serde(with = "serde_u64_string")]
+    pub revision: u64,
+    pub observation: RelayObservationDto,
+    #[serde(default, with = "crate::optional_u64_string")]
+    pub last_observed_at_millis: Option<u64>,
+    #[serde(default, with = "crate::optional_u64_string")]
+    pub next_attempt_at_millis: Option<u64>,
+    pub last_failure: Option<RelayFailureClassDto>,
+    #[serde(default, with = "crate::optional_u64_string")]
+    pub last_failure_at_millis: Option<u64>,
+    #[serde(with = "serde_u64_string")]
+    pub attempt_count: u64,
+    #[serde(with = "serde_u64_string")]
+    pub reorg_count: u64,
+}
+
+impl RelayStatusDto {
+    fn validate(
+        &self,
+        signed_at_millis: u64,
+        transaction: &Transaction,
+    ) -> Result<(), FirmQuoteValidationError> {
+        if self.txid != transaction.txid() || self.wtxid != transaction.wtxid() {
+            return Err(FirmQuoteValidationError::RelayTransactionMismatch);
+        }
+        let completed_revision = self.attempt_count.checked_mul(2);
+        let in_flight_revision = completed_revision.and_then(|revision| revision.checked_sub(1));
+        let in_flight = matches!(in_flight_revision, Some(revision) if self.revision == revision);
+        if !matches!(completed_revision, Some(revision) if self.revision == revision) && !in_flight
+        {
+            return Err(FirmQuoteValidationError::InvalidRelayStatus);
+        }
+        let Some(completed_outcomes) = self.revision.checked_sub(self.attempt_count) else {
+            return Err(FirmQuoteValidationError::InvalidRelayStatus);
+        };
+        if self.reorg_count > completed_outcomes {
+            return Err(FirmQuoteValidationError::InvalidRelayStatus);
+        }
+        if self.last_failure.is_some() != self.last_failure_at_millis.is_some() {
+            return Err(FirmQuoteValidationError::InvalidRelayStatus);
+        }
+
+        let initial = self.attempt_count == 0;
+        if initial != (self.revision == 0)
+            || matches!(self.observation, RelayObservationDto::Unobserved)
+                != self.last_observed_at_millis.is_none()
+            || (initial && (self.last_failure.is_some() || self.reorg_count != 0))
+            || (initial && self.next_attempt_at_millis != Some(signed_at_millis))
+            || (in_flight && self.next_attempt_at_millis.is_none())
+            || (!initial
+                && !in_flight
+                && matches!(self.observation, RelayObservationDto::Unobserved)
+                && !matches!(
+                    self.last_failure,
+                    Some(
+                        RelayFailureClassDto::BackendUnavailable
+                            | RelayFailureClassDto::InvalidBackendData
+                    )
+                ))
+            || (self.last_failure == Some(RelayFailureClassDto::PolicyRejected)
+                && !matches!(self.observation, RelayObservationDto::Absent))
+        {
+            return Err(FirmQuoteValidationError::InvalidRelayStatus);
+        }
+        if let RelayObservationDto::Conflicted { spent_input, .. } = self.observation
+            && (spent_input.is_null()
+                || spent_input.vout & 0xc000_0000 != 0
+                || !transaction
+                    .input
+                    .iter()
+                    .any(|input| input.previous_output == spent_input))
+        {
+            return Err(FirmQuoteValidationError::InvalidRelayStatus);
+        }
+        if self
+            .last_observed_at_millis
+            .is_some_and(|at| at < signed_at_millis)
+            || self
+                .next_attempt_at_millis
+                .is_some_and(|at| at < signed_at_millis)
+            || self
+                .last_failure_at_millis
+                .is_some_and(|at| at < signed_at_millis)
+            || self
+                .last_observed_at_millis
+                .zip(self.next_attempt_at_millis)
+                .is_some_and(|(observed, next)| next < observed)
+            || self
+                .last_failure_at_millis
+                .zip(self.next_attempt_at_millis)
+                .is_some_and(|(failure, next)| next < failure)
+            || self
+                .last_observed_at_millis
+                .zip(self.last_failure_at_millis)
+                .is_some_and(|(observed, failure)| failure < observed)
+        {
+            return Err(FirmQuoteValidationError::InvalidStatusTimeline);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
+// Signed status is deliberately self-contained: clients need the exact
+// artifact and its relay record to validate and durably recover execution.
+#[allow(clippy::large_enum_variant)]
 pub enum ReservationStateDto {
     Reserved,
     Released {
@@ -725,6 +870,7 @@ pub enum ReservationStateDto {
         #[serde(with = "serde_u64_string")]
         signed_at_millis: u64,
         signed_pset: SettlementPset,
+        relay: RelayStatusDto,
     },
 }
 
@@ -781,7 +927,9 @@ impl ReservationStatusDto {
         if let ReservationStateDto::Signed {
             signing_commitment,
             artifact_digest,
+            signed_at_millis,
             signed_pset,
+            relay,
             ..
         } = &self.state
         {
@@ -799,6 +947,12 @@ impl ReservationStatusDto {
             if *artifact_digest != expected {
                 return Err(FirmQuoteValidationError::ArtifactDigestMismatch);
             }
+            let transaction = signed_pset
+                .to_pset()
+                .map_err(|_| FirmQuoteValidationError::InvalidRelayTransaction)?
+                .extract_tx()
+                .map_err(|_| FirmQuoteValidationError::InvalidRelayTransaction)?;
+            relay.validate(*signed_at_millis, &transaction)?;
         }
         Ok(())
     }
@@ -1280,6 +1434,12 @@ pub enum FirmQuoteValidationError {
     IncompleteLayout,
     #[error("signed settlement bytes do not match their durable artifact digest")]
     ArtifactDigestMismatch,
+    #[error("signed settlement cannot be extracted as the relayed transaction")]
+    InvalidRelayTransaction,
+    #[error("relay transaction identifiers do not match the signed settlement")]
+    RelayTransactionMismatch,
+    #[error("invalid durable relay status")]
+    InvalidRelayStatus,
     #[error("firm quote provider does not match its attestation signer")]
     ProviderAttestationMismatch,
     #[error("firm quote and reservation status describe different durable records")]
@@ -1316,7 +1476,7 @@ mod tests {
     use elements::confidential::{Asset, AssetBlindingFactor, Nonce, Value, ValueBlindingFactor};
     use elements::hashes::Hash as _;
     use elements::secp256k1_zkp::{Keypair, Secp256k1, SecretKey as SecpSecretKey};
-    use elements::{RangeProofMessage, TxOut, TxOutSecrets, Txid};
+    use elements::{LockTime, RangeProofMessage, TxIn, TxOut, TxOutSecrets, Txid};
     use rand::SeedableRng as _;
     use rand::rngs::StdRng;
 
@@ -1329,6 +1489,38 @@ mod tests {
 
     fn outpoint(marker: u8, vout: u32) -> OutPoint {
         OutPoint::new(Txid::from_byte_array([marker; 32]), vout)
+    }
+
+    fn unobserved_relay(pset: &SettlementPset, signed_at_millis: u64) -> RelayStatusDto {
+        let transaction = pset
+            .to_pset()
+            .expect("fixture PSET")
+            .extract_tx()
+            .expect("fixture transaction");
+        RelayStatusDto {
+            txid: transaction.txid(),
+            wtxid: transaction.wtxid(),
+            revision: 0,
+            observation: RelayObservationDto::Unobserved,
+            last_observed_at_millis: None,
+            next_attempt_at_millis: Some(signed_at_millis),
+            last_failure: None,
+            last_failure_at_millis: None,
+            attempt_count: 0,
+            reorg_count: 0,
+        }
+    }
+
+    fn signed_artifact_digest(
+        signing_commitment: FixedBytes32,
+        pset: &SettlementPset,
+    ) -> FixedBytes32 {
+        let mut hasher = Sha256::new();
+        hasher.update(SIGNED_ARTIFACT_DOMAIN);
+        hasher.update(signing_commitment.to_bytes());
+        hasher.update((pset.as_bytes().len() as u64).to_be_bytes());
+        hasher.update(pset.as_bytes());
+        FixedBytes32::new(hasher.finalize().into())
     }
 
     fn recipient(marker: u8) -> QuoteRecipientDto {
@@ -1865,12 +2057,7 @@ mod tests {
         let pset =
             SettlementPset::from_pset(&PartiallySignedTransaction::new_v2()).expect("valid PSET");
         let signing_commitment = FixedBytes32::new([81; 32]);
-        let mut hasher = Sha256::new();
-        hasher.update(SIGNED_ARTIFACT_DOMAIN);
-        hasher.update(signing_commitment.to_bytes());
-        hasher.update((pset.as_bytes().len() as u64).to_be_bytes());
-        hasher.update(pset.as_bytes());
-        let artifact_digest = FixedBytes32::new(hasher.finalize().into());
+        let artifact_digest = signed_artifact_digest(signing_commitment, &pset);
         let status = ReservationStatusDto {
             reservation_id: FixedBytes32::new([82; 32]),
             quote_commitment: FixedBytes32::new([83; 32]),
@@ -1881,10 +2068,77 @@ mod tests {
                 artifact_digest,
                 committed_at_millis: 1_500,
                 signed_at_millis: 1_600,
+                relay: unobserved_relay(&pset, 1_600),
                 signed_pset: pset,
             },
         };
         assert!(status.validate().is_ok());
+        let mut observed = status.clone();
+        let ReservationStateDto::Signed { relay, .. } = &mut observed.state else {
+            unreachable!("signed fixture")
+        };
+        relay.revision = 2;
+        relay.attempt_count = 1;
+        relay.observation = RelayObservationDto::Mempool;
+        relay.last_observed_at_millis = Some(1_700);
+        relay.next_attempt_at_millis = Some(1_800);
+        assert!(observed.validate().is_ok());
+        let encoded = serde_json::to_string(&observed).expect("encode relay status");
+        assert!(encoded.contains("\"revision\":\"2\""));
+        assert!(encoded.contains("\"last_observed_at_millis\":\"1700\""));
+        assert!(encoded.contains("\"attempt_count\":\"1\""));
+        assert_eq!(
+            serde_json::from_str::<ReservationStatusDto>(&encoded).expect("decode relay status"),
+            observed
+        );
+
+        let mut failed_before_observation = status.clone();
+        let ReservationStateDto::Signed { relay, .. } = &mut failed_before_observation.state else {
+            unreachable!("signed fixture")
+        };
+        relay.revision = 2;
+        relay.attempt_count = 1;
+        relay.last_failure = Some(RelayFailureClassDto::BackendUnavailable);
+        relay.last_failure_at_millis = Some(1_700);
+        relay.next_attempt_at_millis = Some(1_800);
+        assert!(failed_before_observation.validate().is_ok());
+        let mut impossible_policy_rejection = failed_before_observation.clone();
+        let ReservationStateDto::Signed { relay, .. } = &mut impossible_policy_rejection.state
+        else {
+            unreachable!("signed fixture")
+        };
+        relay.last_failure = Some(RelayFailureClassDto::PolicyRejected);
+        assert_eq!(
+            impossible_policy_rejection
+                .validate()
+                .expect_err("policy rejection requires an absent observation"),
+            FirmQuoteValidationError::InvalidRelayStatus
+        );
+
+        let mut failed_after_observation = observed.clone();
+        let ReservationStateDto::Signed { relay, .. } = &mut failed_after_observation.state else {
+            unreachable!("signed fixture")
+        };
+        relay.revision = 4;
+        relay.attempt_count = 2;
+        relay.last_failure = Some(RelayFailureClassDto::BackendUnavailable);
+        relay.last_failure_at_millis = Some(1_900);
+        relay.next_attempt_at_millis = Some(2_000);
+        assert!(failed_after_observation.validate().is_ok());
+
+        let mut stale_failure = observed.clone();
+        let ReservationStateDto::Signed { relay, .. } = &mut stale_failure.state else {
+            unreachable!("signed fixture")
+        };
+        relay.last_failure = Some(RelayFailureClassDto::BackendUnavailable);
+        relay.last_failure_at_millis = Some(1_650);
+        assert_eq!(
+            stale_failure
+                .validate()
+                .expect_err("latest failure cannot predate the retained observation"),
+            FirmQuoteValidationError::InvalidStatusTimeline
+        );
+
         let mut tampered = status.clone();
         let ReservationStateDto::Signed {
             artifact_digest, ..
@@ -1897,6 +2151,191 @@ mod tests {
             tampered.validate().expect_err("digest mismatch"),
             FirmQuoteValidationError::ArtifactDigestMismatch
         );
+
+        let mut wrong_transaction = status.clone();
+        let ReservationStateDto::Signed { relay, .. } = &mut wrong_transaction.state else {
+            unreachable!("signed fixture")
+        };
+        relay.txid = Txid::from_byte_array([85; 32]);
+        assert_eq!(
+            wrong_transaction
+                .validate()
+                .expect_err("relay transaction mismatch"),
+            FirmQuoteValidationError::RelayTransactionMismatch
+        );
+        let mut wrong_witness_transaction = status.clone();
+        let ReservationStateDto::Signed { relay, .. } = &mut wrong_witness_transaction.state else {
+            unreachable!("signed fixture")
+        };
+        relay.wtxid = Wtxid::from_byte_array([86; 32]);
+        assert_eq!(
+            wrong_witness_transaction
+                .validate()
+                .expect_err("relay witness transaction mismatch"),
+            FirmQuoteValidationError::RelayTransactionMismatch
+        );
+
+        let mut invalid_relay_revision = status.clone();
+        let ReservationStateDto::Signed { relay, .. } = &mut invalid_relay_revision.state else {
+            unreachable!("signed fixture")
+        };
+        relay.revision = 1;
+        relay.observation = RelayObservationDto::Mempool;
+        relay.last_observed_at_millis = Some(1_700);
+        assert_eq!(
+            invalid_relay_revision
+                .validate()
+                .expect_err("revision/count mismatch"),
+            FirmQuoteValidationError::InvalidRelayStatus
+        );
+
+        let mut impossible_completed_revision = status.clone();
+        let ReservationStateDto::Signed { relay, .. } = &mut impossible_completed_revision.state
+        else {
+            unreachable!("signed fixture")
+        };
+        relay.revision = 2;
+        relay.attempt_count = 2;
+        assert_eq!(
+            impossible_completed_revision
+                .validate()
+                .expect_err("two attempts cannot have only two revisions"),
+            FirmQuoteValidationError::InvalidRelayStatus
+        );
+
+        let mut reorg_without_completed_outcome = status.clone();
+        let ReservationStateDto::Signed { relay, .. } = &mut reorg_without_completed_outcome.state
+        else {
+            unreachable!("signed fixture")
+        };
+        relay.revision = 1;
+        relay.attempt_count = 1;
+        relay.reorg_count = 1;
+        assert_eq!(
+            reorg_without_completed_outcome
+                .validate()
+                .expect_err("an in-flight first attempt has no completed reorg outcome"),
+            FirmQuoteValidationError::InvalidRelayStatus
+        );
+
+        let mut unscheduled_initial = status.clone();
+        let ReservationStateDto::Signed { relay, .. } = &mut unscheduled_initial.state else {
+            unreachable!("signed fixture")
+        };
+        relay.next_attempt_at_millis = None;
+        assert_eq!(
+            unscheduled_initial
+                .validate()
+                .expect_err("initial relay must be scheduled at signing"),
+            FirmQuoteValidationError::InvalidRelayStatus
+        );
+
+        let mut unscheduled_lease = status.clone();
+        let ReservationStateDto::Signed { relay, .. } = &mut unscheduled_lease.state else {
+            unreachable!("signed fixture")
+        };
+        relay.revision = 1;
+        relay.attempt_count = 1;
+        relay.next_attempt_at_millis = None;
+        assert_eq!(
+            unscheduled_lease
+                .validate()
+                .expect_err("in-flight relay lease must retain its crash retry"),
+            FirmQuoteValidationError::InvalidRelayStatus
+        );
+
+        let mut unexplained_unobserved_outcome = status.clone();
+        let ReservationStateDto::Signed { relay, .. } = &mut unexplained_unobserved_outcome.state
+        else {
+            unreachable!("signed fixture")
+        };
+        relay.revision = 2;
+        relay.attempt_count = 1;
+        relay.next_attempt_at_millis = Some(1_700);
+        assert_eq!(
+            unexplained_unobserved_outcome
+                .validate()
+                .expect_err("completed unobserved relay must carry a failure"),
+            FirmQuoteValidationError::InvalidRelayStatus
+        );
+
+        let conflict_input = outpoint(87, 0);
+        let conflict_pset =
+            SettlementPset::from_pset(&PartiallySignedTransaction::from_tx(Transaction {
+                version: 2,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: conflict_input,
+                    ..TxIn::default()
+                }],
+                output: Vec::new(),
+            }))
+            .expect("conflict fixture PSET");
+        let mut conflicted = status.clone();
+        let ReservationStateDto::Signed {
+            artifact_digest,
+            signed_pset,
+            relay,
+            ..
+        } = &mut conflicted.state
+        else {
+            unreachable!("signed fixture")
+        };
+        *artifact_digest = signed_artifact_digest(signing_commitment, &conflict_pset);
+        *signed_pset = conflict_pset;
+        *relay = unobserved_relay(signed_pset, 1_600);
+        relay.revision = 2;
+        relay.attempt_count = 1;
+        relay.observation = RelayObservationDto::Conflicted {
+            spent_input: outpoint(88, 0),
+            // Equal txids are meaningful when an alternate witness encoding
+            // spent the same input; only the exact wtxid is successful.
+            conflicting_txid: Some(relay.txid),
+        };
+        relay.last_observed_at_millis = Some(1_700);
+        relay.next_attempt_at_millis = Some(1_800);
+        assert_eq!(
+            conflicted
+                .validate()
+                .expect_err("conflict must name an exact transaction input"),
+            FirmQuoteValidationError::InvalidRelayStatus
+        );
+        let ReservationStateDto::Signed { relay, .. } = &mut conflicted.state else {
+            unreachable!("signed fixture")
+        };
+        relay.observation = RelayObservationDto::Conflicted {
+            spent_input: conflict_input,
+            conflicting_txid: Some(relay.txid),
+        };
+        assert!(conflicted.validate().is_ok());
+
+        let mut invalid_failure = status.clone();
+        let ReservationStateDto::Signed { relay, .. } = &mut invalid_failure.state else {
+            unreachable!("signed fixture")
+        };
+        relay.last_failure = Some(RelayFailureClassDto::BackendUnavailable);
+        assert_eq!(
+            invalid_failure
+                .validate()
+                .expect_err("failure class without timestamp"),
+            FirmQuoteValidationError::InvalidRelayStatus
+        );
+
+        let mut invalid_relay_time = status.clone();
+        let ReservationStateDto::Signed { relay, .. } = &mut invalid_relay_time.state else {
+            unreachable!("signed fixture")
+        };
+        relay.revision = 2;
+        relay.attempt_count = 1;
+        relay.observation = RelayObservationDto::Absent;
+        relay.last_observed_at_millis = Some(1_599);
+        assert_eq!(
+            invalid_relay_time
+                .validate()
+                .expect_err("relay observation predates signature"),
+            FirmQuoteValidationError::InvalidStatusTimeline
+        );
+
         let mut invalid_time = status;
         let ReservationStateDto::Signed {
             signed_at_millis, ..
@@ -2040,6 +2479,7 @@ mod tests {
                     artifact_digest,
                     committed_at_millis: 1_500,
                     signed_at_millis: 1_600,
+                    relay: unobserved_relay(&pset, 1_600),
                     signed_pset: pset,
                 })
             }

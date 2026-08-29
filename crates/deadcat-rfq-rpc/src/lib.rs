@@ -19,9 +19,10 @@ pub use quote::{
     LiveFirmQuote, MAX_RECIPIENT_SCRIPT_BYTES, MAX_SETTLEMENT_BYTES, MAX_SETTLEMENT_INPUTS,
     MAX_SETTLEMENT_OUTPUTS, OutputPlacementDto, PricingDecisionDto, PsetError, QuoteAttestation,
     QuoteContextDto, QuoteExecutionDto, QuoteInputDto, QuoteKindDto, QuoteOutputDto,
-    QuoteOutputRoleDto, QuoteRecipientDto, RationalRateDto, ReleaseReasonDto, ReservationIdDto,
-    ReservationStateDto, ReservationStatusDto, SettlementLayoutDto, SettlementPset,
-    SignedFirmQuote, SnapshotEvidenceDto, TxOutDto, VerifiedFirmQuote, owner_id_from_endpoints,
+    QuoteOutputRoleDto, QuoteRecipientDto, RationalRateDto, RelayFailureClassDto,
+    RelayObservationDto, RelayStatusDto, ReleaseReasonDto, ReservationIdDto, ReservationStateDto,
+    ReservationStatusDto, SettlementLayoutDto, SettlementPset, SignedFirmQuote,
+    SnapshotEvidenceDto, TxOutDto, VerifiedFirmQuote, owner_id_from_endpoints,
 };
 
 use serde::{Deserialize, Serialize};
@@ -224,6 +225,7 @@ pub enum ProviderCapability {
     ProviderBlinding,
     SettlementExecution,
     DurableStatus,
+    SettlementRelay,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

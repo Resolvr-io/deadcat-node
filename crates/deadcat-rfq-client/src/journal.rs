@@ -4,7 +4,8 @@ use std::fs::OpenOptions;
 use std::path::Path;
 
 use deadcat_rfq_rpc::{
-    AttestationError, FixedBytes32, ReservationIdDto, ReservationStateDto, ReservationStatusDto,
+    AttestationError, FixedBytes32, RelayObservationDto, RelayStatusDto, ReservationIdDto,
+    ReservationStateDto, ReservationStatusDto,
 };
 use iroh::EndpointId;
 use redb::{
@@ -698,6 +699,32 @@ fn validate_transition(
                 committed_at_millis: previous_at,
             } if previous_commitment == *signing_commitment && previous_at == *committed_at_millis
         ),
+        (
+            ExecutionJournalObservation::Signed(previous),
+            ReservationStateDto::Signed {
+                signing_commitment,
+                artifact_digest,
+                committed_at_millis,
+                signed_at_millis,
+                signed_pset,
+                relay,
+            },
+        ) => matches!(
+            &previous.state,
+            ReservationStateDto::Signed {
+                signing_commitment: previous_commitment,
+                artifact_digest: previous_artifact,
+                committed_at_millis: previous_committed_at,
+                signed_at_millis: previous_signed_at,
+                signed_pset: previous_pset,
+                relay: previous_relay,
+            } if previous_commitment == signing_commitment
+                && previous_artifact == artifact_digest
+                && previous_committed_at == committed_at_millis
+                && previous_signed_at == signed_at_millis
+                && previous_pset.as_bytes() == signed_pset.as_bytes()
+                && valid_relay_update(previous_relay, relay)
+        ),
         (ExecutionJournalObservation::Released(_), _)
         | (ExecutionJournalObservation::Signed(_), _)
         | (ExecutionJournalObservation::Committed(_), _) => false,
@@ -706,6 +733,48 @@ fn validate_transition(
         return Err(ExecutionJournalRecordError::StatusRegression);
     }
     Ok(ExecutionJournalObservation::from_status(next.clone()))
+}
+
+fn valid_relay_update(previous: &RelayStatusDto, next: &RelayStatusDto) -> bool {
+    let observation_time_is_monotonic = match (
+        previous.last_observed_at_millis,
+        next.last_observed_at_millis,
+    ) {
+        (Some(previous), Some(next)) => next >= previous,
+        (Some(_), None) => false,
+        _ => true,
+    };
+    let failure_time_is_monotonic =
+        match (previous.last_failure_at_millis, next.last_failure_at_millis) {
+            (Some(previous), Some(next)) => next >= previous,
+            _ => true,
+        };
+    let confirmed_reorg = match (previous.observation, next.observation) {
+        (
+            RelayObservationDto::Confirmed {
+                block_hash: previous_hash,
+                block_height: previous_height,
+            },
+            RelayObservationDto::Confirmed {
+                block_hash: next_hash,
+                block_height: next_height,
+            },
+        ) => previous_hash != next_hash || previous_height != next_height,
+        (RelayObservationDto::Confirmed { .. }, _) => true,
+        _ => false,
+    };
+    let regressed_to_unobserved = !matches!(previous.observation, RelayObservationDto::Unobserved)
+        && matches!(next.observation, RelayObservationDto::Unobserved);
+
+    previous.txid == next.txid
+        && previous.wtxid == next.wtxid
+        && next.revision > previous.revision
+        && next.attempt_count >= previous.attempt_count
+        && next.reorg_count >= previous.reorg_count
+        && observation_time_is_monotonic
+        && failure_time_is_monotonic
+        && !regressed_to_unobserved
+        && (!confirmed_reorg || next.reorg_count > previous.reorg_count)
 }
 
 #[derive(Serialize)]
@@ -821,6 +890,7 @@ mod tests {
 
     use super::*;
     use deadcat_rfq_rpc::{ReleaseReasonDto, SettlementPset};
+    use elements::hashes::Hash as _;
     use elements::pset::PartiallySignedTransaction;
     use redb::TableHandle as _;
 
@@ -832,6 +902,41 @@ mod tests {
             accept_before_millis: 200,
             state,
         }
+    }
+
+    fn unobserved_relay(pset: &SettlementPset, signed_at_millis: u64) -> RelayStatusDto {
+        let transaction = pset
+            .to_pset()
+            .expect("fixture PSET")
+            .extract_tx()
+            .expect("fixture transaction");
+        RelayStatusDto {
+            txid: transaction.txid(),
+            wtxid: transaction.wtxid(),
+            revision: 0,
+            observation: RelayObservationDto::Unobserved,
+            last_observed_at_millis: None,
+            next_attempt_at_millis: Some(signed_at_millis),
+            last_failure: None,
+            last_failure_at_millis: None,
+            attempt_count: 0,
+            reorg_count: 0,
+        }
+    }
+
+    fn observed_relay(
+        pset: &SettlementPset,
+        revision: u64,
+        attempt_count: u64,
+        observation: RelayObservationDto,
+    ) -> RelayStatusDto {
+        let mut relay = unobserved_relay(pset, 160);
+        relay.revision = revision;
+        relay.attempt_count = attempt_count;
+        relay.observation = observation;
+        relay.last_observed_at_millis = Some(160 + revision);
+        relay.next_attempt_at_millis = Some(161 + revision);
+        relay
     }
 
     fn assert_database_io_kind(
@@ -935,13 +1040,15 @@ mod tests {
                 signing_commitment: FixedBytes32::new([0x33; 32]),
                 committed_at_millis: 150,
             }));
+        let signed_pset = SettlementPset::from_pset(&PartiallySignedTransaction::new_v2())
+            .expect("empty fixture PSET");
         let signed = ExecutionJournalObservation::Signed(status(ReservationStateDto::Signed {
             signing_commitment: FixedBytes32::new([0x33; 32]),
             artifact_digest: FixedBytes32::new([0x44; 32]),
             committed_at_millis: 150,
             signed_at_millis: 160,
-            signed_pset: SettlementPset::from_pset(&PartiallySignedTransaction::new_v2())
-                .expect("empty fixture PSET"),
+            relay: unobserved_relay(&signed_pset, 160),
+            signed_pset,
         }));
 
         assert!(ExecutionJournalObservation::Armed.requires_taker_funding_exclusion());
@@ -949,5 +1056,132 @@ mod tests {
         assert!(!released.requires_taker_funding_exclusion());
         assert!(committed.requires_taker_funding_exclusion());
         assert!(signed.requires_taker_funding_exclusion());
+    }
+
+    #[test]
+    fn signed_status_accepts_revisioned_relay_reorgs_but_not_artifact_changes() {
+        let signed_pset = SettlementPset::from_pset(&PartiallySignedTransaction::new_v2())
+            .expect("empty fixture PSET");
+        let signed_state = |relay| ReservationStateDto::Signed {
+            signing_commitment: FixedBytes32::new([0x33; 32]),
+            artifact_digest: FixedBytes32::new([0x44; 32]),
+            committed_at_millis: 150,
+            signed_at_millis: 160,
+            signed_pset: signed_pset.clone(),
+            relay,
+        };
+        let previous = status(signed_state(observed_relay(
+            &signed_pset,
+            4,
+            2,
+            RelayObservationDto::Confirmed {
+                block_hash: elements::BlockHash::from_byte_array([0x55; 32]),
+                block_height: 42,
+            },
+        )));
+        let current = ExecutionJournalObservation::Signed(previous.clone());
+
+        let mut reorged_relay = observed_relay(&signed_pset, 6, 3, RelayObservationDto::Absent);
+        reorged_relay.reorg_count = 1;
+        let reorged = status(signed_state(reorged_relay));
+        assert!(matches!(
+            validate_transition(&current, &reorged),
+            Ok(ExecutionJournalObservation::Signed(status)) if status == reorged
+        ));
+
+        let missing_reorg = status(signed_state(observed_relay(
+            &signed_pset,
+            6,
+            3,
+            RelayObservationDto::Absent,
+        )));
+        assert!(matches!(
+            validate_transition(&current, &missing_reorg),
+            Err(ExecutionJournalRecordError::StatusRegression)
+        ));
+
+        let moved_block_without_reorg = status(signed_state(observed_relay(
+            &signed_pset,
+            6,
+            3,
+            RelayObservationDto::Confirmed {
+                block_hash: elements::BlockHash::from_byte_array([0x56; 32]),
+                block_height: 43,
+            },
+        )));
+        assert!(matches!(
+            validate_transition(&current, &moved_block_without_reorg),
+            Err(ExecutionJournalRecordError::StatusRegression)
+        ));
+
+        let mut moved_relay = observed_relay(
+            &signed_pset,
+            6,
+            3,
+            RelayObservationDto::Confirmed {
+                block_hash: elements::BlockHash::from_byte_array([0x56; 32]),
+                block_height: 43,
+            },
+        );
+        moved_relay.reorg_count = 1;
+        let moved_block = status(signed_state(moved_relay));
+        assert!(matches!(
+            validate_transition(&current, &moved_block),
+            Ok(ExecutionJournalObservation::Signed(status)) if status == moved_block
+        ));
+
+        let stale = status(signed_state(observed_relay(
+            &signed_pset,
+            4,
+            2,
+            RelayObservationDto::Mempool,
+        )));
+        assert!(matches!(
+            validate_transition(&current, &stale),
+            Err(ExecutionJournalRecordError::StatusRegression)
+        ));
+
+        let mut previous_failure_relay =
+            observed_relay(&signed_pset, 4, 2, RelayObservationDto::Mempool);
+        previous_failure_relay.last_failure =
+            Some(deadcat_rfq_rpc::RelayFailureClassDto::BackendUnavailable);
+        previous_failure_relay.last_failure_at_millis = Some(165);
+        let failure_current =
+            ExecutionJournalObservation::Signed(status(signed_state(previous_failure_relay)));
+        let mut stale_failure_relay =
+            observed_relay(&signed_pset, 6, 3, RelayObservationDto::Mempool);
+        stale_failure_relay.last_failure =
+            Some(deadcat_rfq_rpc::RelayFailureClassDto::BackendUnavailable);
+        stale_failure_relay.last_failure_at_millis = Some(164);
+        let stale_failure = status(signed_state(stale_failure_relay));
+        assert!(matches!(
+            validate_transition(&failure_current, &stale_failure),
+            Err(ExecutionJournalRecordError::StatusRegression)
+        ));
+
+        let mut changed_artifact = reorged.clone();
+        let ReservationStateDto::Signed {
+            artifact_digest, ..
+        } = &mut changed_artifact.state
+        else {
+            unreachable!("signed fixture")
+        };
+        *artifact_digest = FixedBytes32::new([0x45; 32]);
+        assert!(matches!(
+            validate_transition(&current, &changed_artifact),
+            Err(ExecutionJournalRecordError::StatusRegression)
+        ));
+
+        let mut changed_pset = reorged;
+        let ReservationStateDto::Signed { signed_pset, .. } = &mut changed_pset.state else {
+            unreachable!("signed fixture")
+        };
+        let mut different_pset = PartiallySignedTransaction::new_v2();
+        different_pset.global.tx_data.tx_modifiable = Some(1);
+        *signed_pset = SettlementPset::from_pset(&different_pset).expect("different fixture PSET");
+        assert!(matches!(
+            validate_transition(&current, &changed_pset),
+            Err(ExecutionJournalRecordError::StatusRegression)
+        ));
     }
 }

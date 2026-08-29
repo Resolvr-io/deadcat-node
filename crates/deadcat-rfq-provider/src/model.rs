@@ -1,7 +1,7 @@
 use core::fmt;
 
 use elements::secp256k1_zkp::XOnlyPublicKey;
-use elements::{AssetId, BlockHash, OutPoint};
+use elements::{AssetId, BlockHash, OutPoint, Txid, Wtxid};
 use thiserror::Error;
 
 /// Maximum number of provider inventory inputs one reservation may claim.
@@ -776,6 +776,330 @@ impl SignedArtifact {
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+}
+
+/// Latest provider observation of the exact transaction derived from a signed
+/// settlement artifact.
+///
+/// This state is deliberately orthogonal to [`ReservationState`]. A relay or
+/// chain-reconciliation result can never make a signed reservation spendable
+/// again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayObservation {
+    /// No relay or chain observation has completed yet.
+    Unobserved,
+    /// The backend accepted the exact transaction for broadcast.
+    BroadcastAccepted,
+    /// The exact transaction was observed in the mempool.
+    Mempool,
+    /// The exact transaction was observed in a block.
+    Confirmed {
+        block_hash: BlockHash,
+        block_height: u32,
+    },
+    /// The exact transaction was not observed in either the mempool or chain.
+    Absent,
+    /// At least one committed input was spent by another transaction.
+    Conflicted {
+        spent_input: OutPoint,
+        conflicting_txid: Option<Txid>,
+    },
+}
+
+/// Stable, non-sensitive classification of the latest failed relay attempt.
+///
+/// Backend error strings are intentionally excluded from durable state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayFailureClass {
+    BackendUnavailable,
+    PolicyRejected,
+    InvalidBackendData,
+}
+
+/// Exact bounded work item returned by the provider relay outbox.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RelayJob {
+    pub(crate) reservation_id: ReservationId,
+    pub(crate) commitment: SigningCommitment,
+    pub(crate) artifact: SignedArtifactDigest,
+    pub(crate) txid: Txid,
+    pub(crate) wtxid: Wtxid,
+    pub(crate) revision: u64,
+    pub(crate) due_at: UnixMillis,
+    pub(crate) observation: RelayObservation,
+    pub(crate) last_failure: Option<RelayFailureClass>,
+    pub(crate) last_failure_at: Option<UnixMillis>,
+    pub(crate) attempt_count: u64,
+    pub(crate) reorg_count: u64,
+}
+
+impl fmt::Debug for RelayJob {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RelayJob")
+            .field("reservation_id", &self.reservation_id)
+            .field("commitment", &self.commitment)
+            .field("artifact", &self.artifact)
+            .field("txid", &self.txid)
+            .field("wtxid", &self.wtxid)
+            .field("revision", &self.revision)
+            .field("due_at", &self.due_at)
+            .field("observation", &self.observation)
+            .field("last_failure", &self.last_failure)
+            .field("last_failure_at", &self.last_failure_at)
+            .field("attempt_count", &self.attempt_count)
+            .field("reorg_count", &self.reorg_count)
+            .finish()
+    }
+}
+
+impl RelayJob {
+    #[must_use]
+    pub const fn reservation_id(&self) -> ReservationId {
+        self.reservation_id
+    }
+
+    #[must_use]
+    pub const fn commitment(&self) -> SigningCommitment {
+        self.commitment
+    }
+
+    #[must_use]
+    pub const fn artifact(&self) -> SignedArtifactDigest {
+        self.artifact
+    }
+
+    #[must_use]
+    pub const fn txid(&self) -> Txid {
+        self.txid
+    }
+
+    #[must_use]
+    pub const fn wtxid(&self) -> Wtxid {
+        self.wtxid
+    }
+
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn due_at(&self) -> UnixMillis {
+        self.due_at
+    }
+
+    #[must_use]
+    pub const fn observation(&self) -> RelayObservation {
+        self.observation
+    }
+
+    #[must_use]
+    pub const fn last_failure(&self) -> Option<RelayFailureClass> {
+        self.last_failure
+    }
+
+    #[must_use]
+    pub const fn last_failure_at(&self) -> Option<UnixMillis> {
+        self.last_failure_at
+    }
+
+    #[must_use]
+    pub const fn attempt_count(&self) -> u64 {
+        self.attempt_count
+    }
+
+    #[must_use]
+    pub const fn reorg_count(&self) -> u64 {
+        self.reorg_count
+    }
+}
+
+/// One leased, revision-bound relay attempt.
+///
+/// This is the only public capability that exposes the exact serialized
+/// transaction. It is created durably before external relay I/O begins.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RelayAttempt {
+    pub(crate) reservation_id: ReservationId,
+    pub(crate) commitment: SigningCommitment,
+    pub(crate) artifact: SignedArtifactDigest,
+    pub(crate) txid: Txid,
+    pub(crate) wtxid: Wtxid,
+    pub(crate) transaction_bytes: Vec<u8>,
+    pub(crate) revision: u64,
+    pub(crate) retry_at: UnixMillis,
+    pub(crate) attempt_count: u64,
+}
+
+impl fmt::Debug for RelayAttempt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RelayAttempt")
+            .field("reservation_id", &self.reservation_id)
+            .field("commitment", &self.commitment)
+            .field("artifact", &self.artifact)
+            .field("txid", &self.txid)
+            .field("wtxid", &self.wtxid)
+            .field("transaction_bytes", &self.transaction_bytes.len())
+            .field("revision", &self.revision)
+            .field("retry_at", &self.retry_at)
+            .field("attempt_count", &self.attempt_count)
+            .finish()
+    }
+}
+
+impl RelayAttempt {
+    #[must_use]
+    pub const fn reservation_id(&self) -> ReservationId {
+        self.reservation_id
+    }
+
+    #[must_use]
+    pub const fn commitment(&self) -> SigningCommitment {
+        self.commitment
+    }
+
+    #[must_use]
+    pub const fn artifact(&self) -> SignedArtifactDigest {
+        self.artifact
+    }
+
+    #[must_use]
+    pub const fn txid(&self) -> Txid {
+        self.txid
+    }
+
+    #[must_use]
+    pub const fn wtxid(&self) -> Wtxid {
+        self.wtxid
+    }
+
+    #[must_use]
+    pub fn transaction_bytes(&self) -> &[u8] {
+        &self.transaction_bytes
+    }
+
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn retry_at(&self) -> UnixMillis {
+        self.retry_at
+    }
+
+    #[must_use]
+    pub const fn attempt_count(&self) -> u64 {
+        self.attempt_count
+    }
+}
+
+/// Current durable relay and reconciliation state for one signed reservation.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RelayRecord {
+    pub(crate) reservation_id: ReservationId,
+    pub(crate) commitment: SigningCommitment,
+    pub(crate) artifact: SignedArtifactDigest,
+    pub(crate) txid: Txid,
+    pub(crate) wtxid: Wtxid,
+    pub(crate) revision: u64,
+    pub(crate) observation: RelayObservation,
+    pub(crate) last_failure: Option<RelayFailureClass>,
+    pub(crate) last_failure_at: Option<UnixMillis>,
+    pub(crate) attempt_count: u64,
+    pub(crate) reorg_count: u64,
+    pub(crate) last_observed_at: Option<UnixMillis>,
+    pub(crate) next_attempt_at: Option<UnixMillis>,
+}
+
+impl fmt::Debug for RelayRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RelayRecord")
+            .field("reservation_id", &self.reservation_id)
+            .field("commitment", &self.commitment)
+            .field("artifact", &self.artifact)
+            .field("txid", &self.txid)
+            .field("wtxid", &self.wtxid)
+            .field("revision", &self.revision)
+            .field("observation", &self.observation)
+            .field("last_failure", &self.last_failure)
+            .field("last_failure_at", &self.last_failure_at)
+            .field("attempt_count", &self.attempt_count)
+            .field("reorg_count", &self.reorg_count)
+            .field("last_observed_at", &self.last_observed_at)
+            .field("next_attempt_at", &self.next_attempt_at)
+            .finish()
+    }
+}
+
+impl RelayRecord {
+    #[must_use]
+    pub const fn reservation_id(&self) -> ReservationId {
+        self.reservation_id
+    }
+
+    #[must_use]
+    pub const fn commitment(&self) -> SigningCommitment {
+        self.commitment
+    }
+
+    #[must_use]
+    pub const fn artifact(&self) -> SignedArtifactDigest {
+        self.artifact
+    }
+
+    #[must_use]
+    pub const fn txid(&self) -> Txid {
+        self.txid
+    }
+
+    #[must_use]
+    pub const fn wtxid(&self) -> Wtxid {
+        self.wtxid
+    }
+
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn observation(&self) -> RelayObservation {
+        self.observation
+    }
+
+    #[must_use]
+    pub const fn last_failure(&self) -> Option<RelayFailureClass> {
+        self.last_failure
+    }
+
+    #[must_use]
+    pub const fn last_failure_at(&self) -> Option<UnixMillis> {
+        self.last_failure_at
+    }
+
+    #[must_use]
+    pub const fn attempt_count(&self) -> u64 {
+        self.attempt_count
+    }
+
+    #[must_use]
+    pub const fn reorg_count(&self) -> u64 {
+        self.reorg_count
+    }
+
+    #[must_use]
+    pub const fn last_observed_at(&self) -> Option<UnixMillis> {
+        self.last_observed_at
+    }
+
+    #[must_use]
+    pub const fn next_attempt_at(&self) -> Option<UnixMillis> {
+        self.next_attempt_at
     }
 }
 

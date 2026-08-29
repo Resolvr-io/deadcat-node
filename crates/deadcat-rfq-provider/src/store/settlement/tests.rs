@@ -1764,7 +1764,10 @@ fn exact_signed_retry_uses_durable_state_before_live_chain_revalidation() {
     .commit(fixture.book(), &VALIDATION_TIME)
     .expect("initial commit");
     let job = committed.signing_job().expect("committed signing job");
-    let signed_bytes = vec![0x51_u8, 0x21, 0x02];
+    // The legacy test seam does not verify signatures, but relay persistence
+    // still requires a canonical PSET from which one exact transaction can be
+    // extracted.
+    let signed_bytes = canonical.clone();
     fixture
         .book()
         .record_signed(

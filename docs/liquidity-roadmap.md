@@ -495,9 +495,10 @@ An RFQ deadline is enforced by service behavior:
 4. while the reservation is live, have the provider durably commit its inputs
    to the exact validated pre-sign transcript;
 5. have the provider sign only that persisted transcript, then durably store
-   the signed response; and
+   the signed response and exact relay transaction before either is exposed;
+   and
 6. return the provider signature for that exact finalized transaction and
-   immediately relay it according to the quote policy.
+   immediately perform status-first relay according to the quote policy.
 
 The provider commitment creates accountability and operational firmness, not a
 consensus guarantee that the provider cannot fail. Once created, a transaction
@@ -509,7 +510,10 @@ may finish after the deadline when durable acceptance won beforehand. The
 client retains final
 verification and may relay the exact same transaction through any broadcaster.
 Ambiguous broadcast or deliberate conflict handling requires a documented
-state machine that checks the exact transaction and input outspends. An absolute
+state machine that checks the exact transaction and input outspends. The current
+provider implements that state machine with a durable relay lease, exact raw and
+witness-transaction matching, canonical confirmation checks, stable-tip
+mempool-aware input checks, and post-send reconciliation. An absolute
 transaction locktime cannot enforce an upper quote expiry.
 
 ### Public state
@@ -598,6 +602,18 @@ multi-venue end-to-end router proposed here:
   explicit `SIGHASH_ALL` targets. Destination non-reuse and authoritative scan
   freshness are backend obligations. The provider core itself intentionally
   owns no keys or concrete wallet backend.
+- Signed-artifact persistence also atomically creates a bounded durable relay
+  outbox entry containing the exact final transaction, its transaction and
+  witness transaction IDs, and an immediately due observation record. A
+  store-issued revision lease is persisted before a worker can access the raw
+  bytes. The Elements adapter reconciles exact status and canonical
+  confirmation first, checks all inputs under a stable tip, preflights only an
+  absent transaction whose inputs remain unspent, relays the same bytes, and
+  resolves ambiguous responses with another exact lookup. Relay observations,
+  failures, attempts, and reorganizations are returned with authenticated
+  signed status without ever changing the signed allocation. The daemon drains
+  due relay work before readiness and gates new quote, blind, and execute work
+  on relay health while keeping status recovery available.
 - [ADR 0008](adr/0008-rfq-service-owned-wallet.md) selects the first adjacent
   provider-wallet implementation: a versioned encrypted, in-memory-unlocked
   service seed; domain-separated BIP32 spend and SLIP-77 blinding derivation;
@@ -723,12 +739,13 @@ authenticated remote protocol and supervised handler now have a separate
 `deadcat-rfq` executable with protected credential-file unlock, explicit
 no-clobber initialization, open-existing-only restart, stable Iroh identity,
 authoritative Elements/txindex preflight, recovery-before-readiness,
-confidential deposit-address issuance, and graceful signal draining. Its first
-profile is intentionally regtest-only and statically configured; canonical
-market evidence, a production pricing source, relay/reconciliation,
-authenticated-owner request-rate limits, external backup freshness,
-process-kill acceptance coverage, host memory hardening, and HSM support remain
-outside the current slice.
+confidential deposit-address issuance, and graceful signal draining. Recovery
+before readiness covers both pending signing jobs and relay work currently due.
+Its first profile is intentionally regtest-only and statically configured;
+canonical market evidence, a production pricing source, authenticated-owner
+request-rate limits, external backup freshness, process-kill and live-Core
+relay/reorganization acceptance coverage, host memory hardening, and HSM
+support remain outside the current slice.
 The taker integration now implements the keyless whole-PSET authorization, the
 first concrete custom-wallet funding boundary, and a high-level one-provider
 quote-to-journal runtime. The wallet authenticates caller-supplied confidential
@@ -1109,8 +1126,10 @@ three independently designed fragment layouts compose safely.
   authenticated? RFQ provider inventory version one is fixed to tree-less P2TR
   key path with explicit `SIGHASH_ALL`.
 - ADR 0007 resolves reservation, commit-before-sign, signature persistence, and
-  permanent input retirement. Exact relay, ambiguous-broadcast, and canonical
-  outspend reconciliation remain to be specified with the service layer.
+  permanent input retirement. Its service layer now also resolves exact relay,
+  ambiguous-broadcast, canonical confirmation, and input-outspend
+  reconciliation. Production acceptance, fee-bump policy, and long-term relay
+  record retention remain operational decisions.
 - Which chain and mempool evidence is required before a route is considered
   fresh enough to display or sign?
 - When should multiple RFQ signers be allowed in one transaction?

@@ -38,7 +38,8 @@ pub use model::{
     AuditEntry, AuditEvent, Clock, FeePolicy, FeePolicyViolation, FeeSizeMetric, IdempotencyKey,
     InventoryBinding, InventoryItem, InventoryState, InventoryView, MAX_RESERVATION_INPUTS,
     MAX_SETTLEMENT_BYTES, ModelError, OwnerId, ProviderId, ProviderIdentity, QuoteCommitment,
-    QuoteRequestDigest, RecoveryAction, ReleaseReason, ReservationAccess, ReservationId,
+    QuoteRequestDigest, RecoveryAction, RelayAttempt, RelayFailureClass, RelayJob,
+    RelayObservation, RelayRecord, ReleaseReason, ReservationAccess, ReservationId,
     ReservationState, ReservationView, SignedArtifact, SignedArtifactDigest, SigningCommitment,
     SigningJob, SigningTarget, TransactionFee, UnixMillis, WalletKeyLocator,
 };
@@ -57,7 +58,7 @@ pub use quote::{
 pub use store::{
     AuthoritativePrevout, AuthorizedReservationStatus, CommitOutcome,
     DEFAULT_MAX_SETTLEMENT_INPUTS, DEFAULT_MAX_SETTLEMENT_OUTPUTS, MAX_EXPIRATION_BATCH,
-    MAX_PENDING_SIGNING_BATCH, ProviderBlindedPset, ProviderBlindingCoordinator,
+    MAX_PENDING_SIGNING_BATCH, MAX_RELAY_BATCH, ProviderBlindedPset, ProviderBlindingCoordinator,
     ProviderBlindingError, ProviderError, ProviderSettlementValidator, ProviderSigningCoordinator,
     ReservationBook, SCHEMA_VERSION, SettlementChainSource, SettlementInputPlacement,
     SettlementLayout, SettlementLayoutError, SettlementLimitsError, SettlementOutputPlacement,

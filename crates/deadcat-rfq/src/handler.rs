@@ -9,23 +9,24 @@ use deadcat_rfq_iroh::{
 };
 use deadcat_rfq_provider::{
     AuthorizedReservationStatus, Clock, DestinationSource, FeeSizeMetric, FirmQuote,
-    FirmQuoteRequest, IdempotencyKey, InventorySource, MAX_PENDING_SIGNING_BATCH, OwnerId,
-    PricingPolicy, ProviderBlindingCoordinator, ProviderBlindingError, ProviderIdentity,
+    FirmQuoteRequest, IdempotencyKey, InventorySource, MAX_PENDING_SIGNING_BATCH, MAX_RELAY_BATCH,
+    OwnerId, PricingPolicy, ProviderBlindingCoordinator, ProviderBlindingError, ProviderIdentity,
     ProviderOutputRecovery, ProviderSettlementValidator, ProviderSigner,
     ProviderSigningCoordinator, QuoteAdmissionError, QuoteBlinderRole, QuoteEngine,
-    QuoteEngineError, QuoteInputId, QuoteKind, QuoteOutputId, QuoteOutputRole, ReleaseReason,
-    ReservationAccess, ReservationId, ReservationState, SettlementChainSource,
-    SettlementInputPlacement, SettlementLayout, SettlementOutputPlacement,
-    SettlementValidationError,
+    QuoteEngineError, QuoteInputId, QuoteKind, QuoteOutputId, QuoteOutputRole, RelayFailureClass,
+    RelayObservation, RelayRecord, ReleaseReason, ReservationAccess, ReservationId,
+    ReservationState, SettlementChainSource, SettlementInputPlacement, SettlementLayout,
+    SettlementOutputPlacement, SettlementValidationError, UnixMillis,
 };
 use deadcat_rfq_rpc::{
     AssetAmountDto, BlinderRoleDto, FeePolicyDto, FeeSizeMetricDto, FirmQuoteDto,
     FirmQuoteRequestDto, FixedBytes32, IdempotencyKeyDto, InputPlacementDto, OutputPlacementDto,
     PricingDecisionDto, ProviderCapability, ProviderInfo, QuoteContextDto, QuoteExecutionDto,
     QuoteInputDto, QuoteKindDto, QuoteOutputDto, QuoteOutputRoleDto, QuoteRecipientDto,
-    RationalRateDto, ReleaseReasonDto, Request, ReservationStateDto, ReservationStatusDto,
-    Response, RpcError, RpcErrorCode, SettlementLayoutDto, SettlementPset, SignedFirmQuote,
-    SnapshotEvidenceDto, TxOutDto, owner_id_from_endpoints,
+    RationalRateDto, RelayFailureClassDto, RelayObservationDto, RelayStatusDto, ReleaseReasonDto,
+    Request, ReservationStateDto, ReservationStatusDto, Response, RpcError, RpcErrorCode,
+    SettlementLayoutDto, SettlementPset, SignedFirmQuote, SnapshotEvidenceDto, TxOutDto,
+    owner_id_from_endpoints,
 };
 use deadcat_types::{ChainIdentity, LiquidNetwork};
 use elements::Script;
@@ -37,6 +38,7 @@ use tokio::sync::{OwnedRwLockReadGuard, RwLock, Semaphore, mpsc, oneshot, watch}
 use tokio::task::JoinHandle;
 
 use crate::SharedRfqWallet;
+use crate::relay::ProviderRelaySource;
 
 const DEFAULT_EXECUTE_QUEUE_CAPACITY: usize = 8;
 const MAX_EXECUTE_QUEUE_CAPACITY: usize = 8;
@@ -46,6 +48,11 @@ const DEFAULT_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_INVENTORY_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_RECOVERY_BATCH_SIZE: usize = 64;
 const MAX_QUOTE_ATTEMPTS: usize = 2;
+const RELAY_ATTEMPT_LEASE: Duration = Duration::from_secs(2 * 60);
+const RELAY_RETRY_DELAY: Duration = Duration::from_secs(1);
+const RELAY_MEMPOOL_RECHECK: Duration = Duration::from_secs(5);
+const RELAY_CONFIRMED_RECHECK: Duration = Duration::from_secs(60);
+const RELAY_CONFLICT_RECHECK: Duration = Duration::from_secs(30);
 
 /// Bounded daemon supervision policy.
 #[derive(Clone, Debug)]
@@ -106,6 +113,9 @@ pub trait RfqBackend: Send + Sync + 'static {
     fn info(&self) -> Result<ProviderInfo, RpcError>;
     fn refresh_inventory(&self) -> Result<(), RpcError>;
     fn recover_pending(&self, limit: usize) -> Result<usize, RpcError>;
+    /// Reconcile and, when safe, relay a bounded batch of exact durable
+    /// signed settlements.
+    fn reconcile_relay(&self, limit: usize) -> Result<usize, RpcError>;
     fn quote(
         &self,
         owner: FixedBytes32,
@@ -155,7 +165,7 @@ where
     S: InventorySource,
     D: DestinationSource,
     P: PricingPolicy,
-    C: SettlementChainSource,
+    C: SettlementChainSource + ProviderRelaySource,
     W: RuntimeWallet,
     K: Clock,
 {
@@ -199,20 +209,42 @@ where
         &self,
         access: ReservationAccess,
     ) -> Result<ReservationStatusDto, RpcError> {
-        self.book()
+        let status = self
+            .book()
             .reservation_status_at(access, &self.clock)
-            .map_err(|error| map_provider_error(&error))
-            .and_then(|status| status_to_dto(&status))
+            .map_err(|error| map_provider_error(&error))?;
+        let relay = if matches!(
+            status.reservation().state(),
+            ReservationState::Signed { .. }
+        ) {
+            self.book()
+                .relay_record(status.reservation().id())
+                .map_err(|error| map_provider_error(&error))?
+        } else {
+            None
+        };
+        status_to_dto(&status, relay.as_ref())
     }
 
     fn authorized_status_readonly(
         &self,
         access: ReservationAccess,
     ) -> Result<ReservationStatusDto, RpcError> {
-        self.book()
+        let status = self
+            .book()
             .reservation_status(access)
-            .map_err(|error| map_provider_error(&error))
-            .and_then(|status| status_to_dto(&status))
+            .map_err(|error| map_provider_error(&error))?;
+        let relay = if matches!(
+            status.reservation().state(),
+            ReservationState::Signed { .. }
+        ) {
+            self.book()
+                .relay_record(status.reservation().id())
+                .map_err(|error| map_provider_error(&error))?
+        } else {
+            None
+        };
+        status_to_dto(&status, relay.as_ref())
     }
 }
 
@@ -221,7 +253,7 @@ where
     S: InventorySource + Send + Sync + 'static,
     D: DestinationSource + Send + Sync + 'static,
     P: PricingPolicy + Send + Sync + 'static,
-    C: SettlementChainSource + Send + Sync + 'static,
+    C: SettlementChainSource + ProviderRelaySource + Send + Sync + 'static,
     W: RuntimeWallet,
     K: Clock + Send + Sync + 'static,
 {
@@ -237,6 +269,7 @@ where
                 ProviderCapability::ProviderBlinding,
                 ProviderCapability::SettlementExecution,
                 ProviderCapability::DurableStatus,
+                ProviderCapability::SettlementRelay,
             ],
         })
     }
@@ -272,6 +305,66 @@ where
             })?;
         }
         Ok(recovered)
+    }
+
+    fn reconcile_relay(&self, limit: usize) -> Result<usize, RpcError> {
+        let now = self.clock.now();
+        let jobs = self
+            .book()
+            .due_relay_jobs(now, limit)
+            .map_err(|error| map_provider_error(&error))?;
+        let reconciled = jobs.len();
+        for job in jobs {
+            // The lease is persisted before the exact raw transaction becomes
+            // available to the chain adapter. If the process dies during an
+            // ambiguous send, the same outbox entry becomes due again without
+            // permitting another transaction to replace it.
+            let retry_at = checked_relay_time(self.clock.now(), RELAY_ATTEMPT_LEASE)?;
+            let attempt = self
+                .book()
+                .begin_relay_attempt(&job, retry_at, &self.clock)
+                .map_err(|error| map_provider_error(&error))?;
+            let result = self.chain.relay_once(&attempt);
+            let (observation, failure, delay, source_failed) = match result {
+                Ok(result) => {
+                    let observation = result.observation();
+                    let failure = result.last_failure();
+                    let delay = relay_recheck_delay(observation, failure);
+                    (observation, failure, delay, false)
+                }
+                Err(error) => {
+                    tracing::error!(
+                        reservation_id = ?attempt.reservation_id(),
+                        txid = %attempt.txid(),
+                        error = %error,
+                        "RFQ settlement relay/reconciliation failed"
+                    );
+                    (
+                        job.observation(),
+                        Some(error.class()),
+                        RELAY_RETRY_DELAY,
+                        true,
+                    )
+                }
+            };
+            let next_attempt_at = checked_relay_time(self.clock.now(), delay)?;
+            self.book()
+                .record_relay_outcome(
+                    &attempt,
+                    observation,
+                    failure,
+                    Some(next_attempt_at),
+                    &self.clock,
+                )
+                .map_err(|error| map_provider_error(&error))?;
+            if source_failed {
+                return Err(rpc_error(
+                    RpcErrorCode::BackendUnavailable,
+                    "provider relay backend is temporarily unavailable",
+                ));
+            }
+        }
+        Ok(reconciled)
     }
 
     fn quote(
@@ -403,6 +496,7 @@ pub struct AuthenticatedRfqHandler<B> {
 struct AdmissionState {
     accepting: bool,
     signer_healthy: bool,
+    relay_healthy: bool,
 }
 
 type AdmissionGate = RwLock<AdmissionState>;
@@ -410,6 +504,7 @@ type AdmissionGate = RwLock<AdmissionState>;
 struct WorkerTasks {
     execute: JoinHandle<()>,
     signing: JoinHandle<()>,
+    relay: JoinHandle<()>,
     inventory: JoinHandle<()>,
 }
 
@@ -417,6 +512,7 @@ struct HandlerSupervisor {
     admission: Arc<AdmissionGate>,
     execute_shutdown: watch::Sender<bool>,
     signing_shutdown: watch::Sender<bool>,
+    relay_shutdown: watch::Sender<bool>,
     inventory_shutdown: watch::Sender<bool>,
     tasks: Mutex<Option<WorkerTasks>>,
 }
@@ -438,6 +534,11 @@ impl HandlerSupervisor {
             let _ = tasks.execute.await;
             let _ = self.signing_shutdown.send(true);
             let _ = tasks.signing.await;
+            // Signing may have created a final relay outbox entry. Relay gets
+            // one last bounded drain only after no more signed artifacts can
+            // appear during this shutdown.
+            let _ = self.relay_shutdown.send(true);
+            let _ = tasks.relay.await;
             let _ = tasks.inventory.await;
         }
     }
@@ -450,12 +551,14 @@ impl Drop for HandlerSupervisor {
         }
         let _ = self.execute_shutdown.send(true);
         let _ = self.signing_shutdown.send(true);
+        let _ = self.relay_shutdown.send(true);
         let _ = self.inventory_shutdown.send(true);
         if let Ok(tasks) = self.tasks.get_mut()
             && let Some(tasks) = tasks.take()
         {
             tasks.execute.abort();
             tasks.signing.abort();
+            tasks.relay.abort();
             tasks.inventory.abort();
         }
     }
@@ -519,11 +622,18 @@ impl<B: RfqBackend> AuthenticatedRfqHandler<B> {
         // recovered signing job can reach the signer after restart.
         let startup_backend = Arc::clone(&backend);
         let recovery_batch_size = config.recovery_batch_size;
+        let relay_batch_size = recovery_batch_size.min(MAX_RELAY_BATCH);
         tokio::task::spawn_blocking(move || {
             startup_backend.refresh_inventory()?;
             loop {
                 let recovered = startup_backend.recover_pending(recovery_batch_size)?;
                 if recovered < recovery_batch_size {
+                    break;
+                }
+            }
+            loop {
+                let reconciled = startup_backend.reconcile_relay(relay_batch_size)?;
+                if reconciled < relay_batch_size {
                     return Ok::<(), RpcError>(());
                 }
             }
@@ -537,12 +647,15 @@ impl<B: RfqBackend> AuthenticatedRfqHandler<B> {
         // command actively owned by the daemon worker.
         let (execute_tx, execute_rx) = mpsc::channel(config.execute_queue_capacity);
         let (signing_tx, signing_rx) = mpsc::channel(1);
+        let (relay_tx, relay_rx) = mpsc::channel(1);
         let (execute_shutdown, execute_shutdown_rx) = watch::channel(false);
         let (signing_shutdown, signing_shutdown_rx) = watch::channel(false);
+        let (relay_shutdown, relay_shutdown_rx) = watch::channel(false);
         let (inventory_shutdown, inventory_shutdown_rx) = watch::channel(false);
         let admission = Arc::new(RwLock::new(AdmissionState {
             accepting: true,
             signer_healthy: true,
+            relay_healthy: true,
         }));
         let execute_task = tokio::spawn(execute_worker(
             Arc::clone(&backend),
@@ -554,10 +667,19 @@ impl<B: RfqBackend> AuthenticatedRfqHandler<B> {
         let signing_task = tokio::spawn(signing_worker(
             Arc::clone(&backend),
             signing_rx,
+            relay_tx,
             Arc::clone(&admission),
             config.recovery_batch_size,
             config.recovery_interval,
             signing_shutdown_rx,
+        ));
+        let relay_task = tokio::spawn(relay_worker(
+            Arc::clone(&backend),
+            relay_rx,
+            Arc::clone(&admission),
+            relay_batch_size,
+            config.recovery_interval,
+            relay_shutdown_rx,
         ));
         let inventory_task = tokio::spawn(inventory_worker(
             Arc::clone(&backend),
@@ -568,10 +690,12 @@ impl<B: RfqBackend> AuthenticatedRfqHandler<B> {
             admission: Arc::clone(&admission),
             execute_shutdown,
             signing_shutdown,
+            relay_shutdown,
             inventory_shutdown,
             tasks: Mutex::new(Some(WorkerTasks {
                 execute: execute_task,
                 signing: signing_task,
+                relay: relay_task,
                 inventory: inventory_task,
             })),
         });
@@ -816,6 +940,7 @@ async fn process_execute_command<B: RfqBackend>(
 async fn signing_worker<B: RfqBackend>(
     backend: Arc<B>,
     mut notifications: mpsc::Receiver<()>,
+    relay_tx: mpsc::Sender<()>,
     admission: Arc<AdmissionGate>,
     recovery_batch_size: usize,
     recovery_interval: Duration,
@@ -841,9 +966,23 @@ async fn signing_worker<B: RfqBackend>(
             })
             .await;
             match result {
-                Ok(Ok(recovered)) if recovered == recovery_batch_size => {}
-                Ok(Ok(_)) if shutting_down => return,
-                Ok(Ok(_)) => break,
+                Ok(Ok(recovered)) if recovered == recovery_batch_size => {
+                    if recovered != 0 {
+                        let _ = relay_tx.try_send(());
+                    }
+                }
+                Ok(Ok(recovered)) if shutting_down => {
+                    if recovered != 0 {
+                        let _ = relay_tx.try_send(());
+                    }
+                    return;
+                }
+                Ok(Ok(recovered)) => {
+                    if recovered != 0 {
+                        let _ = relay_tx.try_send(());
+                    }
+                    break;
+                }
                 Ok(Err(error)) => {
                     mark_signer_degraded(Arc::clone(&admission)).await;
                     tracing::error!(error = %error.message(), "RFQ signer degraded; quote, blind, and execute admission stopped");
@@ -870,8 +1009,91 @@ async fn signing_worker<B: RfqBackend>(
     }
 }
 
+async fn relay_worker<B: RfqBackend>(
+    backend: Arc<B>,
+    mut notifications: mpsc::Receiver<()>,
+    admission: Arc<AdmissionGate>,
+    relay_batch_size: usize,
+    recovery_interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut recovery = tokio::time::interval_at(
+        tokio::time::Instant::now() + recovery_interval,
+        recovery_interval,
+    );
+    recovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut degraded = false;
+    loop {
+        let shutting_down = tokio::select! {
+            _ = shutdown.changed() => true,
+            notification = notifications.recv() => notification.is_none(),
+            _ = recovery.tick() => false,
+        };
+        let mut reconciled_any = false;
+        loop {
+            let relay_backend = Arc::clone(&backend);
+            let result = tokio::task::spawn_blocking(move || {
+                relay_backend.reconcile_relay(relay_batch_size)
+            })
+            .await;
+            match result {
+                Ok(Ok(reconciled)) if reconciled == relay_batch_size => {
+                    // Continue until one full due pass succeeds before
+                    // advertising recovery from a prior backend failure.
+                    reconciled_any |= reconciled != 0;
+                }
+                Ok(Ok(reconciled)) => {
+                    // A successful due reconciliation proves recovery from a
+                    // prior Core failure. An empty batch alone does not: the
+                    // failed leased item may simply not be due again yet.
+                    if degraded && (reconciled_any || reconciled != 0) {
+                        mark_relay_healthy(Arc::clone(&admission)).await;
+                        degraded = false;
+                    }
+                    if shutting_down {
+                        return;
+                    }
+                    break;
+                }
+                Ok(Err(error)) => {
+                    mark_relay_degraded(Arc::clone(&admission)).await;
+                    degraded = true;
+                    tracing::error!(
+                        error = %error.message(),
+                        "RFQ relay degraded; quote, blind, and execute admission stopped"
+                    );
+                    if shutting_down {
+                        return;
+                    }
+                    break;
+                }
+                Err(error) => {
+                    mark_relay_degraded(Arc::clone(&admission)).await;
+                    degraded = true;
+                    tracing::error!(
+                        error = %error,
+                        "RFQ relay worker panicked; quote, blind, and execute admission stopped"
+                    );
+                    if shutting_down {
+                        return;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
 async fn mark_signer_degraded(admission: Arc<AdmissionGate>) {
     admission.write().await.signer_healthy = false;
+}
+
+async fn mark_relay_degraded(admission: Arc<AdmissionGate>) {
+    admission.write().await.relay_healthy = false;
+}
+
+async fn mark_relay_healthy(admission: Arc<AdmissionGate>) {
+    admission.write().await.relay_healthy = true;
 }
 
 async fn inventory_worker<B: RfqBackend>(
@@ -913,6 +1135,12 @@ async fn admission_guard(
         return Err(rpc_error(
             RpcErrorCode::BackendUnavailable,
             "provider signer requires operator recovery",
+        ));
+    }
+    if !state.relay_healthy {
+        return Err(rpc_error(
+            RpcErrorCode::BackendUnavailable,
+            "provider relay requires recovery",
         ));
     }
     Ok(state)
@@ -1181,25 +1409,37 @@ fn recipient_to_dto(recipient: &deadcat_rfq_provider::QuoteRecipient) -> QuoteRe
     }
 }
 
-fn status_to_dto(status: &AuthorizedReservationStatus) -> Result<ReservationStatusDto, RpcError> {
+fn status_to_dto(
+    status: &AuthorizedReservationStatus,
+    relay: Option<&RelayRecord>,
+) -> Result<ReservationStatusDto, RpcError> {
     let reservation = status.reservation();
     let state = match reservation.state() {
-        ReservationState::Reserved => ReservationStateDto::Reserved,
+        ReservationState::Reserved => {
+            ensure_no_relay_record(relay)?;
+            ReservationStateDto::Reserved
+        }
         ReservationState::Released { reason, at } => ReservationStateDto::Released {
-            reason: match reason {
-                ReleaseReason::Expired => ReleaseReasonDto::Expired,
-                ReleaseReason::ClientCancelled => ReleaseReasonDto::ClientCancelled,
-                ReleaseReason::ProviderRejected => ReleaseReasonDto::ProviderRejected,
+            reason: {
+                ensure_no_relay_record(relay)?;
+                match reason {
+                    ReleaseReason::Expired => ReleaseReasonDto::Expired,
+                    ReleaseReason::ClientCancelled => ReleaseReasonDto::ClientCancelled,
+                    ReleaseReason::ProviderRejected => ReleaseReasonDto::ProviderRejected,
+                }
             },
             at_millis: at.value(),
         },
         ReservationState::Committed {
             commitment,
             committed_at,
-        } => ReservationStateDto::Committed {
-            signing_commitment: FixedBytes32::new(commitment.to_bytes()),
-            committed_at_millis: committed_at.value(),
-        },
+        } => {
+            ensure_no_relay_record(relay)?;
+            ReservationStateDto::Committed {
+                signing_commitment: FixedBytes32::new(commitment.to_bytes()),
+                committed_at_millis: committed_at.value(),
+            }
+        }
         ReservationState::Signed {
             commitment,
             artifact,
@@ -1210,6 +1450,12 @@ fn status_to_dto(status: &AuthorizedReservationStatus) -> Result<ReservationStat
                 rpc_error(
                     RpcErrorCode::InternalError,
                     "signed reservation is missing its durable artifact",
+                )
+            })?;
+            let relay = relay.ok_or_else(|| {
+                rpc_error(
+                    RpcErrorCode::InternalError,
+                    "signed reservation is missing its durable relay record",
                 )
             })?;
             ReservationStateDto::Signed {
@@ -1223,6 +1469,7 @@ fn status_to_dto(status: &AuthorizedReservationStatus) -> Result<ReservationStat
                         "durable signed artifact is not a valid PSET",
                     )
                 })?,
+                relay: relay_to_dto(relay),
             }
         }
     };
@@ -1241,6 +1488,54 @@ fn status_to_dto(status: &AuthorizedReservationStatus) -> Result<ReservationStat
         )
     })?;
     Ok(dto)
+}
+
+fn ensure_no_relay_record(relay: Option<&RelayRecord>) -> Result<(), RpcError> {
+    if relay.is_some() {
+        return Err(rpc_error(
+            RpcErrorCode::InternalError,
+            "unsigned reservation unexpectedly has a relay record",
+        ));
+    }
+    Ok(())
+}
+
+fn relay_to_dto(relay: &RelayRecord) -> RelayStatusDto {
+    RelayStatusDto {
+        txid: relay.txid(),
+        wtxid: relay.wtxid(),
+        revision: relay.revision(),
+        observation: match relay.observation() {
+            RelayObservation::Unobserved => RelayObservationDto::Unobserved,
+            RelayObservation::BroadcastAccepted => RelayObservationDto::BroadcastAccepted,
+            RelayObservation::Mempool => RelayObservationDto::Mempool,
+            RelayObservation::Confirmed {
+                block_hash,
+                block_height,
+            } => RelayObservationDto::Confirmed {
+                block_hash,
+                block_height,
+            },
+            RelayObservation::Absent => RelayObservationDto::Absent,
+            RelayObservation::Conflicted {
+                spent_input,
+                conflicting_txid,
+            } => RelayObservationDto::Conflicted {
+                spent_input,
+                conflicting_txid,
+            },
+        },
+        last_observed_at_millis: relay.last_observed_at().map(UnixMillis::value),
+        next_attempt_at_millis: relay.next_attempt_at().map(UnixMillis::value),
+        last_failure: relay.last_failure().map(|failure| match failure {
+            RelayFailureClass::BackendUnavailable => RelayFailureClassDto::BackendUnavailable,
+            RelayFailureClass::PolicyRejected => RelayFailureClassDto::PolicyRejected,
+            RelayFailureClass::InvalidBackendData => RelayFailureClassDto::InvalidBackendData,
+        }),
+        last_failure_at_millis: relay.last_failure_at().map(UnixMillis::value),
+        attempt_count: relay.attempt_count(),
+        reorg_count: relay.reorg_count(),
+    }
 }
 
 fn map_quote_error<S, D, P>(error: QuoteEngineError<S, D, P>) -> RpcError
@@ -1396,6 +1691,46 @@ fn rpc_error(code: RpcErrorCode, message: &'static str) -> RpcError {
     RpcError::new(code, message).expect("static runtime RPC error satisfies public bounds")
 }
 
+fn checked_relay_time(now: UnixMillis, delay: Duration) -> Result<UnixMillis, RpcError> {
+    let delay = u64::try_from(delay.as_millis()).map_err(|_| {
+        rpc_error(
+            RpcErrorCode::InternalError,
+            "provider relay schedule exceeds its supported time range",
+        )
+    })?;
+    now.value()
+        .checked_add(delay)
+        .map(UnixMillis::new)
+        .ok_or_else(|| {
+            rpc_error(
+                RpcErrorCode::InternalError,
+                "provider relay schedule exceeds its supported time range",
+            )
+        })
+}
+
+fn relay_recheck_delay(
+    observation: RelayObservation,
+    failure: Option<RelayFailureClass>,
+) -> Duration {
+    if let Some(failure) = failure {
+        return match failure {
+            RelayFailureClass::PolicyRejected => RELAY_CONFLICT_RECHECK,
+            RelayFailureClass::BackendUnavailable | RelayFailureClass::InvalidBackendData => {
+                RELAY_RETRY_DELAY
+            }
+        };
+    }
+    match observation {
+        RelayObservation::Unobserved
+        | RelayObservation::BroadcastAccepted
+        | RelayObservation::Absent => RELAY_RETRY_DELAY,
+        RelayObservation::Mempool => RELAY_MEMPOOL_RECHECK,
+        RelayObservation::Confirmed { .. } => RELAY_CONFIRMED_RECHECK,
+        RelayObservation::Conflicted { .. } => RELAY_CONFLICT_RECHECK,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1447,6 +1782,8 @@ mod tests {
         provider: EndpointId,
         owners: Arc<Mutex<Vec<FixedBytes32>>>,
         recoveries: Arc<AtomicUsize>,
+        relay_due: Arc<AtomicUsize>,
+        relay_fails: Arc<AtomicBool>,
         startup_events: Arc<Mutex<Vec<&'static str>>>,
         recovery_fails: Arc<AtomicBool>,
         recovery: Arc<RecoveryState>,
@@ -1505,6 +1842,29 @@ mod tests {
                 ));
             }
             Ok(0)
+        }
+
+        fn reconcile_relay(&self, limit: usize) -> Result<usize, RpcError> {
+            self.startup_events.lock().expect("events").push("relay");
+            if self.relay_fails.load(Ordering::SeqCst) {
+                return Err(rpc_error(
+                    RpcErrorCode::BackendUnavailable,
+                    "injected relay failure",
+                ));
+            }
+            let mut current = self.relay_due.load(Ordering::SeqCst);
+            loop {
+                let reconciled = current.min(limit);
+                match self.relay_due.compare_exchange(
+                    current,
+                    current - reconciled,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => return Ok(reconciled),
+                    Err(actual) => current = actual,
+                }
+            }
         }
 
         fn quote(
@@ -1589,6 +1949,8 @@ mod tests {
         backend: FakeBackend,
         owners: Arc<Mutex<Vec<FixedBytes32>>>,
         recoveries: Arc<AtomicUsize>,
+        relay_due: Arc<AtomicUsize>,
+        relay_fails: Arc<AtomicBool>,
         startup_events: Arc<Mutex<Vec<&'static str>>>,
         recovery_fails: Arc<AtomicBool>,
         recovery: Arc<RecoveryState>,
@@ -1600,6 +1962,8 @@ mod tests {
     fn fake_backend(provider: EndpointId) -> FakeHarness {
         let owners = Arc::new(Mutex::new(Vec::new()));
         let recoveries = Arc::new(AtomicUsize::new(0));
+        let relay_due = Arc::new(AtomicUsize::new(0));
+        let relay_fails = Arc::new(AtomicBool::new(false));
         let startup_events = Arc::new(Mutex::new(Vec::new()));
         let recovery_fails = Arc::new(AtomicBool::new(false));
         let recovery = Arc::new(RecoveryState::default());
@@ -1611,6 +1975,8 @@ mod tests {
                 provider,
                 owners: Arc::clone(&owners),
                 recoveries: Arc::clone(&recoveries),
+                relay_due: Arc::clone(&relay_due),
+                relay_fails: Arc::clone(&relay_fails),
                 startup_events: Arc::clone(&startup_events),
                 recovery_fails: Arc::clone(&recovery_fails),
                 recovery: Arc::clone(&recovery),
@@ -1620,6 +1986,8 @@ mod tests {
             },
             owners,
             recoveries,
+            relay_due,
+            relay_fails,
             startup_events,
             recovery_fails,
             recovery,
@@ -1723,7 +2091,7 @@ mod tests {
         assert_eq!(recoveries.load(Ordering::SeqCst), 1);
         assert_eq!(
             startup_events.lock().expect("events").as_slice(),
-            ["refresh", "recover"]
+            ["refresh", "recover", "relay"]
         );
 
         let response = handler
@@ -1868,6 +2236,70 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), handler.shutdown())
             .await
             .expect("persistent signer failure cannot hang shutdown");
+    }
+
+    #[tokio::test]
+    async fn relay_degradation_stops_new_trades_and_recovers_after_a_due_success() {
+        let provider_key = SecretKey::from_bytes(&[43; 32]);
+        let client = SecretKey::from_bytes(&[44; 32]).public();
+        let FakeHarness {
+            backend,
+            relay_due,
+            relay_fails,
+            ..
+        } = fake_backend(provider_key.public());
+        let handler = AuthenticatedRfqHandler::start_with_config(
+            backend,
+            provider_key,
+            HandlerConfig {
+                recovery_interval: Duration::from_millis(10),
+                inventory_refresh_interval: Duration::from_secs(60),
+                ..HandlerConfig::default()
+            },
+        )
+        .await
+        .expect("handler");
+
+        relay_due.store(1, Ordering::SeqCst);
+        relay_fails.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while handler.admission.read().await.relay_healthy {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("relay degradation observed");
+
+        let status = handler
+            .handle(
+                *client.as_bytes(),
+                Request::GetReservationStatus {
+                    reservation_id: FixedBytes32::new([7; 32]),
+                },
+            )
+            .await
+            .expect("status remains readable while relay is degraded");
+        assert!(matches!(status, Response::ReservationStatus { .. }));
+        let error = handler
+            .handle(*client.as_bytes(), quote_request())
+            .await
+            .expect_err("new quote is gated while relay is degraded");
+        assert_eq!(error.code(), RpcErrorCode::BackendUnavailable);
+
+        relay_fails.store(false, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !handler.admission.read().await.relay_healthy {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("successful due reconciliation heals relay admission");
+        let error = handler
+            .handle(*client.as_bytes(), quote_request())
+            .await
+            .expect_err("fake backend still rejects the market");
+        assert_eq!(error.code(), RpcErrorCode::UnsupportedMarket);
+        handler.shutdown().await;
     }
 
     #[tokio::test]
