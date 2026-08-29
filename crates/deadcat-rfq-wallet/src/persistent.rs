@@ -1,15 +1,19 @@
 use core::fmt;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
+use deadcat_client::composition::CompositionLayout;
+use deadcat_client::venue::RouteAuthorization;
+use deadcat_rfq_client::{OwnedOutputValidation, TakerWalletBlindingJob, TakerWalletSigningJob};
 use deadcat_rfq_provider::{
     ConfidentialDestination, DestinationPurpose, DestinationSource, ProviderIdentity,
     ProviderOutputRecovery, ProviderSigner, SigningJob, SigningResponse, WalletKeyLocator,
     WalletOwnedOutput,
 };
+use elements::pset::PartiallySignedTransaction;
 use elements::{AssetId, OutPoint, TxOut};
 use rand::rngs::OsRng;
 use rand::{CryptoRng, RngCore};
@@ -23,6 +27,8 @@ use subtle::ConstantTimeEq as _;
 use tempfile::TempPath;
 use thiserror::Error;
 
+use crate::taker::{TakerInputBinding, TakerOutputBinding, TakerWalletIdentity, TakerWalletUtxo};
+use crate::wallet::WalletSigningTarget;
 use crate::{
     DEFAULT_KDF_PARAMS, EncryptedKeystore, KdfParams, KeystoreError, RfqWallet, RfqWalletError,
 };
@@ -199,6 +205,26 @@ impl PersistentRfqWallet<OsRng> {
         Self::create_with_kdf(path, identity, passphrase, DEFAULT_KDF_PARAMS)
     }
 
+    /// Create a taker wallet without exposing the provider-specific storage
+    /// identity retained for on-disk compatibility.
+    pub fn create_taker(
+        path: impl AsRef<Path>,
+        identity: TakerWalletIdentity,
+        passphrase: &[u8],
+    ) -> Result<Self, PersistentWalletError> {
+        Self::create(path, identity.wallet_identity(), passphrase)
+    }
+
+    /// Create a taker wallet with an explicit bounded KDF profile.
+    pub fn create_taker_with_kdf(
+        path: impl AsRef<Path>,
+        identity: TakerWalletIdentity,
+        passphrase: &[u8],
+        kdf: KdfParams,
+    ) -> Result<Self, PersistentWalletError> {
+        Self::create_with_kdf(path, identity.wallet_identity(), passphrase, kdf)
+    }
+
     /// Create a new wallet using an explicitly selected bounded KDF profile.
     pub fn create_with_kdf(
         path: impl AsRef<Path>,
@@ -220,6 +246,15 @@ impl PersistentRfqWallet<OsRng> {
         Self::open_with_rng(path.as_ref(), identity, passphrase, OsRng)
     }
 
+    /// Open an existing taker wallet through its taker-facing identity.
+    pub fn open_taker(
+        path: impl AsRef<Path>,
+        identity: TakerWalletIdentity,
+        passphrase: &[u8],
+    ) -> Result<Self, PersistentWalletError> {
+        Self::open(path, identity.wallet_identity(), passphrase)
+    }
+
     /// Restore an authenticated wallet-only backup into an absent path.
     ///
     /// The caller must reconcile the accompanying provider database and chain
@@ -232,6 +267,16 @@ impl PersistentRfqWallet<OsRng> {
         backup: &WalletBackup,
     ) -> Result<Self, PersistentWalletError> {
         Self::restore_with_rng(path.as_ref(), identity, passphrase, backup, OsRng)
+    }
+
+    /// Restore a taker wallet-only backup through its taker-facing identity.
+    pub fn restore_taker(
+        path: impl AsRef<Path>,
+        identity: TakerWalletIdentity,
+        passphrase: &[u8],
+        backup: &WalletBackup,
+    ) -> Result<Self, PersistentWalletError> {
+        Self::restore(path, identity.wallet_identity(), passphrase, backup)
     }
 }
 
@@ -365,6 +410,213 @@ impl<R: RngCore + CryptoRng + Send> PersistentRfqWallet<R> {
         self.wallet
             .recover_owned_output(locator, outpoint, txout)
             .map_err(PersistentWalletError::from)
+    }
+
+    /// Authenticate one chain-discovered output as spendable taker funding.
+    ///
+    /// The returned value exposes only clear asset/amount and public recovery
+    /// metadata. Its confidential opening remains behind this wallet's
+    /// blinding boundary.
+    pub fn recover_taker_utxo(
+        &self,
+        locator: WalletKeyLocator,
+        outpoint: OutPoint,
+        txout: TxOut,
+    ) -> Result<TakerWalletUtxo, PersistentWalletError> {
+        let owned = self.recover_owned_output(locator, outpoint, txout)?;
+        let utxo = TakerWalletUtxo::from_owned(&owned);
+        if !self.catalog_snapshot()?.locators().contains(&locator) {
+            return Err(PersistentWalletError::TakerLocatorNotCataloged);
+        }
+        Ok(utxo)
+    }
+
+    /// Issue a durable destination for an RFQ taker's received asset.
+    pub fn fresh_taker_receive_destination(
+        &self,
+    ) -> Result<ConfidentialDestination, PersistentWalletError> {
+        self.issue_destination(IssuancePurpose::Settlement(
+            DestinationPurpose::SettlementReceive,
+        ))
+    }
+
+    pub(crate) fn validate_taker_inventory(
+        &self,
+        inventory: &[TakerWalletUtxo],
+    ) -> Result<(), PersistentWalletError> {
+        let _operation_guard = self.lock_operations()?;
+        self.ensure_healthy()?;
+        let state = read_and_validate_state(&self.database, &self.wallet, self.identity)?;
+        let catalog = state
+            .entries
+            .iter()
+            .map(|entry| entry.locator)
+            .collect::<BTreeSet<_>>();
+        for utxo in inventory {
+            if !catalog.contains(&utxo.locator()) {
+                return Err(PersistentWalletError::TakerLocatorNotCataloged);
+            }
+            let destination = self
+                .wallet
+                .recover_confidential_destination(utxo.locator())?;
+            if destination.script_pubkey() != &utxo.txout().script_pubkey
+                || destination.internal_key() != utxo.internal_key()
+            {
+                return Err(PersistentWalletError::UnknownTakerWalletDestination);
+            }
+            ProviderOutputRecovery::validate_confidential_output(
+                &self.wallet,
+                utxo.locator(),
+                utxo.internal_key(),
+                utxo.txout(),
+                utxo.asset(),
+                utxo.amount(),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn blind_scoped_taker_job(
+        &self,
+        job: TakerWalletBlindingJob,
+        expected_route: &RouteAuthorization,
+        expected_layout: &CompositionLayout,
+        bindings: &BTreeMap<usize, TakerInputBinding>,
+    ) -> Result<PartiallySignedTransaction, PersistentWalletError> {
+        let _operation_guard = self.lock_operations()?;
+        self.ensure_healthy()?;
+        if job.chain().genesis_hash != self.identity.genesis_hash()
+            || job.route().request().context().policy_asset != self.identity.policy_asset()
+        {
+            return Err(PersistentWalletError::TakerChainIdentityMismatch);
+        }
+        if job.route() != expected_route || job.layout() != expected_layout {
+            return Err(PersistentWalletError::TakerRouteBindingMismatch);
+        }
+        let actual_indices = job
+            .wallet_input_indices()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if actual_indices != bindings.keys().copied().collect() {
+            return Err(PersistentWalletError::TakerInputBindingMismatch);
+        }
+        let mut openings = HashMap::with_capacity(bindings.len());
+        for &index in job.wallet_input_indices() {
+            let input = job
+                .pset()
+                .inputs()
+                .get(index)
+                .ok_or(PersistentWalletError::InvalidTakerWalletIndex(index))?;
+            let prevout = job
+                .prevouts()
+                .get(index)
+                .ok_or(PersistentWalletError::InvalidTakerWalletIndex(index))?;
+            let binding = bindings
+                .get(&index)
+                .ok_or(PersistentWalletError::TakerInputBindingMismatch)?;
+            let internal_key = input
+                .tap_internal_key
+                .ok_or(PersistentWalletError::MissingTakerInternalKey(index))?;
+            if internal_key != binding.internal_key
+                || prevout.outpoint() != binding.outpoint
+                || prevout.txout() != &binding.txout
+                || OutPoint::new(input.previous_txid, input.previous_output_index)
+                    != binding.outpoint
+                || input
+                    .witness_utxo
+                    .as_ref()
+                    .is_none_or(|witness_utxo| !same_prevout_body(witness_utxo, &binding.txout))
+                || input.in_utxo_rangeproof != binding.txout.witness.rangeproof
+            {
+                return Err(PersistentWalletError::TakerInputBindingMismatch);
+            }
+            let opening = self.wallet.recover_taker_input_opening(
+                binding.locator,
+                binding.internal_key,
+                prevout.txout(),
+            )?;
+            if openings.insert(index, opening).is_some() {
+                return Err(PersistentWalletError::TakerInputBindingMismatch);
+            }
+        }
+        self.wallet
+            .blind_taker_pset(job.into_pset(), &openings)
+            .map_err(PersistentWalletError::from)
+    }
+
+    pub(crate) fn sign_scoped_taker_job(
+        &self,
+        job: TakerWalletSigningJob,
+        bindings: &BTreeMap<usize, TakerInputBinding>,
+    ) -> Result<PartiallySignedTransaction, PersistentWalletError> {
+        let _operation_guard = self.lock_operations()?;
+        self.ensure_healthy()?;
+        if job.chain().genesis_hash != self.identity.genesis_hash() {
+            return Err(PersistentWalletError::TakerChainIdentityMismatch);
+        }
+        let actual_indices = job
+            .wallet_input_indices()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if actual_indices != bindings.keys().copied().collect() {
+            return Err(PersistentWalletError::TakerInputBindingMismatch);
+        }
+        let mut targets = Vec::with_capacity(bindings.len());
+        for &index in job.wallet_input_indices() {
+            let input = job
+                .pset()
+                .inputs()
+                .get(index)
+                .ok_or(PersistentWalletError::InvalidTakerWalletIndex(index))?;
+            let prevout = job
+                .prevouts()
+                .get(index)
+                .ok_or(PersistentWalletError::InvalidTakerWalletIndex(index))?;
+            let binding = bindings
+                .get(&index)
+                .ok_or(PersistentWalletError::TakerInputBindingMismatch)?;
+            if input.tap_internal_key != Some(binding.internal_key)
+                || prevout.outpoint() != binding.outpoint
+                || prevout.txout() != &binding.txout
+                || OutPoint::new(input.previous_txid, input.previous_output_index)
+                    != binding.outpoint
+                || input
+                    .witness_utxo
+                    .as_ref()
+                    .is_none_or(|witness_utxo| !same_prevout_body(witness_utxo, &binding.txout))
+                || input.in_utxo_rangeproof != binding.txout.witness.rangeproof
+            {
+                return Err(PersistentWalletError::TakerInputBindingMismatch);
+            }
+            targets.push(WalletSigningTarget {
+                outpoint: prevout.outpoint(),
+                locator: binding.locator,
+                internal_key: binding.internal_key,
+            });
+        }
+        self.wallet
+            .sign_taker_pset(job.into_pset(), &targets)
+            .map_err(PersistentWalletError::from)
+    }
+
+    pub(crate) fn validate_scoped_taker_output(
+        &self,
+        output: OwnedOutputValidation<'_>,
+        binding: &TakerOutputBinding,
+    ) -> Result<(), PersistentWalletError> {
+        let _operation_guard = self.lock_operations()?;
+        self.ensure_healthy()?;
+        ProviderOutputRecovery::validate_confidential_output(
+            &self.wallet,
+            binding.locator,
+            binding.internal_key,
+            output.txout(),
+            output.expectation().asset(),
+            output.expectation().amount(),
+        )?;
+        Ok(())
     }
 
     /// Read the catalog revision without retaining a database snapshot. A
@@ -976,6 +1228,13 @@ fn identity_bytes(identity: ProviderIdentity) -> [u8; 96] {
     bytes
 }
 
+fn same_prevout_body(actual: &TxOut, expected: &TxOut) -> bool {
+    actual.asset == expected.asset
+        && actual.value == expected.value
+        && actual.nonce == expected.nonce
+        && actual.script_pubkey == expected.script_pubkey
+}
+
 fn read_metadata_vec(
     table: &impl ReadableTable<&'static str, &'static [u8]>,
     key: &'static str,
@@ -1350,6 +1609,24 @@ pub enum PersistentWalletError {
     CatalogCheckpointMismatch,
     #[error("wallet destination entropy was exhausted by repeated catalog collisions")]
     DestinationEntropyExhausted,
+    #[error("taker wallet job is bound to a different chain or policy asset")]
+    TakerChainIdentityMismatch,
+    #[error("taker wallet job references invalid wallet input index {0}")]
+    InvalidTakerWalletIndex(usize),
+    #[error("taker wallet input {0} is missing its Taproot internal key")]
+    MissingTakerInternalKey(usize),
+    #[error("taker wallet locator is authenticated but absent from the durable catalog")]
+    TakerLocatorNotCataloged,
+    #[error("taker wallet job does not exactly match its funded route and layout")]
+    TakerRouteBindingMismatch,
+    #[error("taker wallet job does not exactly match its funded input bindings")]
+    TakerInputBindingMismatch,
+    #[error("taker wallet job does not exactly match its receive/change output binding")]
+    TakerOutputBindingMismatch,
+    #[error("the settlement-scoped taker wallet was already used to sign")]
+    TakerSettlementAlreadySigned,
+    #[error("taker wallet input or output is not in this wallet's durable destination catalog")]
+    UnknownTakerWalletDestination,
     #[error("wallet operation lock is poisoned")]
     OperationLockPoisoned,
     #[error(

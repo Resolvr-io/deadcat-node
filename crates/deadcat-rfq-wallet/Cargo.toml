@@ -1,6 +1,6 @@
 [package]
 name = "deadcat-rfq-wallet"
-description = "Narrow encrypted hot-wallet adapter for the Deadcat RFQ provider."
+description = "Narrow encrypted hot-wallet adapter for Deadcat RFQ participants."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -12,6 +12,8 @@ workspace = true
 argon2.workspace = true
 bip39.workspace = true
 chacha20poly1305.workspace = true
+deadcat-client.workspace = true
+deadcat-rfq-client.workspace = true
 deadcat-rfq-provider.workspace = true
 elements.workspace = true
 hmac.workspace = true
@@ -26,3 +28,6 @@ zeroize.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 rustix.workspace = true
+
+[dev-dependencies]
+deadcat-types.workspace = true

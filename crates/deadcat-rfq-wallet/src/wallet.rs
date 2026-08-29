@@ -1,5 +1,5 @@
 use core::fmt;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
 
 use deadcat_rfq_provider::{
@@ -7,6 +7,7 @@ use deadcat_rfq_provider::{
     ProviderOutputRecovery, ProviderSigner, SigningJob, SigningResponse, WalletBoundaryError,
     WalletKeyLocator, WalletOwnedOutput,
 };
+use elements::TxOutSecrets;
 use elements::bitcoin::NetworkKind;
 use elements::bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv};
 use elements::encode::{deserialize, serialize};
@@ -301,6 +302,69 @@ impl<R: RngCore + CryptoRng + Send> RfqWallet<R> {
         derive_slip77_blinding_secret(&self.master_blinding_key, script_pubkey)
     }
 
+    pub(crate) fn recover_taker_input_opening(
+        &self,
+        locator: WalletKeyLocator,
+        expected_internal_key: XOnlyPublicKey,
+        txout: &TxOut,
+    ) -> Result<TxOutSecrets, RfqWalletError> {
+        let destination = self.destination_for_locator(locator)?;
+        if destination.internal_key() != expected_internal_key
+            || destination.script_pubkey() != &txout.script_pubkey
+        {
+            return Err(RfqWalletError::OutputInternalKeyMismatch);
+        }
+        let mut blinding_secret = self.slip77_blinding_secret(&txout.script_pubkey)?;
+        let opening = txout
+            .unblind(&Secp256k1::new(), blinding_secret.0)
+            .map_err(|_| RfqWalletError::OutputUnblindFailed)?;
+        blinding_secret.0.non_secure_erase();
+        Ok(opening)
+    }
+
+    pub(crate) fn blind_taker_pset(
+        &self,
+        mut pset: PartiallySignedTransaction,
+        openings: &HashMap<usize, TxOutSecrets>,
+    ) -> Result<PartiallySignedTransaction, RfqWalletError> {
+        let mut issuance = self
+            .issuance
+            .lock()
+            .map_err(|_| RfqWalletError::IssuanceLockPoisoned)?;
+        pset.blind_last(&mut issuance.rng, &Secp256k1::new(), openings)
+            .map_err(|_| RfqWalletError::TakerBlindingFailed)?;
+        Ok(pset)
+    }
+
+    pub(crate) fn sign_taker_pset(
+        &self,
+        mut pset: PartiallySignedTransaction,
+        targets: &[WalletSigningTarget],
+    ) -> Result<PartiallySignedTransaction, RfqWalletError> {
+        let signatures = self.sign_targets(&serialize(&pset), targets)?;
+        let indexes = pset
+            .inputs()
+            .iter()
+            .enumerate()
+            .map(|(index, input)| {
+                (
+                    OutPoint::new(input.previous_txid, input.previous_output_index),
+                    index,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for signature in signatures {
+            let index = indexes
+                .get(&signature.outpoint())
+                .copied()
+                .ok_or(RfqWalletError::MissingSigningTarget(signature.outpoint()))?;
+            let schnorr = signature.signature();
+            pset.inputs_mut()[index].tap_key_sig = Some(schnorr);
+            pset.inputs_mut()[index].final_script_witness = Some(vec![schnorr.to_vec()]);
+        }
+        Ok(pset)
+    }
+
     fn sign_targets(
         &self,
         payload: &[u8],
@@ -476,10 +540,10 @@ enum KeyPurpose {
 }
 
 #[derive(Clone, Copy)]
-struct WalletSigningTarget {
-    outpoint: OutPoint,
-    locator: WalletKeyLocator,
-    internal_key: XOnlyPublicKey,
+pub(crate) struct WalletSigningTarget {
+    pub(crate) outpoint: OutPoint,
+    pub(crate) locator: WalletKeyLocator,
+    pub(crate) internal_key: XOnlyPublicKey,
 }
 
 struct SensitiveKeypair(Keypair);
@@ -646,6 +710,8 @@ pub enum RfqWalletError {
     OutputScriptOrConfidentialityMismatch,
     #[error("wallet output rangeproof could not be rewound")]
     OutputUnblindFailed,
+    #[error("wallet could not complete the balancing PSET blinding turn")]
+    TakerBlindingFailed,
     #[error("wallet output opens to the wrong asset")]
     OutputAssetMismatch,
     #[error("wallet output opens to the wrong amount")]
