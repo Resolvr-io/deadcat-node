@@ -33,6 +33,11 @@ zeroize.workspace = true
 
 [dev-dependencies]
 bitcoind = "0.36"
+deadcat-client.workspace = true
+deadcat-contracts.workspace = true
+deadcat-rfq-client.workspace = true
+deadcat-rfq-taker.workspace = true
+deadcat-rpc.workspace = true
 serde_json.workspace = true
 smplx-sdk.workspace = true
 tempfile.workspace = true

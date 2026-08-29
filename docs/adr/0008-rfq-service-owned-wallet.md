@@ -183,7 +183,10 @@ provider state machine, Elements adapter, protected credential-file delivery,
 stable Iroh identity, and authenticated signed-quote/blind/execute/status
 protocol. It initializes state without clobbering, opens existing state only,
 recovers inventory and signing work before readiness, issues confidential
-deposit addresses, and drains transport before shutdown.
+deposit addresses, atomically queues the exact signed transaction for relay,
+reconciles and broadcasts that exact artifact through Elements Core, monitors
+confirmation, conflicts, and reorganization observations, and drains transport
+before shutdown.
 
 It does **not** yet provide:
 
@@ -192,7 +195,9 @@ It does **not** yet provide:
 - continuous/off-host backup transport, external backup-freshness checkpoints,
   coordinated wallet/provider-state recovery, or key rotation;
 - canonical market-derived configuration, a production pricing source,
-  public-network profiles, relay and outspend reconciliation; or
+  public-network profiles, and process-boundary coverage for Core outages,
+  ambiguous sends, conflicts/outspends, and post-confirmation reorganization;
+  or
 - an HSM or external-signer backend.
 
 The current persistent store also does not implement Windows ACLs or a durable
@@ -217,6 +222,7 @@ record.
   provider's key derivation or persisted locators.
 - The capability boundary remains suitable for a later out-of-process signer or
   HSM without changing ADR 0007's reservation and commit-before-sign semantics.
-- The service must not be described as production-ready until the deferred
-  passphrase, daemon, coordinated recovery, remote protocol, relay, and
-  process-level acceptance work is complete.
+- The service must not be described as production-ready until coordinated
+  recovery, canonical market/pricing integration, abuse controls, adverse
+  relay/reorganization process gates, host hardening, and an HSM or equivalent
+  external signer are complete.

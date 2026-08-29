@@ -419,11 +419,13 @@ The provisional ordinary-output API uses the narrower name `PreparedLeg`: its
 economics and output claims are authorized, but venue-specific completion and
 the final signer checks still have to succeed before it is executable on chain.
 
-For an RFQ leg, preparation reserves exact provider inventory. The eventual
-remote protocol returns a signed short-lived commitment. The current
-transport-free provider engine instead returns an internal, unauthenticated
-`FirmQuote`; it proves construction and durable replay semantics but is not a
-network quote or provider attestation.
+For an RFQ leg, preparation reserves exact provider inventory. The
+transport-free provider engine produces an internal `FirmQuote`, and the
+authenticated runtime maps it into the strict remote schema and signs a
+short-lived attestation bound to both Iroh endpoints, the exact request, and
+its idempotency key. Client preparation verifies that attestation and retains
+its durable recovery binding; the internal provider value alone is not network
+evidence.
 
 For a DLOB or AMM leg, preparation refreshes and pins exact public state. It does
 not reserve that state against another valid transaction.
@@ -743,9 +745,11 @@ confidential deposit-address issuance, and graceful signal draining. Recovery
 before readiness covers both pending signing jobs and relay work currently due.
 Its first profile is intentionally regtest-only and statically configured;
 canonical market evidence, a production pricing source, authenticated-owner
-request-rate limits, external backup freshness, process-kill and live-Core
-relay/reorganization acceptance coverage, host memory hardening, and HSM
-support remain outside the current slice.
+request-rate limits, external backup freshness, live Core-outage,
+ambiguous-send, conflict/outspend, and reorganization process coverage, host
+memory hardening, and HSM support remain outside the current slice. A dedicated
+live liquidregtest gate now crosses the shipped provider process, direct Iroh,
+Elements Core, hard restart, durable exact-relay recovery, and confirmation.
 The taker integration now implements the keyless whole-PSET authorization, the
 first concrete custom-wallet funding boundary, and a high-level one-provider
 quote-to-journal runtime. The wallet authenticates caller-supplied confidential
@@ -1128,8 +1132,8 @@ three independently designed fragment layouts compose safely.
 - ADR 0007 resolves reservation, commit-before-sign, signature persistence, and
   permanent input retirement. Its service layer now also resolves exact relay,
   ambiguous-broadcast, canonical confirmation, and input-outspend
-  reconciliation. Production acceptance, fee-bump policy, and long-term relay
-  record retention remain operational decisions.
+  reconciliation. Adverse-condition process acceptance, fee-bump policy, and
+  long-term relay record retention remain operational decisions.
 - Which chain and mempool evidence is required before a route is considered
   fresh enough to display or sign?
 - When should multiple RFQ signers be allowed in one transaction?
