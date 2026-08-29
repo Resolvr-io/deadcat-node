@@ -2,7 +2,7 @@
 //!
 //! The signed quote authenticates provider-supplied prevouts and settlement
 //! policy; it does not prove those prevouts are canonical or still unspent.
-//! Before taker signing, the wallet-facing whole-PSET coordinator compares
+//! Before taker signing, the wallet-facing whole-PSET authorization compares
 //! every prevout with an authoritative chain source; revalidate that the exact
 //! market observation is still canonical, fresh, and trading; enforce the
 //! quote's fee rate/absolute-fee/weight limits; and enforce the v1 provider

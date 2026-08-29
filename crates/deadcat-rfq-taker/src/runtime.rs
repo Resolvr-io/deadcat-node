@@ -10,8 +10,8 @@ use deadcat_rfq_client::{
     AuthenticatedExecutionStatus, ExecuteError, ExecutionAttemptDigest, ExecutionJournal,
     ExecutionJournalError, ExecutionJournalKey, ExecutionJournalObservation, JournaledExecution,
     PreparedRfqLeg, QuoteBounds, QuoteReplay, RfqQuoteIntent, RfqSession, RfqVenueError,
-    SessionError, TakerAuthorizationError, TakerSettlementCoordinator, TakerSettlementPlan,
-    TakerSettlementPlanError, TakerSettlementSource,
+    SessionError, TakerAuthorizationError, TakerSettlementPlan, TakerSettlementPlanError,
+    TakerSettlementSource,
 };
 use deadcat_rfq_rpc::{IdempotencyKeyDto, ReservationStatusDto, SettlementPset, VerifiedFirmQuote};
 use deadcat_rfq_wallet::{
@@ -332,7 +332,7 @@ where
     R: RngCore + CryptoRng + Send,
     J: ExecutionJournal,
 {
-    pub fn from_source<S>(
+    pub async fn from_source<S>(
         wallet: Arc<PersistentRfqWallet<R>>,
         identity: TakerWalletIdentity,
         source: &S,
@@ -352,6 +352,7 @@ where
         let recovery = load_funding_recovery(&journal, identity, wallet_instance_id)?;
         let inventory = source
             .inventory()
+            .await
             .map_err(|error| RfqTakerError::InventorySource(Box::new(error)))?;
         let pool = claim.initialize(inventory, recovery.exclusions().clone())?;
         Ok(Self {
@@ -467,7 +468,7 @@ where
         })
     }
 
-    pub fn refresh_inventory<S>(&self, source: &S) -> Result<(), RfqTakerError>
+    pub async fn refresh_inventory<S>(&self, source: &S) -> Result<(), RfqTakerError>
     where
         S: TakerInventorySource + ?Sized,
     {
@@ -483,7 +484,12 @@ where
         )?;
         let inventory = source
             .inventory()
+            .await
             .map_err(|error| RfqTakerError::InventorySource(Box::new(error)))?;
+        // Readiness may be revoked while the source is pending. Never report a
+        // successful refresh or install new inventory on a runtime that now
+        // requires restart recovery.
+        self.require_ready()?;
         self.pool
             .replace_inventory(&token, inventory, recovery.exclusions().clone())?;
         Ok(())
@@ -556,9 +562,9 @@ where
         let provider_blinded = session
             .blind_at(&trade.live, &settlement, pset, blind_at_millis)
             .await?;
-        let coordinator = TakerSettlementCoordinator::new(plan, source, &settlement_wallet);
-        let authorized = provider_blinded.authorize_with(&coordinator)?;
-        drop(coordinator);
+        let preflight = provider_blinded.preflight_with(plan)?;
+        let observed = preflight.observe(source).await?;
+        let authorized = observed.authorize(&settlement_wallet)?;
         let attempt = authorized.into_execution_attempt();
         let attempt_key = ExecutionJournalKey::for_attempt(&attempt);
         let attempt_digest = attempt.digest();

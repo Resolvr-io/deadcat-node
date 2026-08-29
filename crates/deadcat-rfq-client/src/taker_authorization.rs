@@ -1,15 +1,16 @@
 //! Keyless taker authorization for one collaboratively blinded RFQ settlement.
 //!
-//! The coordinator in this module owns no wallet secrets. It freezes the exact
-//! locally composed route before provider blinding, obtains one coherent and
-//! authoritative current-state snapshot, and gives a caller-owned wallet a
+//! The authorization flow in this module owns no wallet secrets. It freezes the
+//! exact locally composed route before provider blinding, obtains one coherent
+//! and authoritative current-state snapshot, and gives a caller-owned wallet a
 //! narrowly scoped job. The wallet may only complete the remaining blinding
-//! turn and sign the wallet inputs; the coordinator independently validates
-//! the complete result before it becomes an executable settlement.
+//! turn and sign the wallet inputs; the authorization boundary independently
+//! validates the complete result before it becomes an executable settlement.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 
+use async_trait::async_trait;
 use deadcat_client::composition::{CompositionLayout, UnblindedStructureManifest};
 use deadcat_client::venue::{ComposedRoute, RouteAuthorization};
 use deadcat_liquid_settlement::{
@@ -30,7 +31,8 @@ use elements::{AssetId, LockTime, OutPoint, SchnorrSighashType, Script, Sequence
 use thiserror::Error;
 
 use crate::{
-    ExecutionBinding, RfqLegBinding, RfqVenueError, TakerSettlementAuthorizer, TradingMarket,
+    ExecutionBinding, ProviderBlindedPset, RfqLegBinding, RfqVenueError, TakerAuthorizedSettlement,
+    TradingMarket,
 };
 
 /// One authoritative, unspent input prevout returned in transaction order.
@@ -100,8 +102,45 @@ impl TakerSettlementSnapshot {
     }
 }
 
-/// Authoritative chain, market, and clock boundary for taker authorization.
-pub trait TakerSettlementSource {
+/// Exact owned query derived by local provider-response preflight.
+///
+/// The request is created only after the authenticated provider PSET has passed
+/// binding, layout, canonical encoding, mutation-scope, disclosure, and fee
+/// checks. Owning the ordered outpoints lets a blocking Core adapter move the
+/// complete bounded operation onto an explicit blocking-task boundary.
+pub struct TakerSettlementSnapshotRequest {
+    chain: ChainIdentity,
+    market: ContractId,
+    quote_anchor: ChainAnchor,
+    outpoints: Vec<OutPoint>,
+}
+
+impl TakerSettlementSnapshotRequest {
+    #[must_use]
+    pub const fn chain(&self) -> ChainIdentity {
+        self.chain
+    }
+
+    #[must_use]
+    pub const fn market(&self) -> ContractId {
+        self.market
+    }
+
+    #[must_use]
+    pub const fn quote_anchor(&self) -> ChainAnchor {
+        self.quote_anchor
+    }
+
+    #[must_use]
+    pub fn outpoints(&self) -> &[OutPoint] {
+        &self.outpoints
+    }
+}
+
+/// Asynchronous authoritative chain, market, and clock boundary for taker
+/// authorization.
+#[async_trait]
+pub trait TakerSettlementSource: Send + Sync {
     type Error: Error + Send + Sync + 'static;
 
     /// Return one coherent snapshot for the exact ordered outpoint list.
@@ -110,16 +149,13 @@ pub trait TakerSettlementSource {
     /// that `quote_anchor` remains in its canonical ancestry, and reject any
     /// missing or spent outpoint. Returned prevouts must preserve request order
     /// and include complete rangeproof witnesses.
-    fn settlement_snapshot(
+    async fn settlement_snapshot(
         &self,
-        chain: ChainIdentity,
-        market: ContractId,
-        quote_anchor: ChainAnchor,
-        outpoints: &[OutPoint],
+        request: TakerSettlementSnapshotRequest,
     ) -> Result<TakerSettlementSnapshot, Self::Error>;
 }
 
-/// Why the coordinator expects the caller wallet to own an output.
+/// Why the authorization boundary expects the caller wallet to own an output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwnedOutputKind {
     WalletContribution,
@@ -577,57 +613,37 @@ impl TakerSettlementPlan {
     }
 }
 
-/// Production whole-PSET coordinator over caller-supplied state and wallet
-/// capabilities.
-pub struct TakerSettlementCoordinator<'a, S: ?Sized, W: ?Sized> {
+/// Locally validated provider response awaiting one authoritative snapshot.
+///
+/// Construction performs every check that needs only the frozen route and the
+/// authenticated provider response. It yields the exact owned source request
+/// but holds no source or wallet reference across that asynchronous boundary.
+/// [`Self::observe`] consumes this capability while obtaining the exact source
+/// snapshot, so callers cannot advance to wallet authorization without crossing
+/// the authoritative source boundary.
+pub struct PreparedTakerAuthorization {
     plan: TakerSettlementPlan,
-    source: &'a S,
-    wallet: &'a W,
+    provider: CanonicalPset,
+    request: TakerSettlementSnapshotRequest,
 }
 
-impl<'a, S: ?Sized, W: ?Sized> TakerSettlementCoordinator<'a, S, W> {
-    #[must_use]
-    pub const fn new(plan: TakerSettlementPlan, source: &'a S, wallet: &'a W) -> Self {
-        Self {
-            plan,
-            source,
-            wallet,
-        }
-    }
-
-    #[must_use]
-    pub const fn plan(&self) -> &TakerSettlementPlan {
-        &self.plan
-    }
-}
-
-impl<S, W> TakerSettlementAuthorizer for TakerSettlementCoordinator<'_, S, W>
-where
-    S: TakerSettlementSource + ?Sized,
-    W: TakerWalletFinalizer + ?Sized,
-{
-    type Error = TakerAuthorizationError;
-
-    fn validate_and_sign(
-        &self,
-        binding: &ExecutionBinding,
-        layout: &SettlementLayoutDto,
-        provider_blinded_pset: &SettlementPset,
-    ) -> Result<SettlementPset, Self::Error> {
-        if binding != &self.plan.binding || layout != &self.plan.settlement_layout {
+impl PreparedTakerAuthorization {
+    pub(crate) fn new(
+        plan: TakerSettlementPlan,
+        response: &ProviderBlindedPset,
+    ) -> Result<Self, TakerAuthorizationError> {
+        if response.binding() != &plan.binding || response.layout() != &plan.settlement_layout {
             return Err(TakerAuthorizationError::BindingMismatch);
         }
-        layout.validate_for_quote(self.plan.quote.quote())?;
+        response.layout().validate_for_quote(plan.quote.quote())?;
 
-        let provider =
-            CanonicalPset::decode(provider_blinded_pset.as_bytes(), MAX_SETTLEMENT_BYTES)?;
-        self.plan
-            .manifest
+        let provider = CanonicalPset::decode(response.pset().as_bytes(), MAX_SETTLEMENT_BYTES)?;
+        plan.manifest
             .validate(provider.pset())
             .map_err(|error| TakerAuthorizationError::Manifest(error.to_string()))?;
-        validate_provider_mutation(&self.plan, provider.pset())?;
+        validate_provider_mutation(&plan, provider.pset())?;
 
-        for index in &self.plan.provider_outputs {
+        for index in &plan.provider_outputs {
             verify_output_disclosure(&provider.pset().outputs()[*index]).map_err(|error| {
                 TakerAuthorizationError::OutputDisclosure {
                     index: *index,
@@ -636,51 +652,130 @@ where
             })?;
         }
 
+        // Fee policy is signing authorization, not a post-sign diagnostic.
+        // Project fixed-size explicit-ALL witnesses before any chain read or
+        // wallet capability is requested, then recheck concrete wallet results
+        // below.
+        validate_fee_policy(&plan, provider.pset())?;
+
         let outpoints = provider
             .pset()
             .inputs()
             .iter()
             .map(input_outpoint)
             .collect::<Vec<_>>();
-        let quote_value = self.plan.quote.quote();
+        let quote_value = plan.quote.quote();
         let quote_anchor = ChainAnchor {
             height: quote_value.snapshot.block_height,
             hash: quote_value.snapshot.block_hash,
         };
-        let snapshot = self
-            .source
-            .settlement_snapshot(
-                self.plan.binding.chain(),
-                self.plan.market.contract_id(),
+        Ok(Self {
+            request: TakerSettlementSnapshotRequest {
+                chain: plan.binding.chain(),
+                market: plan.market.contract_id(),
                 quote_anchor,
-                &outpoints,
-            )
+                outpoints,
+            },
+            plan,
+            provider,
+        })
+    }
+
+    #[must_use]
+    pub const fn plan(&self) -> &TakerSettlementPlan {
+        &self.plan
+    }
+
+    /// Obtain the exact authoritative snapshot derived during local preflight.
+    ///
+    /// This consumes the preflight capability. Success returns a second opaque
+    /// capability whose synchronous [`ObservedTakerAuthorization::authorize`]
+    /// method is the only standardized path to a signed settlement.
+    pub async fn observe<S>(
+        self,
+        source: &S,
+    ) -> Result<ObservedTakerAuthorization, TakerAuthorizationError>
+    where
+        S: TakerSettlementSource + ?Sized,
+    {
+        let snapshot = source
+            .settlement_snapshot(self.request)
+            .await
             .map_err(|error| TakerAuthorizationError::Source(Box::new(error)))?;
-        validate_snapshot(&self.plan, &snapshot, &outpoints, quote_anchor)?;
+        Ok(ObservedTakerAuthorization {
+            plan: self.plan,
+            provider: self.provider,
+            snapshot,
+        })
+    }
+}
+
+/// Locally preflighted provider response paired with authoritative current
+/// state.
+///
+/// This type has no public constructor. It is produced only when
+/// [`PreparedTakerAuthorization::observe`] successfully crosses the configured
+/// source boundary, and it deliberately owns no wallet reference.
+pub struct ObservedTakerAuthorization {
+    plan: TakerSettlementPlan,
+    provider: CanonicalPset,
+    snapshot: TakerSettlementSnapshot,
+}
+
+impl ObservedTakerAuthorization {
+    /// Finish authorization from one coherent authoritative snapshot.
+    ///
+    /// This method is deliberately synchronous: after the current-state read
+    /// completes there is no cancellation point before wallet-owned output
+    /// validation, balancing blinding, full proof/balance checks, and signing.
+    pub fn authorize<W>(
+        self,
+        wallet: &W,
+    ) -> Result<TakerAuthorizedSettlement, TakerAuthorizationError>
+    where
+        W: TakerWalletFinalizer + ?Sized,
+    {
+        let Self {
+            plan,
+            provider,
+            snapshot,
+        } = self;
+        let outpoints = provider
+            .pset()
+            .inputs()
+            .iter()
+            .map(input_outpoint)
+            .collect::<Vec<_>>();
+        let quote = plan.quote.quote();
+        let quote_anchor = ChainAnchor {
+            height: quote.snapshot.block_height,
+            hash: quote.snapshot.block_hash,
+        };
+        validate_snapshot(&plan, &snapshot, &outpoints, quote_anchor)?;
 
         let prevouts = snapshot
             .prevouts()
             .iter()
             .map(|prevout| prevout.txout().clone())
             .collect::<Vec<_>>();
-        validate_quoted_provider_prevouts(&self.plan, snapshot.prevouts())?;
+        validate_quoted_provider_prevouts(&plan, snapshot.prevouts())?;
         validate_all_inputs(
             provider.pset(),
             snapshot.prevouts(),
-            &self.plan.provider_inputs,
+            &plan.provider_inputs,
             false,
-            self.plan.binding.chain().genesis_hash,
+            plan.binding.chain().genesis_hash,
         )?;
 
         let provider_transaction = provider
             .pset()
             .extract_tx()
             .map_err(|error| TakerAuthorizationError::InvalidPset(error.to_string()))?;
-        for expectation in self.plan.owned_outputs.iter().filter(|expectation| {
+        for expectation in plan.owned_outputs.iter().filter(|expectation| {
             expectation.kind == OwnedOutputKind::RfqReceive
-                && self.plan.provider_outputs.contains(&expectation.index)
+                && plan.provider_outputs.contains(&expectation.index)
         }) {
-            self.wallet
+            wallet
                 .validate_owned_output(OwnedOutputValidation {
                     expectation,
                     txout: &provider_transaction.output[expectation.index],
@@ -688,45 +783,37 @@ where
                 .map_err(|error| TakerAuthorizationError::Wallet(Box::new(error)))?;
         }
 
-        // Fee policy is signing authorization, not a post-sign diagnostic.
-        // Project fixed-size explicit-ALL witnesses for every participant
-        // before handing any capability to the caller wallet, then recheck the
-        // wallet's concrete result below.
-        validate_fee_policy(&self.plan, provider.pset())?;
-
         let job = TakerWalletBlindingJob {
             pset: provider.pset().clone(),
-            chain: self.plan.binding.chain(),
-            route: self.plan.route.clone(),
-            layout: self.plan.composition_layout.clone(),
+            chain: plan.binding.chain(),
+            route: plan.route.clone(),
+            layout: plan.composition_layout.clone(),
             prevouts: snapshot.prevouts().to_vec(),
-            wallet_input_indices: self.plan.wallet_inputs.iter().copied().collect(),
-            wallet_output_indices: self.plan.wallet_outputs.iter().copied().collect(),
-            provider_input_indices: self.plan.provider_inputs.iter().copied().collect(),
-            owned_outputs: self.plan.owned_outputs.clone(),
+            wallet_input_indices: plan.wallet_inputs.iter().copied().collect(),
+            wallet_output_indices: plan.wallet_outputs.iter().copied().collect(),
+            provider_input_indices: plan.provider_inputs.iter().copied().collect(),
+            owned_outputs: plan.owned_outputs.clone(),
         };
-        let wallet_blinded = self
-            .wallet
+        let wallet_blinded = wallet
             .blind_last(job)
             .map_err(|error| TakerAuthorizationError::Wallet(Box::new(error)))?;
         let wallet_blinded =
             CanonicalPset::decode(&serialize(&wallet_blinded), MAX_SETTLEMENT_BYTES)?;
-        self.plan
-            .manifest
+        plan.manifest
             .validate(wallet_blinded.pset())
             .map_err(|error| TakerAuthorizationError::Manifest(error.to_string()))?;
-        validate_wallet_blinding_mutation(&self.plan, provider.pset(), wallet_blinded.pset())?;
+        validate_wallet_blinding_mutation(&plan, provider.pset(), wallet_blinded.pset())?;
         validate_all_inputs(
             wallet_blinded.pset(),
             snapshot.prevouts(),
-            &self.plan.provider_inputs,
+            &plan.provider_inputs,
             false,
-            self.plan.binding.chain().genesis_hash,
+            plan.binding.chain().genesis_hash,
         )?;
 
         for (index, output) in wallet_blinded.pset().outputs().iter().enumerate() {
-            if index == self.plan.composition_layout.fee_output_index() {
-                validate_fee_output(output, self.plan.binding.policy_asset())?;
+            if index == plan.composition_layout.fee_output_index() {
+                validate_fee_output(output, plan.binding.policy_asset())?;
             } else {
                 validate_confidential_output(output, index, wallet_blinded.pset().inputs().len())?;
             }
@@ -737,43 +824,46 @@ where
             .map_err(|error| TakerAuthorizationError::InvalidPset(error.to_string()))?;
         verify_confidential_proofs_and_balance(&transaction, &prevouts)
             .map_err(|error| TakerAuthorizationError::Confidential(error.detail().to_owned()))?;
-        for expectation in &self.plan.owned_outputs {
-            self.wallet
+        for expectation in &plan.owned_outputs {
+            wallet
                 .validate_owned_output(OwnedOutputValidation {
                     expectation,
                     txout: &transaction.output[expectation.index],
                 })
                 .map_err(|error| TakerAuthorizationError::Wallet(Box::new(error)))?;
         }
-        validate_fee_policy(&self.plan, wallet_blinded.pset())?;
+        validate_fee_policy(&plan, wallet_blinded.pset())?;
 
         let signing_job = TakerWalletSigningJob {
             pset: wallet_blinded.pset().clone(),
-            chain: self.plan.binding.chain(),
+            chain: plan.binding.chain(),
             prevouts: snapshot.prevouts().to_vec(),
-            wallet_input_indices: self.plan.wallet_inputs.iter().copied().collect(),
+            wallet_input_indices: plan.wallet_inputs.iter().copied().collect(),
         };
-        let signed = self
-            .wallet
+        let signed = wallet
             .sign(signing_job)
             .map_err(|error| TakerAuthorizationError::Wallet(Box::new(error)))?;
         let signed = CanonicalPset::decode(&serialize(&signed), MAX_SETTLEMENT_BYTES)?;
-        self.plan
-            .manifest
+        plan.manifest
             .validate(signed.pset())
             .map_err(|error| TakerAuthorizationError::Manifest(error.to_string()))?;
-        validate_wallet_signing_mutation(&self.plan, wallet_blinded.pset(), signed.pset())?;
+        validate_wallet_signing_mutation(&plan, wallet_blinded.pset(), signed.pset())?;
         validate_all_inputs(
             signed.pset(),
             snapshot.prevouts(),
-            &self.plan.provider_inputs,
+            &plan.provider_inputs,
             true,
-            self.plan.binding.chain().genesis_hash,
+            plan.binding.chain().genesis_hash,
         )?;
-        validate_fee_policy(&self.plan, signed.pset())?;
+        validate_fee_policy(&plan, signed.pset())?;
 
-        SettlementPset::from_bytes(signed.into_bytes())
-            .map_err(|error| TakerAuthorizationError::InvalidPset(error.to_string()))
+        let pset = SettlementPset::from_bytes(signed.into_bytes())
+            .map_err(|error| TakerAuthorizationError::InvalidPset(error.to_string()))?;
+        Ok(TakerAuthorizedSettlement::from_preflight(
+            plan.binding,
+            plan.settlement_layout,
+            pset,
+        ))
     }
 }
 

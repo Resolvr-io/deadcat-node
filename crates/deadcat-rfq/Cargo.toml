@@ -32,6 +32,7 @@ tracing-subscriber.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 bitcoind = "0.36"
 deadcat-client.workspace = true
 deadcat-contracts.workspace = true

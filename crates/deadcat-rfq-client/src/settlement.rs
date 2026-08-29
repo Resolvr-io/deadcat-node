@@ -23,6 +23,9 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::ResolvedRfqSettlement;
+use crate::taker_authorization::{
+    PreparedTakerAuthorization, TakerAuthorizationError, TakerSettlementPlan,
+};
 
 pub const EXECUTION_ATTEMPT_RECORD_VERSION: u32 = 1;
 
@@ -122,8 +125,9 @@ impl ExecutionBinding {
 /// Provider-returned collaborative blinding result.
 ///
 /// The contained PSET is deliberately not a signing capability. It must cross
-/// [`TakerSettlementAuthorizer`] before it can become a provider execution
-/// request.
+/// the standardized local-preflight, authoritative-observation, and
+/// caller-wallet authorization sequence before it can become a provider
+/// execution request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderBlindedPset {
     binding: ExecutionBinding,
@@ -147,6 +151,19 @@ impl ProviderBlindedPset {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) const fn from_test_parts(
+        binding: ExecutionBinding,
+        layout: SettlementLayoutDto,
+        pset: SettlementPset,
+    ) -> Self {
+        Self {
+            binding,
+            layout,
+            pset,
+        }
+    }
+
     #[must_use]
     pub const fn binding(&self) -> &ExecutionBinding {
         &self.binding
@@ -162,41 +179,19 @@ impl ProviderBlindedPset {
         &self.pset
     }
 
-    /// Invoke the caller-owned whole-transaction validator and signer.
+    /// Perform every provider-response check that does not require current
+    /// chain state or a caller wallet capability.
     ///
-    /// Borrowing `self` preserves the provider response when validation or
-    /// signing fails. The authorizer returns a new exact PSET after completing
-    /// every wallet-specific safety check and taker signature.
-    pub fn authorize_with<A>(&self, authorizer: &A) -> Result<TakerAuthorizedSettlement, A::Error>
-    where
-        A: TakerSettlementAuthorizer,
-    {
-        let pset = authorizer.validate_and_sign(&self.binding, &self.layout, &self.pset)?;
-        Ok(TakerAuthorizedSettlement {
-            binding: self.binding,
-            layout: self.layout.clone(),
-            pset,
-        })
-    }
-}
-
-/// Caller-owned validation and signing boundary.
-///
-/// Implementations must distrust the provider-returned PSET. At minimum they
-/// must revalidate the frozen transaction body, authoritative prevouts,
-/// confidential commitments/proofs and owned output openings, economic and fee
-/// policy, every input's sighash policy, and all pre-existing signatures before
-/// adding the taker's required signatures. The returned PSET is the exact value
-/// that may be submitted to the provider.
-pub trait TakerSettlementAuthorizer {
-    type Error;
-
-    fn validate_and_sign(
+    /// Success returns a non-forgeable continuation that owns the exact
+    /// snapshot request. It may await an asynchronous authoritative source
+    /// without borrowing a wallet; after the source returns, the resulting
+    /// observed-state capability completes validation and signing synchronously.
+    pub fn preflight_with(
         &self,
-        binding: &ExecutionBinding,
-        layout: &SettlementLayoutDto,
-        provider_blinded_pset: &SettlementPset,
-    ) -> Result<SettlementPset, Self::Error>;
+        plan: TakerSettlementPlan,
+    ) -> Result<PreparedTakerAuthorization, TakerAuthorizationError> {
+        PreparedTakerAuthorization::new(plan, self)
+    }
 }
 
 /// Complete settlement approved and signed by the caller-owned wallet boundary.
@@ -212,6 +207,18 @@ pub struct TakerAuthorizedSettlement {
 }
 
 impl TakerAuthorizedSettlement {
+    pub(crate) fn from_preflight(
+        binding: ExecutionBinding,
+        layout: SettlementLayoutDto,
+        pset: SettlementPset,
+    ) -> Self {
+        Self {
+            binding,
+            layout,
+            pset,
+        }
+    }
+
     #[must_use]
     pub const fn binding(&self) -> &ExecutionBinding {
         &self.binding
@@ -710,32 +717,8 @@ mod tests {
         }
     }
 
-    struct TestAuthorizer;
-
-    impl TakerSettlementAuthorizer for TestAuthorizer {
-        type Error = std::convert::Infallible;
-
-        fn validate_and_sign(
-            &self,
-            actual_binding: &ExecutionBinding,
-            actual_layout: &SettlementLayoutDto,
-            provider_blinded_pset: &SettlementPset,
-        ) -> Result<SettlementPset, Self::Error> {
-            assert_eq!(actual_binding, &binding());
-            assert_eq!(actual_layout, &layout());
-            assert_eq!(provider_blinded_pset, &pset());
-            Ok(other_pset())
-        }
-    }
-
     fn authorized() -> TakerAuthorizedSettlement {
-        ProviderBlindedPset {
-            binding: binding(),
-            layout: layout(),
-            pset: pset(),
-        }
-        .authorize_with(&TestAuthorizer)
-        .expect("infallible test authorization")
+        TakerAuthorizedSettlement::from_preflight(binding(), layout(), other_pset())
     }
 
     fn signed_attempt() -> (ExecutionAttempt, SettlementPset) {
@@ -836,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_output_crosses_explicit_authorizer_before_execution() {
+    fn authorized_capability_is_required_for_execution() {
         let authorized = authorized();
         assert_eq!(authorized.binding(), &binding());
         assert_eq!(authorized.layout(), &layout());
