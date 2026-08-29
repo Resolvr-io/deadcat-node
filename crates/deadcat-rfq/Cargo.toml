@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+deadcat-elements-core.workspace = true
 deadcat-rfq-iroh.workspace = true
 deadcat-rfq-provider.workspace = true
 deadcat-rfq-rpc.workspace = true

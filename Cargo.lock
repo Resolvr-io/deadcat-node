@@ -976,6 +976,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "deadcat-elements-core"
+version = "0.1.0-alpha"
+dependencies = [
+ "deadcat-types",
+ "elements",
+ "hex",
+ "libc",
+ "rand 0.8.7",
+ "reqwest",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "zeroize",
+]
+
+[[package]]
 name = "deadcat-iroh"
 version = "0.1.0-alpha"
 dependencies = [
@@ -1035,6 +1053,7 @@ dependencies = [
  "clap",
  "deadcat-client",
  "deadcat-contracts",
+ "deadcat-elements-core",
  "deadcat-rfq-client",
  "deadcat-rfq-iroh",
  "deadcat-rfq-provider",
