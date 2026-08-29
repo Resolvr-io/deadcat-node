@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -8,14 +8,13 @@ use deadcat_client::composition::{
     NetworkFee, OutputId, OutputSpec, TransactionContribution,
 };
 use deadcat_client::validation::validate_contract_view;
-use deadcat_client::venue::{
-    AssetAmount, ConfidentialRecipient, ExecutionRequest, LegId, ProposedLeg, VenueContext,
-};
+use deadcat_client::venue::{AssetAmount, ExecutionRequest, LegId, ProposedLeg, VenueContext};
 use deadcat_contracts::binary_market::BinaryMarketSlot;
 use deadcat_rfq_client::{
-    ExecuteError, ExecutionBinding, ExecutionJournal as _, PreparedRfqLeg, ProviderTarget,
+    AuthoritativeTakerPrevout, ExecuteError, ExecutionJournal as _, PreparedRfqLeg, ProviderTarget,
     QuoteBounds, RedbExecutionJournal, RfqQuoteIntent, RfqSession, SessionConfig, SessionError,
-    TakerSettlementAuthorizer, TakerSettlementPlan, TradingMarket,
+    TakerAuthorizationError, TakerSettlementCoordinator, TakerSettlementPlan,
+    TakerSettlementSnapshot, TakerSettlementSource, TradingMarket,
 };
 use deadcat_rfq_iroh::{ClientConfig, DiscoveryMode, RequestHandler, Server, ServerConfig};
 use deadcat_rfq_rpc::{
@@ -24,6 +23,10 @@ use deadcat_rfq_rpc::{
     QuoteExecutionDto, QuoteInputDto, QuoteKindDto, QuoteOutputDto, QuoteOutputRoleDto,
     QuoteRecipientDto, Request, ReservationStateDto, ReservationStatusDto, Response, RpcError,
     SettlementLayoutDto, SettlementPset, SignedFirmQuote, SnapshotEvidenceDto, TxOutDto,
+};
+use deadcat_rfq_wallet::{
+    KdfParams, PersistentRfqWallet, PersistentWalletError, TakerFundingError, TakerFundingLimits,
+    TakerFundingPool, TakerWalletIdentity,
 };
 use deadcat_rpc::{ContractParametersView, ContractStateView, ContractView, LiveOutpoint};
 use deadcat_types::{
@@ -83,25 +86,7 @@ fn quote_recipient(spend_marker: u8, blinding_marker: u8) -> QuoteRecipientDto {
     }
 }
 
-fn client_recipient(spend_marker: u8, blinding_marker: u8) -> ConfidentialRecipient {
-    ConfidentialRecipient::new(
-        p2tr_script(spend_marker),
-        BitcoinPublicKey::new(blinding_public_key(blinding_marker)),
-    )
-    .expect("valid confidential recipient")
-}
-
-fn explicit_txout(asset: AssetId, amount: u64, spend_marker: u8) -> TxOut {
-    TxOut {
-        asset: Asset::Explicit(asset),
-        value: Value::Explicit(amount),
-        nonce: Nonce::Null,
-        script_pubkey: p2tr_script(spend_marker),
-        witness: TxOutWitness::empty(),
-    }
-}
-
-fn confidential_p2tr_txout(asset: AssetId, amount: u64) -> TxOut {
+fn confidential_p2tr_txout(asset: AssetId, amount: u64) -> (TxOut, TxOutSecrets) {
     let secp = Secp256k1::new();
     let explicit = TxOut {
         asset: Asset::Explicit(asset),
@@ -111,7 +96,7 @@ fn confidential_p2tr_txout(asset: AssetId, amount: u64) -> TxOut {
         witness: TxOutWitness::empty(),
     };
     let mut rng = StdRng::from_seed([0x73; 32]);
-    explicit
+    let (txout, asset_bf, value_bf, _) = explicit
         .to_non_last_confidential(
             &mut rng,
             &secp,
@@ -123,8 +108,8 @@ fn confidential_p2tr_txout(asset: AssetId, amount: u64) -> TxOut {
                 ValueBlindingFactor::zero(),
             )],
         )
-        .expect("confidential provider prevout")
-        .0
+        .expect("confidential provider prevout");
+    (txout, TxOutSecrets::new(asset, asset_bf, amount, value_bf))
 }
 
 fn chain() -> ChainIdentity {
@@ -188,7 +173,12 @@ fn trading_market(policy_asset: AssetId, outcome_asset: AssetId) -> (TradingMark
     (market, chain)
 }
 
-fn quote(provider: EndpointId, request: &deadcat_rfq_rpc::FirmQuoteRequestDto) -> FirmQuoteDto {
+fn quote(
+    provider: EndpointId,
+    request: &deadcat_rfq_rpc::FirmQuoteRequestDto,
+    market: &TradingMarket,
+    provider_prevout: &TxOut,
+) -> FirmQuoteDto {
     let QuoteKindDto::ExactIn {
         input,
         output_asset,
@@ -223,8 +213,8 @@ fn quote(provider: EndpointId, request: &deadcat_rfq_rpc::FirmQuoteRequestDto) -
             revision: 1,
         },
         snapshot: SnapshotEvidenceDto {
-            block_hash: BlockHash::from_byte_array([0x64; 32]),
-            block_height: 100,
+            block_hash: market.observed_at().hash,
+            block_height: market.observed_at().height,
             snapshot_commitment: FixedBytes32::new([0x65; 32]),
             allocation_revision: 2,
             eligible_commitment: FixedBytes32::new([0x66; 32]),
@@ -232,7 +222,7 @@ fn quote(provider: EndpointId, request: &deadcat_rfq_rpc::FirmQuoteRequestDto) -
         inputs: vec![QuoteInputDto {
             id: 7,
             outpoint: outpoint(0x67, 0),
-            witness_utxo: TxOutDto::from_txout(&confidential_p2tr_txout(output_asset, 200)),
+            witness_utxo: TxOutDto::from_txout(provider_prevout),
             internal_key: FixedBytes32::new(keypair(0x71).x_only_public_key().0.serialize()),
             inventory_binding: FixedBytes32::new([0x68; 32]),
         }],
@@ -266,7 +256,7 @@ fn quote(provider: EndpointId, request: &deadcat_rfq_rpc::FirmQuoteRequestDto) -
         accept_before_millis: ACCEPT_BEFORE_MILLIS,
         fee_policy: FeePolicyDto {
             policy_asset: request.context.policy_asset,
-            minimum_sats_per_kvb: 100,
+            minimum_sats_per_kvb: 1,
             minimum_absolute_fee: 10,
             maximum_transaction_weight: 100_000,
             size_metric: FeeSizeMetricDto::DiscountVbytes,
@@ -298,6 +288,7 @@ struct ObservedRequests {
     quote_peer: Option<[u8; 32]>,
     quote_idempotency: Option<IdempotencyKeyDto>,
     blind: Option<(SettlementLayoutDto, SettlementPset)>,
+    provider_blinded: Option<SettlementPset>,
     execute: Option<(SettlementLayoutDto, SettlementPset)>,
     events: Vec<&'static str>,
 }
@@ -306,27 +297,13 @@ struct FixtureHandler {
     provider_key: SecretKey,
     chain: ChainIdentity,
     policy_asset: AssetId,
+    market: TradingMarket,
+    provider_prevout: TxOut,
+    provider_input_secrets: TxOutSecrets,
     observed: Arc<Mutex<ObservedRequests>>,
     status_calls: AtomicUsize,
     status_reserved: AtomicBool,
     execute_delay_millis: AtomicUsize,
-}
-
-/// Test-only seam: this transport/composition fixture deliberately does not
-/// claim to implement the wallet's whole-PSET validation and signing policy.
-struct EchoTestAuthorizer;
-
-impl TakerSettlementAuthorizer for EchoTestAuthorizer {
-    type Error = std::convert::Infallible;
-
-    fn validate_and_sign(
-        &self,
-        _binding: &ExecutionBinding,
-        _layout: &SettlementLayoutDto,
-        provider_blinded_pset: &SettlementPset,
-    ) -> Result<SettlementPset, Self::Error> {
-        Ok(provider_blinded_pset.clone())
-    }
 }
 
 impl RequestHandler for FixtureHandler {
@@ -346,7 +323,12 @@ impl RequestHandler for FixtureHandler {
                 request,
             } => {
                 let client = EndpointId::from_bytes(&peer).expect("authenticated fixture peer");
-                let quote = quote(self.provider_key.public(), &request);
+                let quote = quote(
+                    self.provider_key.public(),
+                    &request,
+                    &self.market,
+                    &self.provider_prevout,
+                );
                 let signed =
                     SignedFirmQuote::sign(quote, &self.provider_key, client, idempotency_key)
                         .expect("structurally valid provider quote");
@@ -369,11 +351,29 @@ impl RequestHandler for FixtureHandler {
                 layout,
                 pset,
             } => {
-                self.observed.lock().expect("observed request lock").blind =
-                    Some((layout, pset.clone()));
+                let mut provider_pset = pset.to_pset().expect("submitted settlement PSET");
+                let provider_input = usize::from(
+                    layout
+                        .provider_inputs
+                        .first()
+                        .expect("fixture provider input")
+                        .transaction_index,
+                );
+                provider_pset
+                    .blind_non_last(
+                        &mut StdRng::from_seed([0x74; 32]),
+                        &Secp256k1::new(),
+                        &HashMap::from([(provider_input, self.provider_input_secrets)]),
+                    )
+                    .expect("provider non-last blinding turn");
+                let provider_blinded =
+                    SettlementPset::from_pset(&provider_pset).expect("provider-blinded PSET");
+                let mut observed = self.observed.lock().expect("observed request lock");
+                observed.blind = Some((layout, pset));
+                observed.provider_blinded = Some(provider_blinded.clone());
                 Response::BlindedPset {
                     reservation_id,
-                    pset,
+                    pset: provider_blinded,
                 }
             }
             Request::Execute { layout, pset, .. } => {
@@ -413,25 +413,47 @@ impl RequestHandler for FixtureHandler {
     }
 }
 
-fn wallet_contribution(policy_asset: AssetId, payer: OutPoint) -> TransactionContribution {
-    TransactionContribution::new(
-        vec![InputSpec::tree_less_p2tr_sighash_all(
-            InputId::new(1),
-            payer,
-            explicit_txout(policy_asset, 200, 0x81),
-            InputSequence::Final,
-            keypair(0x81).x_only_public_key().0,
-        )],
-        vec![OutputSpec::confidential(
-            OutputId::new(1),
-            policy_asset,
-            90,
-            p2tr_script(0x82),
-            BitcoinPublicKey::new(blinding_public_key(0x83)),
-            BlinderRef::Local(InputId::new(1)),
-        )],
-        LockTimeConstraint::Unconstrained,
-    )
+struct TestSettlementSource {
+    chain: ChainIdentity,
+    market: TradingMarket,
+    observed_at_millis: u64,
+    prevouts: BTreeMap<OutPoint, TxOut>,
+}
+
+impl TakerSettlementSource for TestSettlementSource {
+    type Error = std::io::Error;
+
+    fn settlement_snapshot(
+        &self,
+        chain: ChainIdentity,
+        market: ContractId,
+        quote_anchor: ChainAnchor,
+        outpoints: &[OutPoint],
+    ) -> Result<TakerSettlementSnapshot, Self::Error> {
+        if chain != self.chain
+            || market != self.market.contract_id()
+            || quote_anchor != self.market.observed_at()
+        {
+            return Err(std::io::Error::other(
+                "settlement snapshot binding mismatch",
+            ));
+        }
+        let prevouts = outpoints
+            .iter()
+            .map(|outpoint| {
+                self.prevouts
+                    .get(outpoint)
+                    .cloned()
+                    .map(|txout| AuthoritativeTakerPrevout::new(*outpoint, txout))
+                    .ok_or_else(|| std::io::Error::other("requested prevout is not unspent"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(TakerSettlementSnapshot::new(
+            self.observed_at_millis,
+            self.market.clone(),
+            prevouts,
+        ))
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -442,11 +464,15 @@ async fn authenticated_session_prepares_composes_and_executes_an_exact_rfq_route
     let policy_asset = asset(0x41);
     let outcome_asset = asset(0x42);
     let (market, chain) = trading_market(policy_asset, outcome_asset);
+    let (provider_prevout, provider_input_secrets) = confidential_p2tr_txout(outcome_asset, 200);
     let observed = Arc::new(Mutex::new(ObservedRequests::default()));
     let handler = Arc::new(FixtureHandler {
         provider_key: provider_key.clone(),
         chain,
         policy_asset,
+        market: market.clone(),
+        provider_prevout: provider_prevout.clone(),
+        provider_input_secrets,
         observed: Arc::clone(&observed),
         status_calls: AtomicUsize::new(0),
         status_reserved: AtomicBool::new(false),
@@ -470,7 +496,65 @@ async fn authenticated_session_prepares_composes_and_executes_an_exact_rfq_route
             .expect("provider-pinned RFQ session");
     assert_eq!(session.provider_info().capabilities, ALL_CAPABILITIES);
 
+    let wallet_directory = tempfile::tempdir().expect("taker wallet directory");
+    let taker_identity =
+        TakerWalletIdentity::new(expected_client, chain.genesis_hash, policy_asset)
+            .expect("taker wallet identity");
+    let wallet = Arc::new(
+        PersistentRfqWallet::create_taker_with_kdf(
+            wallet_directory.path().join("wallet.redb"),
+            taker_identity,
+            b"session-route-test-passphrase",
+            KdfParams::new(8 * 1_024, 1, 1).expect("test KDF"),
+        )
+        .expect("persistent taker wallet"),
+    );
+    let funding_destination = wallet
+        .fresh_inventory_destination()
+        .expect("durable taker funding destination");
+    let funding_opening = TxOutSecrets::new(
+        policy_asset,
+        AssetBlindingFactor::zero(),
+        200,
+        ValueBlindingFactor::zero(),
+    );
+    let explicit_funding = TxOut {
+        asset: Asset::Explicit(policy_asset),
+        value: Value::Explicit(200),
+        nonce: Nonce::Null,
+        script_pubkey: funding_destination.script_pubkey().clone(),
+        witness: TxOutWitness::empty(),
+    };
+    let funding_txout = explicit_funding
+        .to_non_last_confidential(
+            &mut StdRng::from_seed([0x75; 32]),
+            &Secp256k1::new(),
+            funding_destination.blinding_public_key(),
+            &[funding_opening],
+        )
+        .expect("confidential taker funding output")
+        .0;
     let payer = outpoint(0x83, 0);
+    let funding_utxo = wallet
+        .recover_taker_utxo(
+            funding_destination.wallet_locator(),
+            payer,
+            funding_txout.clone(),
+        )
+        .expect("wallet-authenticated taker funding output");
+    let funding_pool = TakerFundingPool::new(
+        Arc::clone(&wallet),
+        taker_identity,
+        vec![funding_utxo],
+        BTreeSet::new(),
+    )
+    .expect("taker funding pool");
+    let receive_destination = funding_pool
+        .fresh_receive_destination()
+        .expect("one-time taker receive destination");
+    let receive_recipient = receive_destination
+        .recipient()
+        .expect("wallet receive recipient");
     let context = VenueContext {
         chain,
         market: contract_id(),
@@ -481,13 +565,19 @@ async fn authenticated_session_prepares_composes_and_executes_an_exact_rfq_route
         AssetAmount::new(policy_asset, 100).expect("nonzero input"),
         outcome_asset,
         170,
-        client_recipient(0x84, 0x85),
+        receive_recipient.clone(),
         BTreeMap::from([(policy_asset, 10)]),
         10,
     )
     .expect("valid user execution request");
+    let funding_lease = funding_pool
+        .reserve_request(&request, receive_destination, TakerFundingLimits::default())
+        .expect("full worst-case funding is leased before requesting a quote");
+    assert_eq!(funding_lease.selected_outpoints(), &BTreeSet::from([payer]));
+    assert_eq!(funding_lease.projected_wallet_input_count(), 1);
+    assert_eq!(funding_lease.maximum_change_output_count(), 1);
     let leg_request = request
-        .exact_in_leg(LegId::new(9), 100, payer)
+        .exact_in_leg(LegId::new(9), 100, funding_lease.payer_blinder())
         .expect("exact RFQ allocation");
     let intent = RfqQuoteIntent::new(
         &leg_request,
@@ -541,24 +631,40 @@ async fn authenticated_session_prepares_composes_and_executes_an_exact_rfq_route
         .expect("substituted route is economically valid in isolation")
         .compose(
             CompositionLimits::default(),
-            wallet_contribution(policy_asset, payer),
+            TransactionContribution::new(
+                vec![InputSpec::tree_less_p2tr_sighash_all(
+                    InputId::new(1),
+                    payer,
+                    funding_txout.clone(),
+                    InputSequence::Final,
+                    funding_destination.internal_key(),
+                )],
+                vec![OutputSpec::confidential(
+                    OutputId::new(1),
+                    policy_asset,
+                    90,
+                    p2tr_script(0x82),
+                    BitcoinPublicKey::new(blinding_public_key(0x83)),
+                    BlinderRef::Local(InputId::new(1)),
+                )],
+                LockTimeConstraint::Unconstrained,
+            ),
         )
         .expect("substituted route composition");
     assert!(matches!(
         binding.resolve(&substituted_route),
         Err(deadcat_rfq_client::RfqVenueError::RouteLegMismatch)
     ));
-    let route = request
+    let validated_route = request
         .validate_route(
             vec![prepared_leg],
             NetworkFee::new(policy_asset, 10).expect("network fee"),
         )
-        .expect("aggregate-valid RFQ route")
-        .compose(
-            CompositionLimits::default(),
-            wallet_contribution(policy_asset, payer),
-        )
-        .expect("route composition");
+        .expect("aggregate-valid RFQ route");
+    let funded_route = funding_lease
+        .fund_route(validated_route, CompositionLimits::default())
+        .expect("wallet-funded route composition without post-quote inputs");
+    let (route, settlement_wallet) = funded_route.into_parts();
     let settlement = binding.resolve(&route).expect("exact global RFQ layout");
     let layout = settlement.layout();
     assert_eq!(layout.taker_payment_input, 0);
@@ -602,11 +708,8 @@ async fn authenticated_session_prepares_composes_and_executes_an_exact_rfq_route
     let receive = &composed_pset.outputs()[2];
     assert_eq!(receive.asset, Some(outcome_asset));
     assert_eq!(receive.amount, Some(180));
-    assert_eq!(receive.script_pubkey, p2tr_script(0x84));
-    assert_eq!(
-        receive.blinding_key,
-        Some(BitcoinPublicKey::new(blinding_public_key(0x85)))
-    );
+    assert_eq!(receive.script_pubkey, *receive_recipient.script_pubkey());
+    assert_eq!(receive.blinding_key, Some(receive_recipient.blinding_key()));
     assert_eq!(receive.blinder_index, Some(1));
     let provider_change = &composed_pset.outputs()[3];
     assert_eq!(provider_change.asset, Some(outcome_asset));
@@ -621,8 +724,17 @@ async fn authenticated_session_prepares_composes_and_executes_an_exact_rfq_route
             .minimum_absolute_fee,
         10
     );
-    TakerSettlementPlan::new(&route, &binding)
+    let plan = TakerSettlementPlan::new(&route, &binding)
         .expect("production plan constructor binds the route, RFQ, and exact intent market");
+    let source = TestSettlementSource {
+        chain,
+        market: market.clone(),
+        observed_at_millis: 2_000,
+        prevouts: BTreeMap::from([
+            (payer, funding_txout.clone()),
+            (outpoint(0x67, 0), provider_prevout.clone()),
+        ]),
+    };
 
     let pset = SettlementPset::from_pset(composed_pset).expect("composed PSET");
     assert!(matches!(
@@ -643,10 +755,32 @@ async fn authenticated_session_prepares_composes_and_executes_an_exact_rfq_route
         .blind_at(&live, &settlement, pset.clone(), 1_600)
         .await
         .expect("typed provider blinding request");
-    assert_eq!(blinded.pset(), &pset);
+    assert_ne!(blinded.pset(), &pset);
+    assert_eq!(
+        Some(blinded.pset()),
+        observed
+            .lock()
+            .expect("observed request lock")
+            .provider_blinded
+            .as_ref(),
+        "the authenticated response survives the provider serialization round trip"
+    );
+    let coordinator = TakerSettlementCoordinator::new(plan, &source, &settlement_wallet);
     let authorized = blinded
-        .authorize_with(&EchoTestAuthorizer)
-        .expect("infallible test-only authorization seam");
+        .authorize_with(&coordinator)
+        .expect("authoritative wallet-backed taker authorization");
+    let second_signing_error = blinded
+        .authorize_with(&coordinator)
+        .expect_err("one settlement-scoped wallet capability signs only once");
+    assert!(matches!(
+        second_signing_error,
+        TakerAuthorizationError::Wallet(error)
+            if matches!(
+                error.downcast_ref::<PersistentWalletError>(),
+                Some(PersistentWalletError::TakerSettlementAlreadySigned)
+            )
+    ));
+    drop(coordinator);
     let attempt = authorized.into_execution_attempt();
     let journal_directory = tempfile::tempdir().expect("execution journal directory");
     let journal = RedbExecutionJournal::open(journal_directory.path().join("executions.redb"))
@@ -657,6 +791,35 @@ async fn authenticated_session_prepares_composes_and_executes_an_exact_rfq_route
     let journaled = journal
         .arm(&recovery, &attempt)
         .expect("attempt durably armed before Execute");
+    let armed_funding = settlement_wallet
+        .mark_durably_armed(&journaled)
+        .expect("exact wallet-signed attempt promotes the lease to durable exclusions");
+    assert_eq!(armed_funding.outpoints(), &BTreeSet::from([payer]));
+    drop(settlement_wallet);
+
+    let unavailable_receive = funding_pool
+        .fresh_receive_destination()
+        .expect("fresh destination for a later route");
+    let unavailable_request = ExecutionRequest::exact_in(
+        context,
+        AssetAmount::new(policy_asset, 100).expect("nonzero input"),
+        outcome_asset,
+        170,
+        unavailable_receive
+            .recipient()
+            .expect("later wallet receive recipient"),
+        BTreeMap::from([(policy_asset, 10)]),
+        10,
+    )
+    .expect("later user execution request");
+    assert!(matches!(
+        funding_pool.reserve_request(
+            &unavailable_request,
+            unavailable_receive,
+            TakerFundingLimits::default(),
+        ),
+        Err(TakerFundingError::InsufficientFunds { asset }) if asset == policy_asset
+    ));
     let executed = session
         .execute_at(&live, &settlement, &journaled, 1_700)
         .await

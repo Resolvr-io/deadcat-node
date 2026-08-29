@@ -697,14 +697,21 @@ market evidence, a production pricing source, relay/reconciliation,
 authenticated-owner request-rate limits, external backup freshness,
 process-kill acceptance coverage, host memory hardening, and HSM support remain
 outside the current slice.
-The first taker integration now implements the keyless whole-PSET authorization
-and restart-safe execution boundaries after route composition. It still does
-not select wallet inputs/change or supply a production wallet backend, but it
-validates the provider-blinded transaction against authoritative current state
-and prevouts, delegates balancing blinding and user-first signing, verifies the
-wallet-authorized and later provider-signed results, and persists/drives exact
-ambiguous Execute recovery. Broadcast, confirmation monitoring, and production
-wallet integration remain future work.
+The taker integration now implements both the keyless whole-PSET authorization
+and the first concrete custom-wallet funding boundary. The wallet authenticates
+confidential inventory, exclusively leases the complete worst-case input set
+before a quote fixes the fee and shape, creates exact confidential change, and
+scopes blinding, owned-output recovery, and one-shot signing to the final route
+and composition layout. Once the exact wallet-signed PSET is journaled, its
+inputs are promoted into a revision-guarded durable exclusion set; stale chain
+or journal refreshes cannot make an ambiguous attempt spendable again.
+
+The remaining production taker runtime must supply the authoritative chain
+scan, fee selection, and the high-level quote-to-journal coordinator. That
+coordinator must obtain the durable-funding proof before the first Execute
+dispatch and restore exclusions from every non-terminal journal record before
+serving new funding work after restart. Broadcast and confirmation monitoring
+also remain future work.
 The initial profile accepts exactly one RFQ leg plus ordinary tree-less P2TR
 key-path inputs with explicit `SIGHASH_ALL`. Simplicity covenant inputs and more
 than one interactive RFQ signer remain later router/venue-verification work;
