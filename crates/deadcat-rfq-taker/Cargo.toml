@@ -1,0 +1,27 @@
+[package]
+name = "deadcat-rfq-taker"
+description = "Fail-closed wallet-backed taker orchestration for Deadcat RFQ trades."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+deadcat-client.workspace = true
+deadcat-rfq-client.workspace = true
+deadcat-rfq-rpc.workspace = true
+deadcat-rfq-wallet.workspace = true
+elements.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+deadcat-contracts.workspace = true
+deadcat-rfq-iroh.workspace = true
+deadcat-rpc.workspace = true
+deadcat-types.workspace = true
+iroh.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

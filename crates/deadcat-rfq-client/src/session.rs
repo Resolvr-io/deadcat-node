@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
-use crate::journal::{ExecutionJournalRecordError, JournaledExecution};
+use crate::journal::{ExecutionJournalKey, ExecutionJournalRecordError, JournaledExecution};
 use crate::settlement::{
     ExecutionAttempt, ExecutionAttemptDigest, ExecutionAttemptError, ProviderBlindedPset,
 };
@@ -32,6 +32,45 @@ const REQUIRED_CAPABILITIES: [ProviderCapability; 4] = [
     ProviderCapability::SettlementExecution,
     ProviderCapability::DurableStatus,
 ];
+
+/// An execution status accepted through an authenticated RFQ session and
+/// validated against one exact durably journaled attempt.
+///
+/// This is an in-memory capability, not a wire or persistence type. Its
+/// contents can be inspected, but only [`RfqSession::execute_at`] and
+/// [`RfqSession::retry_armed_execution`] can construct it. Requiring this type
+/// at the execution-journal boundary prevents a caller from forging a raw
+/// [`ReservationStatusDto`]—most importantly a false `Released` status that
+/// could otherwise make wallet inputs appear reusable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthenticatedExecutionStatus {
+    journal_key: ExecutionJournalKey,
+    attempt_digest: ExecutionAttemptDigest,
+    status: ReservationStatusDto,
+}
+
+impl AuthenticatedExecutionStatus {
+    fn new(journaled: &JournaledExecution, status: ReservationStatusDto) -> Self {
+        Self {
+            journal_key: journaled.key(),
+            attempt_digest: journaled.attempt().digest(),
+            status,
+        }
+    }
+
+    pub(crate) const fn journal_key(&self) -> ExecutionJournalKey {
+        self.journal_key
+    }
+
+    pub(crate) const fn attempt_digest(&self) -> ExecutionAttemptDigest {
+        self.attempt_digest
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> &ReservationStatusDto {
+        &self.status
+    }
+}
 
 /// Serializable evidence needed to reauthenticate a firm quote after restart.
 ///
@@ -898,7 +937,7 @@ impl RfqSession {
         settlement: &ResolvedRfqSettlement,
         journaled: &JournaledExecution,
         now_millis: u64,
-    ) -> Result<ReservationStatusDto, ExecuteError> {
+    ) -> Result<AuthenticatedExecutionStatus, ExecuteError> {
         self.validate_handle_context(&reservation.handle)
             .map_err(ExecuteError::BeforeSubmission)?;
         validate_settlement_binding(&reservation.handle, settlement)
@@ -933,7 +972,7 @@ impl RfqSession {
                 attempt: journaled.attempt().digest(),
                 source,
             })?;
-        Ok(status)
+        Ok(AuthenticatedExecutionStatus::new(journaled, status))
     }
 
     /// Recover status and, only while it is still reserved, replay one exact
@@ -947,7 +986,7 @@ impl RfqSession {
     pub async fn retry_armed_execution(
         &self,
         journaled: &JournaledExecution,
-    ) -> Result<ReservationStatusDto, ExecuteError> {
+    ) -> Result<AuthenticatedExecutionStatus, ExecuteError> {
         let uncertain = |source| ExecuteError::SubmissionUncertain {
             attempt: journaled.attempt().digest(),
             source,
@@ -965,7 +1004,7 @@ impl RfqSession {
             .map_err(SessionError::InvalidExecutionJournal)
             .map_err(uncertain)?;
         if !matches!(replay.status.state, ReservationStateDto::Reserved) {
-            return Ok(replay.status);
+            return Ok(AuthenticatedExecutionStatus::new(journaled, replay.status));
         }
         let status = self
             .dispatch_execution(&replay.handle, journaled.attempt())
@@ -974,7 +1013,7 @@ impl RfqSession {
             .validate_next_status(&status)
             .map_err(SessionError::InvalidExecutionJournal)
             .map_err(uncertain)?;
-        Ok(status)
+        Ok(AuthenticatedExecutionStatus::new(journaled, status))
     }
 
     async fn dispatch_execution(
@@ -1379,7 +1418,7 @@ mod tests {
 
     use crate::journal::{
         ExecutionJournal as _, ExecutionJournalError, ExecutionJournalRecordError,
-        RedbExecutionJournal,
+        MAX_EXECUTION_JOURNAL_PAGE_SIZE, RedbExecutionJournal,
     };
     use crate::settlement::ExecutionBinding;
 
@@ -1588,6 +1627,40 @@ mod tests {
                 state: ReservationStateDto::Reserved,
             })
             .expect("bound replay")
+    }
+
+    fn replay_for_reservation(reservation_index: u16) -> QuoteReplay {
+        let (signed, request, provider_key, client_key, idempotency_key) = signed_quote_fixture();
+        let mut quote = signed.quote;
+        let mut reservation_id = [0_u8; 32];
+        reservation_id[30..].copy_from_slice(&reservation_index.to_be_bytes());
+        quote.reservation_id = FixedBytes32::new(reservation_id);
+        let signed =
+            SignedFirmQuote::sign(quote, &provider_key, client_key.public(), idempotency_key)
+                .expect("valid indexed signed quote");
+        let verified = signed
+            .verify(
+                provider_key.public(),
+                client_key.public(),
+                idempotency_key,
+                &request,
+            )
+            .expect("authentic indexed quote");
+        let handle = ReservationHandle::from_quote(
+            verified.quote(),
+            provider_key.public(),
+            client_key.public(),
+        );
+        let config = SessionConfig::new(ClientConfig::default(), 10_000, 1_000).expect("config");
+        AuthenticatedQuote::new(verified, handle, &config, Some(1_500))
+            .into_replay(ReservationStatusDto {
+                reservation_id: FixedBytes32::new(reservation_id),
+                quote_commitment: FixedBytes32::new([0x31; 32]),
+                created_at_millis: 1_000,
+                accept_before_millis: 10_000,
+                state: ReservationStateDto::Reserved,
+            })
+            .expect("bound indexed replay")
     }
 
     fn execution_attempt(replay: &QuoteReplay, fee: u64) -> ExecutionAttempt {
@@ -1913,7 +1986,7 @@ mod tests {
         let path = directory.path().join("executions.redb");
 
         {
-            let journal = RedbExecutionJournal::open(&path).expect("open journal");
+            let journal = RedbExecutionJournal::create(&path).expect("create journal");
             let armed = journal.arm(&quote, &attempt).expect("durably arm");
             assert_eq!(armed.revision(), 0);
             let same = journal.arm(&quote, &attempt).expect("idempotent arm");
@@ -1979,46 +2052,103 @@ mod tests {
     }
 
     #[test]
+    fn journal_pagination_rejects_a_misplaced_row_after_the_first_full_page() {
+        let directory = tempfile::tempdir().expect("journal directory");
+        let journal = RedbExecutionJournal::create(directory.path().join("executions.redb"))
+            .expect("create journal");
+        let mut records = Vec::with_capacity(MAX_EXECUTION_JOURNAL_PAGE_SIZE + 1);
+        for reservation_index in 0..=MAX_EXECUTION_JOURNAL_PAGE_SIZE {
+            let replay = replay_for_reservation(
+                u16::try_from(reservation_index).expect("page fixture fits u16"),
+            );
+            let quote = replay.to_recovery_record().expect("recovery record");
+            let attempt = execution_attempt(&replay, 50);
+            records.push(journal.arm(&quote, &attempt).expect("durably arm row"));
+        }
+
+        let first_page = journal
+            .list_after(None, MAX_EXECUTION_JOURNAL_PAGE_SIZE)
+            .expect("first full page");
+        assert_eq!(first_page.len(), MAX_EXECUTION_JOURNAL_PAGE_SIZE);
+        let cursor = first_page.last().expect("full page has a cursor").key();
+        assert_eq!(cursor, records[MAX_EXECUTION_JOURNAL_PAGE_SIZE - 1].key());
+
+        journal
+            .overwrite_record_at_storage_key_for_test(
+                records[MAX_EXECUTION_JOURNAL_PAGE_SIZE].key(),
+                &records[0].to_record(),
+            )
+            .expect("inject a valid record under the wrong second-page key");
+        assert!(matches!(
+            journal.list_after(Some(cursor), MAX_EXECUTION_JOURNAL_PAGE_SIZE),
+            Err(ExecutionJournalError::KeyMismatch)
+        ));
+    }
+
+    #[test]
     fn durable_journal_cas_enforces_monotonic_provider_observations() {
         let replay = replay(Some(1_500));
         let quote = replay.to_recovery_record().expect("recovery record");
         let attempt = execution_attempt(&replay, 50);
         let directory = tempfile::tempdir().expect("journal directory");
-        let journal = RedbExecutionJournal::open(directory.path().join("executions.redb"))
-            .expect("open journal");
+        let journal = RedbExecutionJournal::create(directory.path().join("executions.redb"))
+            .expect("create journal");
         let armed = journal.arm(&quote, &attempt).expect("durably arm");
         let key = armed.key();
 
-        let reserved = bound_status(&replay, ReservationStateDto::Reserved);
+        let other_attempt = execution_attempt(&replay, 51);
+        let other_directory = tempfile::tempdir().expect("other journal directory");
+        let other_journal =
+            RedbExecutionJournal::create(other_directory.path().join("executions.redb"))
+                .expect("create other journal");
+        let other_armed = other_journal
+            .arm(&quote, &other_attempt)
+            .expect("durably arm other exact attempt");
+        let cross_attempt_status = AuthenticatedExecutionStatus::new(
+            &other_armed,
+            bound_status(&replay, ReservationStateDto::Reserved),
+        );
+        assert!(matches!(
+            journal.observe(key, 0, &cross_attempt_status),
+            Err(ExecutionJournalError::AuthenticatedStatusAttemptMismatch)
+        ));
+
+        let reserved = AuthenticatedExecutionStatus::new(
+            &armed,
+            bound_status(&replay, ReservationStateDto::Reserved),
+        );
         let observed = journal
-            .observe(key, 0, reserved.clone())
+            .observe(key, 0, &reserved)
             .expect("record reserved status");
         assert_eq!(observed.revision(), 1);
         let idempotent = journal
-            .observe(key, 1, reserved.clone())
+            .observe(key, 1, &reserved)
             .expect("idempotent observation");
         assert_eq!(idempotent.revision(), 1);
 
-        let committed = bound_status(
-            &replay,
-            ReservationStateDto::Committed {
-                signing_commitment: FixedBytes32::new([0x78; 32]),
-                committed_at_millis: 2_000,
-            },
+        let committed = AuthenticatedExecutionStatus::new(
+            &armed,
+            bound_status(
+                &replay,
+                ReservationStateDto::Committed {
+                    signing_commitment: FixedBytes32::new([0x78; 32]),
+                    committed_at_millis: 2_000,
+                },
+            ),
         );
         assert!(matches!(
-            journal.observe(key, 0, committed.clone()),
+            journal.observe(key, 0, &committed),
             Err(ExecutionJournalError::RevisionConflict {
                 expected: 0,
                 actual: 1
             })
         ));
         let committed = journal
-            .observe(key, 1, committed)
+            .observe(key, 1, &committed)
             .expect("advance to committed");
         assert_eq!(committed.revision(), 2);
         assert!(matches!(
-            journal.observe(key, 2, reserved),
+            journal.observe(key, 2, &reserved),
             Err(ExecutionJournalError::InvalidRecord(
                 ExecutionJournalRecordError::StatusRegression
             ))
