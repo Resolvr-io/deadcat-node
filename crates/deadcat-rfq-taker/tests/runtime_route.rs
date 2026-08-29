@@ -8,9 +8,9 @@ use deadcat_client::validation::validate_contract_view;
 use deadcat_client::venue::{AssetAmount, VenueContext};
 use deadcat_contracts::binary_market::BinaryMarketSlot;
 use deadcat_rfq_client::{
-    AuthoritativeTakerPrevout, ExecutionJournal as _, ExecutionJournalObservation, ProviderTarget,
-    RedbExecutionJournal, RfqSession, SessionConfig, TakerSettlementSnapshot,
-    TakerSettlementSource, TradingMarket,
+    AuthoritativeTakerPrevout, ExecutionJournal as _, ExecutionJournalBinding,
+    ExecutionJournalObservation, ProviderTarget, RedbExecutionJournal, RfqSession, SessionConfig,
+    TakerSettlementSnapshot, TakerSettlementSource, TradingMarket,
 };
 use deadcat_rfq_iroh::{ClientConfig, DiscoveryMode, RequestHandler, Server, ServerConfig};
 use deadcat_rfq_rpc::{
@@ -541,7 +541,8 @@ async fn run_runtime_route(
 ) {
     let provider_key = SecretKey::from_bytes(&[0x11; 32]);
     let client_key = SecretKey::from_bytes(&[0x12; 32]);
-    let expected_client = *client_key.public().as_bytes();
+    let client_endpoint = client_key.public();
+    let expected_client = *client_endpoint.as_bytes();
     let policy_asset = asset(0x41);
     let outcome_asset = asset(0x42);
     let (market, chain) = trading_market(policy_asset, outcome_asset);
@@ -587,11 +588,12 @@ async fn run_runtime_route(
         .expect("provider-pinned RFQ session");
 
     let wallet_directory = tempfile::tempdir().expect("taker wallet directory");
-    let wallet_owner = if reject_wrong_session_identity {
-        [0x91; 32]
+    let wallet_endpoint = if reject_wrong_session_identity {
+        SecretKey::from_bytes(&[0x91; 32]).public()
     } else {
-        expected_client
+        client_endpoint
     };
+    let wallet_owner = *wallet_endpoint.as_bytes();
     let taker_identity = TakerWalletIdentity::new(wallet_owner, chain.genesis_hash, policy_asset)
         .expect("taker wallet identity");
     let wallet = Arc::new(
@@ -633,7 +635,16 @@ async fn run_runtime_route(
 
     let journal_directory = tempfile::tempdir().expect("execution journal directory");
     let journal_path = journal_directory.path().join("executions.redb");
-    let journal = RedbExecutionJournal::create(&journal_path).expect("durable execution journal");
+    let journal_binding = ExecutionJournalBinding::new(
+        FixedBytes32::new([0x87; 32]),
+        FixedBytes32::new(wallet.instance_id().to_bytes()),
+        wallet_endpoint,
+        chain,
+        policy_asset,
+    )
+    .expect("execution journal binding");
+    let journal = RedbExecutionJournal::create(&journal_path, journal_binding)
+        .expect("durable execution journal");
     let config = RfqTakerConfig::new(
         TakerFundingLimits::default(),
         CompositionLimits::default(),
@@ -741,9 +752,19 @@ async fn run_runtime_route(
         };
         let foreign_journal_directory =
             tempfile::tempdir().expect("foreign execution journal directory");
-        let foreign_journal =
-            RedbExecutionJournal::create(foreign_journal_directory.path().join("executions.redb"))
-                .expect("foreign durable execution journal");
+        let foreign_journal_binding = ExecutionJournalBinding::new(
+            FixedBytes32::new([0x88; 32]),
+            FixedBytes32::new(foreign_wallet.instance_id().to_bytes()),
+            wallet_endpoint,
+            chain,
+            policy_asset,
+        )
+        .expect("foreign execution journal binding");
+        let foreign_journal = RedbExecutionJournal::create(
+            foreign_journal_directory.path().join("executions.redb"),
+            foreign_journal_binding,
+        )
+        .expect("foreign durable execution journal");
         let foreign_runtime = RfqTakerRuntime::from_source(
             foreign_wallet,
             taker_identity,
@@ -869,8 +890,8 @@ async fn run_runtime_route(
         .expect("foreign client identity");
         let (_foreign_client_directory, foreign_client_wallet) =
             empty_taker_wallet(foreign_client_identity);
-        let foreign_client_journal =
-            RedbExecutionJournal::open(&journal_path).expect("reopen for client identity check");
+        let foreign_client_journal = RedbExecutionJournal::open(&journal_path, journal_binding)
+            .expect("reopen for client identity check");
         assert!(matches!(
             RfqTakerRuntime::from_source(
                 foreign_client_wallet,
@@ -880,7 +901,7 @@ async fn run_runtime_route(
                 config,
             ),
             Err(RfqTakerError::FundingRecovery(
-                FundingRecoveryError::JournalClientEndpointMismatch { .. }
+                FundingRecoveryError::JournalBindingClientEndpointMismatch
             ))
         ));
 
@@ -892,8 +913,8 @@ async fn run_runtime_route(
         .expect("foreign chain identity");
         let (_foreign_chain_directory, foreign_chain_wallet) =
             empty_taker_wallet(foreign_chain_identity);
-        let foreign_chain_journal =
-            RedbExecutionJournal::open(&journal_path).expect("reopen for chain identity check");
+        let foreign_chain_journal = RedbExecutionJournal::open(&journal_path, journal_binding)
+            .expect("reopen for chain identity check");
         assert!(matches!(
             RfqTakerRuntime::from_source(
                 foreign_chain_wallet,
@@ -903,7 +924,7 @@ async fn run_runtime_route(
                 config,
             ),
             Err(RfqTakerError::FundingRecovery(
-                FundingRecoveryError::JournalGenesisHashMismatch { .. }
+                FundingRecoveryError::JournalBindingGenesisHashMismatch
             ))
         ));
 
@@ -915,8 +936,8 @@ async fn run_runtime_route(
         .expect("foreign policy identity");
         let (_foreign_policy_directory, foreign_policy_wallet) =
             empty_taker_wallet(foreign_policy_identity);
-        let foreign_policy_journal =
-            RedbExecutionJournal::open(&journal_path).expect("reopen for policy identity check");
+        let foreign_policy_journal = RedbExecutionJournal::open(&journal_path, journal_binding)
+            .expect("reopen for policy identity check");
         assert!(matches!(
             RfqTakerRuntime::from_source(
                 foreign_policy_wallet,
@@ -926,12 +947,28 @@ async fn run_runtime_route(
                 config,
             ),
             Err(RfqTakerError::FundingRecovery(
-                FundingRecoveryError::JournalPolicyAssetMismatch { .. }
+                FundingRecoveryError::JournalBindingPolicyAssetMismatch
+            ))
+        ));
+
+        let (_foreign_wallet_directory, foreign_wallet) = empty_taker_wallet(taker_identity);
+        let foreign_wallet_journal = RedbExecutionJournal::open(&journal_path, journal_binding)
+            .expect("reopen for wallet instance check");
+        assert!(matches!(
+            RfqTakerRuntime::from_source(
+                foreign_wallet,
+                taker_identity,
+                &source,
+                foreign_wallet_journal,
+                config,
+            ),
+            Err(RfqTakerError::FundingRecovery(
+                FundingRecoveryError::JournalBindingWalletInstanceMismatch
             ))
         ));
     }
-    let reopened =
-        RedbExecutionJournal::open(&journal_path).expect("reopen the existing durable journal");
+    let reopened = RedbExecutionJournal::open(&journal_path, journal_binding)
+        .expect("reopen the existing durable journal");
     let durable = reopened
         .load(recovered_key)
         .expect("read journal")

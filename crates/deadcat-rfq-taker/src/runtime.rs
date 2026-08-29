@@ -16,7 +16,7 @@ use deadcat_rfq_client::{
 use deadcat_rfq_rpc::{IdempotencyKeyDto, ReservationStatusDto, SettlementPset, VerifiedFirmQuote};
 use deadcat_rfq_wallet::{
     DurablyArmedTakerFunding, PersistentRfqWallet, TakerFundingError, TakerFundingLease,
-    TakerFundingLimits, TakerFundingPool, TakerWalletIdentity,
+    TakerFundingLimits, TakerFundingPool, TakerWalletIdentity, WalletInstanceId,
 };
 use elements::AssetId;
 use rand::{CryptoRng, RngCore};
@@ -157,6 +157,7 @@ enum RequestedTrade {
 /// authorize or dispatch it.
 struct RuntimeProvenance {
     identity: TakerWalletIdentity,
+    wallet_instance_id: WalletInstanceId,
 }
 
 impl RuntimeProvenance {
@@ -341,16 +342,23 @@ where
     where
         S: TakerInventorySource + ?Sized,
     {
+        let wallet_instance_id = wallet.instance_id();
         // Claim before either external read so a previous runtime cannot arm
         // an attempt between our snapshots and the funding-pool handoff.
         let claim = TakerFundingPool::claim(wallet, identity)?;
+        // Recovery is intentionally first: a swapped empty journal must fail
+        // closed before an inventory source is consulted or funding is made
+        // available to this wallet generation.
+        let recovery = load_funding_recovery(&journal, identity, wallet_instance_id)?;
         let inventory = source
             .inventory()
             .map_err(|error| RfqTakerError::InventorySource(Box::new(error)))?;
-        let recovery = load_funding_recovery(&journal, identity)?;
         let pool = claim.initialize(inventory, recovery.exclusions().clone())?;
         Ok(Self {
-            provenance: Arc::new(RuntimeProvenance { identity }),
+            provenance: Arc::new(RuntimeProvenance {
+                identity,
+                wallet_instance_id,
+            }),
             pool,
             journal,
             config,
@@ -468,10 +476,14 @@ where
         // concurrent successful arm changes the revision and makes replacement
         // fail instead of erasing its newly promoted exclusion.
         let token = self.pool.begin_inventory_refresh()?;
+        let recovery = load_funding_recovery(
+            &self.journal,
+            self.provenance.identity,
+            self.provenance.wallet_instance_id,
+        )?;
         let inventory = source
             .inventory()
             .map_err(|error| RfqTakerError::InventorySource(Box::new(error)))?;
-        let recovery = load_funding_recovery(&self.journal, self.provenance.identity)?;
         self.pool
             .replace_inventory(&token, inventory, recovery.exclusions().clone())?;
         Ok(())
@@ -609,8 +621,12 @@ where
     /// authenticated `Released` observation is omitted. In particular, `Signed`
     /// remains pending because its valid transaction can still be broadcast.
     pub fn pending_executions(&self) -> Result<Vec<RfqExecutionHandle>, RfqTakerError> {
-        let (_, pending) =
-            load_funding_recovery(&self.journal, self.provenance.identity)?.into_parts();
+        let (_, pending) = load_funding_recovery(
+            &self.journal,
+            self.provenance.identity,
+            self.provenance.wallet_instance_id,
+        )?
+        .into_parts();
         pending
             .into_iter()
             .map(|journaled| {

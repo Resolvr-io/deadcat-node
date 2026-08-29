@@ -11,10 +11,10 @@ use deadcat_client::validation::validate_contract_view;
 use deadcat_client::venue::{AssetAmount, ExecutionRequest, LegId, ProposedLeg, VenueContext};
 use deadcat_contracts::binary_market::BinaryMarketSlot;
 use deadcat_rfq_client::{
-    AuthoritativeTakerPrevout, ExecuteError, ExecutionJournal as _, PreparedRfqLeg, ProviderTarget,
-    QuoteBounds, RedbExecutionJournal, RfqQuoteIntent, RfqSession, SessionConfig, SessionError,
-    TakerAuthorizationError, TakerSettlementCoordinator, TakerSettlementPlan,
-    TakerSettlementSnapshot, TakerSettlementSource, TradingMarket,
+    AuthoritativeTakerPrevout, ExecuteError, ExecutionJournal as _, ExecutionJournalBinding,
+    PreparedRfqLeg, ProviderTarget, QuoteBounds, RedbExecutionJournal, RfqQuoteIntent, RfqSession,
+    SessionConfig, SessionError, TakerAuthorizationError, TakerSettlementCoordinator,
+    TakerSettlementPlan, TakerSettlementSnapshot, TakerSettlementSource, TradingMarket,
 };
 use deadcat_rfq_iroh::{ClientConfig, DiscoveryMode, RequestHandler, Server, ServerConfig};
 use deadcat_rfq_rpc::{
@@ -784,8 +784,19 @@ async fn authenticated_session_prepares_composes_and_executes_an_exact_rfq_route
     drop(coordinator);
     let attempt = authorized.into_execution_attempt();
     let journal_directory = tempfile::tempdir().expect("execution journal directory");
-    let journal = RedbExecutionJournal::create(journal_directory.path().join("executions.redb"))
-        .expect("durable execution journal");
+    let journal_binding = ExecutionJournalBinding::new(
+        FixedBytes32::new([0x70; 32]),
+        FixedBytes32::new(wallet.instance_id().to_bytes()),
+        session.client_endpoint_id(),
+        chain,
+        policy_asset,
+    )
+    .expect("execution journal binding");
+    let journal = RedbExecutionJournal::create(
+        journal_directory.path().join("executions.redb"),
+        journal_binding,
+    )
+    .expect("durable execution journal");
     let recovery = replay
         .to_recovery_record()
         .expect("self-contained quote recovery record");

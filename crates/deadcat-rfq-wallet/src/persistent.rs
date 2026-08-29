@@ -57,6 +57,7 @@ const CATALOG: TableDefinition<&[u8], &[u8]> = TableDefinition::new("issued_loca
 
 const CATALOG_ROOT_DOMAIN: &[u8] = b"deadcat/rfq/wallet/catalog-root/v1";
 const CATALOG_ENTRY_DOMAIN: &[u8] = b"deadcat/rfq/wallet/catalog-entry/v1";
+const WALLET_INSTANCE_ID_DOMAIN: &[u8] = b"deadcat/rfq/wallet/instance-id/v1";
 
 const BACKUP_MAGIC: &[u8; 8] = b"DCRFQWB\0";
 const BACKUP_VERSION: u16 = 1;
@@ -72,6 +73,29 @@ const MAX_BACKUP_KEYSTORE_BYTES: usize = 4 * 1024;
 /// procedure rather than producing a backup that this implementation cannot
 /// safely parse.
 pub const MAX_WALLET_CATALOG_ENTRIES: u64 = 1_000_000;
+
+/// Stable, opaque identity for one independently generated wallet instance.
+///
+/// This identifier is derived from the wallet's existing random wallet ID and
+/// its stored provider/taker identity. It therefore survives an
+/// authenticated backup and restore while distinguishing separately generated
+/// wallets that use the same application identity. It contains no secret key
+/// material, but its representation remains deliberately redacted.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WalletInstanceId([u8; 32]);
+
+impl WalletInstanceId {
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl fmt::Debug for WalletInstanceId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WalletInstanceId([redacted])")
+    }
+}
 
 /// One coherent, revisioned view of every destination locator ever issued by
 /// this wallet.
@@ -399,6 +423,12 @@ impl<R: RngCore + CryptoRng + Send> PersistentRfqWallet<R> {
     #[must_use]
     pub const fn identity(&self) -> ProviderIdentity {
         self.identity
+    }
+
+    /// Return the stable identity of this particular wallet generation.
+    #[must_use]
+    pub fn instance_id(&self) -> WalletInstanceId {
+        wallet_instance_id(self.identity, self.wallet.wallet_id())
     }
 
     /// Atomically acquire the single process-local taker funding authority for
@@ -1254,6 +1284,14 @@ fn validate_backup_catalog<R: RngCore + CryptoRng + Send>(
 
 fn keystore_digest(envelope: &EncryptedKeystore) -> [u8; 32] {
     Sha256::digest(envelope.as_bytes()).into()
+}
+
+fn wallet_instance_id(identity: ProviderIdentity, wallet_id: [u8; 16]) -> WalletInstanceId {
+    let mut hasher = Sha256::new();
+    hasher.update(WALLET_INSTANCE_ID_DOMAIN);
+    hasher.update(identity_bytes(identity));
+    hasher.update(wallet_id);
+    WalletInstanceId(hasher.finalize().into())
 }
 
 fn identity_bytes(identity: ProviderIdentity) -> [u8; 96] {

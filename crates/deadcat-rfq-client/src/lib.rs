@@ -19,9 +19,11 @@ mod taker_authorization;
 mod venue;
 
 pub use journal::{
-    EXECUTION_JOURNAL_RECORD_VERSION, ExecutionJournal, ExecutionJournalError, ExecutionJournalKey,
-    ExecutionJournalObservation, ExecutionJournalRecord, ExecutionJournalRecordError,
-    JournaledExecution, MAX_EXECUTION_JOURNAL_PAGE_SIZE, RedbExecutionJournal,
+    EXECUTION_JOURNAL_BINDING_VERSION, EXECUTION_JOURNAL_RECORD_VERSION, ExecutionJournal,
+    ExecutionJournalBinding, ExecutionJournalBindingError, ExecutionJournalError,
+    ExecutionJournalKey, ExecutionJournalObservation, ExecutionJournalRecord,
+    ExecutionJournalRecordError, JournaledExecution, MAX_EXECUTION_JOURNAL_PAGE_SIZE,
+    RedbExecutionJournal,
 };
 pub use session::{
     AuthenticatedExecutionStatus, ExecuteError, LiveQuoteReservation, ProviderTarget,

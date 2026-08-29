@@ -57,6 +57,86 @@ fn open_seeded(path: &Path, identity: ProviderIdentity, seed: u64) -> Persistent
         .expect("open persistent wallet")
 }
 
+#[test]
+fn wallet_instance_id_survives_reopen_and_restore_but_separates_taker_wallets() {
+    let directory = TempDir::new().expect("tempdir");
+    let first_path = directory.path().join("first.redb");
+    let second_path = directory.path().join("second.redb");
+    let restored_path = directory.path().join("restored.redb");
+    let taker = TakerWalletIdentity::new(
+        [0x91; 32],
+        BlockHash::from_byte_array([0x92; 32]),
+        AssetId::from_byte_array([0x93; 32]),
+    )
+    .expect("taker identity");
+
+    let first =
+        PersistentRfqWallet::create_taker_with_kdf(&first_path, taker, PASSPHRASE, test_kdf())
+            .expect("first taker wallet");
+    let first_instance = first.instance_id();
+    let backup = first.export_backup().expect("wallet backup");
+    assert_eq!(
+        format!("{first_instance:?}"),
+        "WalletInstanceId([redacted])"
+    );
+    drop(first);
+
+    let reopened = PersistentRfqWallet::open_taker(&first_path, taker, PASSPHRASE)
+        .expect("reopen first taker wallet");
+    assert_eq!(reopened.instance_id(), first_instance);
+    assert_eq!(reopened.instance_id().to_bytes(), first_instance.to_bytes());
+    drop(reopened);
+
+    let restored = PersistentRfqWallet::restore_taker(&restored_path, taker, PASSPHRASE, &backup)
+        .expect("restore first taker wallet");
+    assert_eq!(restored.instance_id(), first_instance);
+
+    let second =
+        PersistentRfqWallet::create_taker_with_kdf(&second_path, taker, PASSPHRASE, test_kdf())
+            .expect("independent taker wallet");
+    assert_ne!(second.instance_id(), first_instance);
+}
+
+#[test]
+fn wallet_instance_id_derivation_is_stable_and_binds_every_input() {
+    let expected_identity = identity(0x11);
+    let expected_wallet_id = [0x22; 16];
+    let expected = wallet_instance_id(expected_identity, expected_wallet_id);
+    assert_eq!(
+        hex(&expected.to_bytes()),
+        "d8f01589b2c8ba4bfcfd34cac006c65422635d129a8f8b59fad53157b3a71bec"
+    );
+
+    let wrong_provider = ProviderIdentity::new(
+        ProviderId::new([0x14; 32]),
+        expected_identity.genesis_hash(),
+        expected_identity.policy_asset(),
+    );
+    let wrong_genesis = ProviderIdentity::new(
+        expected_identity.provider(),
+        BlockHash::from_byte_array([0x15; 32]),
+        expected_identity.policy_asset(),
+    );
+    let wrong_policy = ProviderIdentity::new(
+        expected_identity.provider(),
+        expected_identity.genesis_hash(),
+        AssetId::from_byte_array([0x16; 32]),
+    );
+    assert_ne!(
+        wallet_instance_id(wrong_provider, expected_wallet_id),
+        expected
+    );
+    assert_ne!(
+        wallet_instance_id(wrong_genesis, expected_wallet_id),
+        expected
+    );
+    assert_ne!(
+        wallet_instance_id(wrong_policy, expected_wallet_id),
+        expected
+    );
+    assert_ne!(wallet_instance_id(expected_identity, [0x23; 16]), expected);
+}
+
 fn issue_settlement(
     wallet: &impl DestinationSource<Error = PersistentWalletError>,
     purpose: DestinationPurpose,

@@ -26,9 +26,9 @@ use deadcat_contracts::binary_market::BinaryMarketSlot;
 use deadcat_rfq::SharedRfqWallet;
 use deadcat_rfq::elements::{ElementsCoreAuth, ElementsCoreConfig, ElementsCoreSource};
 use deadcat_rfq_client::{
-    AuthoritativeTakerPrevout, ExecutionJournalKey, ExecutionJournalObservation, ProviderTarget,
-    RedbExecutionJournal, RfqSession, SessionConfig, TakerSettlementSnapshot,
-    TakerSettlementSource, TradingMarket,
+    AuthoritativeTakerPrevout, ExecutionJournalBinding, ExecutionJournalKey,
+    ExecutionJournalObservation, ProviderTarget, RedbExecutionJournal, RfqSession, SessionConfig,
+    TakerSettlementSnapshot, TakerSettlementSource, TradingMarket,
 };
 use deadcat_rfq_iroh::{ClientConfig, EndpointAddr, SecretKey};
 use deadcat_rfq_provider::{
@@ -36,7 +36,7 @@ use deadcat_rfq_provider::{
     SettlementChainSource as _,
 };
 use deadcat_rfq_rpc::{
-    IdempotencyKeyDto, RelayObservationDto, RelayStatusDto, ReservationStateDto,
+    FixedBytes32, IdempotencyKeyDto, RelayObservationDto, RelayStatusDto, ReservationStateDto,
     ReservationStatusDto,
 };
 use deadcat_rfq_taker::{ExactInRfqTrade, RfqTakerConfig, RfqTakerRuntime, TakerInventorySource};
@@ -1043,8 +1043,17 @@ async fn provider_daemon_quotes_signs_relays_and_recovers_after_restart() {
         .await
         .expect("connect to the real RFQ provider process");
 
-    let journal = RedbExecutionJournal::create(directory.path().join("taker-journal.redb"))
-        .expect("durable taker execution journal");
+    let journal_binding = ExecutionJournalBinding::new(
+        FixedBytes32::new([0x53; 32]),
+        FixedBytes32::new(taker_wallet.instance_id().to_bytes()),
+        client_key.public(),
+        chain,
+        policy_asset,
+    )
+    .expect("taker execution journal binding");
+    let journal =
+        RedbExecutionJournal::create(directory.path().join("taker-journal.redb"), journal_binding)
+            .expect("durable taker execution journal");
     let runtime = RfqTakerRuntime::from_source(
         Arc::clone(&taker_wallet),
         taker_identity,

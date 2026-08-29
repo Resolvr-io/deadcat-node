@@ -1418,8 +1418,8 @@ mod tests {
     use rand::rngs::StdRng;
 
     use crate::journal::{
-        ExecutionJournal as _, ExecutionJournalError, ExecutionJournalRecordError,
-        MAX_EXECUTION_JOURNAL_PAGE_SIZE, RedbExecutionJournal,
+        ExecutionJournal as _, ExecutionJournalBinding, ExecutionJournalError,
+        ExecutionJournalRecordError, MAX_EXECUTION_JOURNAL_PAGE_SIZE, RedbExecutionJournal,
     };
     use crate::settlement::ExecutionBinding;
 
@@ -1434,6 +1434,17 @@ mod tests {
 
     fn policy_asset() -> AssetId {
         AssetId::from_slice(&[6; 32]).expect("policy asset")
+    }
+
+    fn journal_binding() -> ExecutionJournalBinding {
+        ExecutionJournalBinding::new(
+            FixedBytes32::new([0x71; 32]),
+            FixedBytes32::new([0x72; 32]),
+            SecretKey::from_bytes(&[0x22; 32]).public(),
+            chain(),
+            policy_asset(),
+        )
+        .expect("valid journal binding")
     }
 
     fn asset(marker: u8) -> AssetId {
@@ -1987,7 +1998,8 @@ mod tests {
         let path = directory.path().join("executions.redb");
 
         {
-            let journal = RedbExecutionJournal::create(&path).expect("create journal");
+            let journal =
+                RedbExecutionJournal::create(&path, journal_binding()).expect("create journal");
             let armed = journal.arm(&quote, &attempt).expect("durably arm");
             assert_eq!(armed.revision(), 0);
             let same = journal.arm(&quote, &attempt).expect("idempotent arm");
@@ -1998,7 +2010,8 @@ mod tests {
             ));
         }
 
-        let reopened = RedbExecutionJournal::open(&path).expect("reopen journal");
+        let reopened =
+            RedbExecutionJournal::open(&path, journal_binding()).expect("reopen journal");
         let discovered = reopened
             .list_after(None, 10)
             .expect("discover journal after restart without an in-memory key");
@@ -2053,10 +2066,75 @@ mod tests {
     }
 
     #[test]
+    fn durable_journal_rejects_attempts_outside_its_bound_execution_identity() {
+        let replay = replay(Some(1_500));
+        let quote = replay.to_recovery_record().expect("recovery record");
+        let attempt = execution_attempt(&replay, 50);
+        let expected = journal_binding();
+
+        let wrong_client = ExecutionJournalBinding::new(
+            expected.bundle_id(),
+            expected.wallet_instance_id(),
+            SecretKey::from_bytes(&[0x73; 32]).public(),
+            expected.chain(),
+            expected.policy_asset(),
+        )
+        .expect("wrong client journal binding");
+        let directory = tempfile::tempdir().expect("wrong client journal directory");
+        let journal =
+            RedbExecutionJournal::create(directory.path().join("executions.redb"), wrong_client)
+                .expect("wrong client journal");
+        assert!(matches!(
+            journal.arm(&quote, &attempt),
+            Err(ExecutionJournalError::AttemptClientEndpointMismatch)
+        ));
+
+        let wrong_chain = ExecutionJournalBinding::new(
+            expected.bundle_id(),
+            expected.wallet_instance_id(),
+            expected.client_endpoint(),
+            ChainIdentity {
+                genesis_hash: BlockHash::from_byte_array([0x74; 32]),
+                ..expected.chain()
+            },
+            expected.policy_asset(),
+        )
+        .expect("wrong chain journal binding");
+        let directory = tempfile::tempdir().expect("wrong chain journal directory");
+        let journal =
+            RedbExecutionJournal::create(directory.path().join("executions.redb"), wrong_chain)
+                .expect("wrong chain journal");
+        assert!(matches!(
+            journal.arm(&quote, &attempt),
+            Err(ExecutionJournalError::AttemptChainIdentityMismatch)
+        ));
+
+        let wrong_policy = ExecutionJournalBinding::new(
+            expected.bundle_id(),
+            expected.wallet_instance_id(),
+            expected.client_endpoint(),
+            expected.chain(),
+            asset(0x75),
+        )
+        .expect("wrong policy journal binding");
+        let directory = tempfile::tempdir().expect("wrong policy journal directory");
+        let journal =
+            RedbExecutionJournal::create(directory.path().join("executions.redb"), wrong_policy)
+                .expect("wrong policy journal");
+        assert!(matches!(
+            journal.arm(&quote, &attempt),
+            Err(ExecutionJournalError::AttemptPolicyAssetMismatch)
+        ));
+    }
+
+    #[test]
     fn journal_pagination_rejects_a_misplaced_row_after_the_first_full_page() {
         let directory = tempfile::tempdir().expect("journal directory");
-        let journal = RedbExecutionJournal::create(directory.path().join("executions.redb"))
-            .expect("create journal");
+        let journal = RedbExecutionJournal::create(
+            directory.path().join("executions.redb"),
+            journal_binding(),
+        )
+        .expect("create journal");
         let mut records = Vec::with_capacity(MAX_EXECUTION_JOURNAL_PAGE_SIZE + 1);
         for reservation_index in 0..=MAX_EXECUTION_JOURNAL_PAGE_SIZE {
             let replay = replay_for_reservation(
@@ -2092,16 +2170,21 @@ mod tests {
         let quote = replay.to_recovery_record().expect("recovery record");
         let attempt = execution_attempt(&replay, 50);
         let directory = tempfile::tempdir().expect("journal directory");
-        let journal = RedbExecutionJournal::create(directory.path().join("executions.redb"))
-            .expect("create journal");
+        let journal = RedbExecutionJournal::create(
+            directory.path().join("executions.redb"),
+            journal_binding(),
+        )
+        .expect("create journal");
         let armed = journal.arm(&quote, &attempt).expect("durably arm");
         let key = armed.key();
 
         let other_attempt = execution_attempt(&replay, 51);
         let other_directory = tempfile::tempdir().expect("other journal directory");
-        let other_journal =
-            RedbExecutionJournal::create(other_directory.path().join("executions.redb"))
-                .expect("create other journal");
+        let other_journal = RedbExecutionJournal::create(
+            other_directory.path().join("executions.redb"),
+            journal_binding(),
+        )
+        .expect("create other journal");
         let other_armed = other_journal
             .arm(&quote, &other_attempt)
             .expect("durably arm other exact attempt");

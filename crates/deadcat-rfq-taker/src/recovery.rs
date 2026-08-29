@@ -1,11 +1,11 @@
 use std::collections::BTreeSet;
 
 use deadcat_rfq_client::{
-    ExecutionJournal, ExecutionJournalError, ExecutionJournalKey, JournaledExecution,
-    MAX_EXECUTION_JOURNAL_PAGE_SIZE,
+    ExecutionJournal, ExecutionJournalBinding, ExecutionJournalError, ExecutionJournalKey,
+    JournaledExecution, MAX_EXECUTION_JOURNAL_PAGE_SIZE,
 };
 use deadcat_rfq_rpc::SettlementLayoutDto;
-use deadcat_rfq_wallet::TakerWalletIdentity;
+use deadcat_rfq_wallet::{TakerWalletIdentity, WalletInstanceId};
 use elements::{OutPoint, pset::PartiallySignedTransaction};
 use thiserror::Error;
 
@@ -35,9 +35,10 @@ impl FundingRecoverySnapshot {
 
 /// Page and validate the complete journal before wallet funding becomes ready.
 ///
-/// Every record must belong to the configured wallet owner, chain genesis, and
-/// policy asset. A shared or accidentally swapped journal therefore fails
-/// closed before any of its outpoints can influence this wallet's funding.
+/// The journal binding must name the configured wallet instance, client, chain
+/// genesis, and policy asset. Every record is then checked against the same
+/// client/chain/policy identity. A missing, replaced, or accidentally swapped
+/// journal therefore fails closed even when it contains no records.
 ///
 /// Every state except an authenticated pre-commit `Released` observation keeps
 /// the taker inputs excluded. In particular, `Signed` is provider-terminal but
@@ -45,7 +46,9 @@ impl FundingRecoverySnapshot {
 pub fn load_funding_recovery<J: ExecutionJournal>(
     journal: &J,
     identity: TakerWalletIdentity,
+    wallet_instance_id: WalletInstanceId,
 ) -> Result<FundingRecoverySnapshot, FundingRecoveryError> {
+    validate_journal_binding(journal.binding(), identity, wallet_instance_id)?;
     let mut after = None;
     let mut exclusions = BTreeSet::new();
     let mut pending = Vec::new();
@@ -76,6 +79,26 @@ pub fn load_funding_recovery<J: ExecutionJournal>(
         exclusions,
         pending,
     })
+}
+
+fn validate_journal_binding(
+    binding: ExecutionJournalBinding,
+    identity: TakerWalletIdentity,
+    wallet_instance_id: WalletInstanceId,
+) -> Result<(), FundingRecoveryError> {
+    if *binding.client_endpoint().as_bytes() != identity.owner() {
+        return Err(FundingRecoveryError::JournalBindingClientEndpointMismatch);
+    }
+    if binding.chain().genesis_hash != identity.genesis_hash() {
+        return Err(FundingRecoveryError::JournalBindingGenesisHashMismatch);
+    }
+    if binding.policy_asset() != identity.policy_asset() {
+        return Err(FundingRecoveryError::JournalBindingPolicyAssetMismatch);
+    }
+    if binding.wallet_instance_id().to_bytes() != wallet_instance_id.to_bytes() {
+        return Err(FundingRecoveryError::JournalBindingWalletInstanceMismatch);
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_execution_identity(
@@ -139,6 +162,14 @@ fn taker_input_outpoints(
 pub enum FundingRecoveryError {
     #[error(transparent)]
     Journal(#[from] ExecutionJournalError),
+    #[error("execution journal is bound to a different taker client endpoint")]
+    JournalBindingClientEndpointMismatch,
+    #[error("execution journal is bound to a different chain genesis hash")]
+    JournalBindingGenesisHashMismatch,
+    #[error("execution journal is bound to a different policy asset")]
+    JournalBindingPolicyAssetMismatch,
+    #[error("execution journal is bound to a different wallet instance")]
+    JournalBindingWalletInstanceMismatch,
     #[error("execution journal pagination is not strictly ordered")]
     JournalOrder,
     #[error("execution journal record {key:?} belongs to a different taker client endpoint")]
