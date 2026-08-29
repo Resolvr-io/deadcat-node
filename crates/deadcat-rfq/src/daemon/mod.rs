@@ -161,8 +161,13 @@ async fn run(args: CommonArgs) -> anyhow::Result<()> {
     let (identity, wallet, book, secret) =
         open_existing_state(&paths, &config, &args.passphrase_file)?;
 
-    let source = ElementsCoreSource::new(config.elements.clone(), wallet.clone())
-        .context("construct authoritative Elements provider source")?;
+    let elements = config.elements.clone();
+    let source_wallet = wallet.clone();
+    let source =
+        tokio::task::spawn_blocking(move || ElementsCoreSource::new(elements, source_wallet))
+            .await
+            .context("Elements provider source construction panicked")?
+            .context("construct authoritative Elements provider source")?;
     let inventory = InventoryCoordinator::new(book, source.clone(), config.inventory);
     let engine = QuoteEngine::new(
         inventory,

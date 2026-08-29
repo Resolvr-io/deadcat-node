@@ -61,6 +61,13 @@ regtest-rfq-wallet-source: generate
         persistent_wallet_inventory_is_discovered_unblinded_and_recovered_after_restart \
         -- --ignored --nocapture --test-threads=1
 
+# Cross the real RFQ provider process, direct-Iroh protocol, persistent wallet
+# and provider state, and Elements relay boundary through restart.
+regtest-rfq-provider-process: generate
+    cargo test --locked -p deadcat-rfq --test elements_regtest \
+        provider_daemon_quotes_signs_relays_and_recovers_after_restart \
+        -- --ignored --nocapture --test-threads=1
+
 # Cross actual daemon/CLI process boundaries over direct Iroh, including
 # restart identity persistence, deep-reorg refusal, and operator rebuild.
 regtest-process-boundary: generate
@@ -70,7 +77,7 @@ regtest-process-boundary: generate
         -- --ignored --nocapture --test-threads=1
 
 # Every isolated live-chain protocol gate required before CI succeeds.
-regtest: regtest-market-ab regtest-multi-market regtest-backend-equivalence regtest-rfq-settlement regtest-rfq-wallet-source regtest-process-boundary
+regtest: regtest-market-ab regtest-multi-market regtest-backend-equivalence regtest-rfq-settlement regtest-rfq-wallet-source regtest-rfq-provider-process regtest-process-boundary
 
 wasm-check:
     NIX_HARDENING_ENABLE=pic cargo check --locked \

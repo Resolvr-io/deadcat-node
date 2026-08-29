@@ -111,9 +111,15 @@ input-lock maps over the same open wallet.
 
 A concrete authoritative taker inventory/settlement source, a securely paired
 wallet/journal process-state lifecycle and runnable taker entrypoint, canonical
-market-data pricing, provider relay/reconciliation, taker
-broadcast/confirmation/reorg monitoring, live regtest process coverage,
-authenticated-owner rate limits, and HSM support remain future work.
+market-data pricing, taker broadcast/confirmation/reorg monitoring, a complete
+taker process-boundary gate, authenticated-owner rate limits, and HSM support
+remain future work. The provider now persists an exact relay outbox with every
+signed settlement and supervises status-first reconciliation, exact-byte
+broadcast, canonical confirmation, conflict, and reorganization observations.
+Its live liquidregtest gate crosses the shipped daemon, direct Iroh, Elements
+Core, hard restart, durable relay reconciliation, and confirmation boundaries;
+Core-outage, ambiguous-send, conflict/outspend, and reorganization process cases
+remain explicit follow-ups.
 [ADR 0008](docs/adr/0008-rfq-service-owned-wallet.md) records that boundary.
 This initial taker profile accepts exactly one RFQ leg plus ordinary tree-less
 P2TR inputs with explicit `SIGHASH_ALL`. Simplicity covenant inputs and a
@@ -177,6 +183,8 @@ just regtest-market-ab
 just regtest-multi-market
 just regtest-backend-equivalence
 just regtest-rfq-settlement
+just regtest-rfq-wallet-source
+just regtest-rfq-provider-process
 just regtest-process-boundary
 ```
 
@@ -241,6 +249,7 @@ for individual `ContractId` arguments.
 - [Binary-market A/B acceptance packet](docs/acceptance/binary-market-ab-v1.md)
 - [Multi-market assurance test](crates/deadcat-client/tests/market_regtest.rs)
 - [Confidential RFQ settlement assurance test](crates/deadcat-client/tests/rfq_regtest.rs)
+- [RFQ provider-process acceptance packet](docs/acceptance/rfq-provider-process-v1.md)
 - [Elements RPC and Esplora backend-equivalence packet](docs/acceptance/backend-equivalence-v1.md)
 - [Daemon/Iroh/CLI process-boundary packet](docs/acceptance/process-boundary-v1.md)
 - [Completed v1 alpha implementation record](docs/implementation-plan.md)
