@@ -25,7 +25,7 @@ mod wallet;
 pub use keystore::{DEFAULT_KDF_PARAMS, EncryptedKeystore, KdfParams, KeystoreError, UnlockedSeed};
 pub use persistent::{
     MAX_WALLET_CATALOG_ENTRIES, PersistentRfqWallet, PersistentWalletError, WalletBackup,
-    WalletCatalogSnapshot,
+    WalletCatalogSnapshot, WalletInstanceId,
 };
 pub use taker::{
     DurablyArmedTakerFunding, FundedTakerRoute, TakerFundingError, TakerFundingLease,

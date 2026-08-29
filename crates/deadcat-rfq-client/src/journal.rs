@@ -1,5 +1,6 @@
 //! Durable taker execution records and exact-retry capabilities.
 
+use std::fmt;
 use std::fs::OpenOptions;
 use std::path::Path;
 
@@ -7,10 +8,13 @@ use deadcat_rfq_rpc::{
     AttestationError, FixedBytes32, RelayObservationDto, RelayStatusDto, ReservationIdDto,
     ReservationStateDto, ReservationStatusDto,
 };
+use deadcat_types::ChainIdentity;
+use elements::AssetId;
 use iroh::EndpointId;
 use redb::{
     CommitError, Database, DatabaseError, Durability, ReadableDatabase as _, ReadableTable as _,
-    SetDurabilityError, StorageError, TableDefinition, TableError, TransactionError,
+    SetDurabilityError, StorageError, TableDefinition, TableError, TableHandle as _,
+    TransactionError,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -26,10 +30,121 @@ use crate::settlement::{
 };
 
 pub const EXECUTION_JOURNAL_RECORD_VERSION: u32 = 1;
+pub const EXECUTION_JOURNAL_BINDING_VERSION: u32 = 1;
 pub const MAX_EXECUTION_JOURNAL_PAGE_SIZE: usize = 256;
 
 const RECORD_DIGEST_DOMAIN: &[u8] = b"deadcat/rfq/client-execution-journal/v1";
+const BINDING_METADATA_KEY: &str = "binding";
+const METADATA: TableDefinition<&str, &[u8]> = TableDefinition::new("rfq_journal_metadata");
 const EXECUTIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("rfq_executions");
+
+/// Immutable identity of one wallet/journal state bundle.
+///
+/// The embedding process must create one random nonzero `bundle_id`, pair it
+/// with the concrete wallet instance, and use this exact value whenever it
+/// opens the journal. The client endpoint, chain, and policy asset additionally
+/// prevent state created for another taker or Liquid chain from being accepted
+/// under the same paths.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionJournalBinding {
+    version: u32,
+    bundle_id: FixedBytes32,
+    wallet_instance_id: FixedBytes32,
+    client_endpoint: EndpointId,
+    chain: ChainIdentity,
+    policy_asset: AssetId,
+}
+
+impl ExecutionJournalBinding {
+    pub fn new(
+        bundle_id: FixedBytes32,
+        wallet_instance_id: FixedBytes32,
+        client_endpoint: EndpointId,
+        chain: ChainIdentity,
+        policy_asset: AssetId,
+    ) -> Result<Self, ExecutionJournalBindingError> {
+        let binding = Self {
+            version: EXECUTION_JOURNAL_BINDING_VERSION,
+            bundle_id,
+            wallet_instance_id,
+            client_endpoint,
+            chain,
+            policy_asset,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    #[must_use]
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+
+    #[must_use]
+    pub const fn bundle_id(&self) -> FixedBytes32 {
+        self.bundle_id
+    }
+
+    #[must_use]
+    pub const fn wallet_instance_id(&self) -> FixedBytes32 {
+        self.wallet_instance_id
+    }
+
+    #[must_use]
+    pub const fn client_endpoint(&self) -> EndpointId {
+        self.client_endpoint
+    }
+
+    #[must_use]
+    pub const fn chain(&self) -> ChainIdentity {
+        self.chain
+    }
+
+    #[must_use]
+    pub const fn policy_asset(&self) -> AssetId {
+        self.policy_asset
+    }
+
+    fn validate(&self) -> Result<(), ExecutionJournalBindingError> {
+        if self.version != EXECUTION_JOURNAL_BINDING_VERSION {
+            return Err(ExecutionJournalBindingError::UnsupportedVersion {
+                actual: self.version,
+            });
+        }
+        if self.bundle_id.to_bytes() == [0; 32] {
+            return Err(ExecutionJournalBindingError::ZeroBundleId);
+        }
+        if self.wallet_instance_id.to_bytes() == [0; 32] {
+            return Err(ExecutionJournalBindingError::ZeroWalletInstanceId);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for ExecutionJournalBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExecutionJournalBinding")
+            .field("version", &self.version)
+            .field("bundle_id", &"[opaque]")
+            .field("wallet_instance_id", &"[opaque]")
+            .field("client_endpoint", &self.client_endpoint)
+            .field("chain", &self.chain)
+            .field("policy_asset", &self.policy_asset)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum ExecutionJournalBindingError {
+    #[error("unsupported execution-journal binding version {actual}")]
+    UnsupportedVersion { actual: u32 },
+    #[error("execution-journal bundle ID must be nonzero")]
+    ZeroBundleId,
+    #[error("execution-journal wallet instance ID must be nonzero")]
+    ZeroWalletInstanceId,
+}
 
 /// Collision-resistant durable lookup key for one owner-scoped reservation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -322,6 +437,11 @@ impl JournaledExecution {
 
 /// Synchronous durable storage contract for exact execution attempts.
 pub trait ExecutionJournal: sealed::Sealed {
+    /// Immutable wallet, client, and chain identity persisted with this
+    /// journal when it was created.
+    #[must_use]
+    fn binding(&self) -> ExecutionJournalBinding;
+
     /// Atomically persist the exact attempt before its first network dispatch.
     fn arm(
         &self,
@@ -365,6 +485,7 @@ mod sealed {
 /// [`ExecutionJournal::list_after`] before deciding whether to retry.
 pub struct RedbExecutionJournal {
     database: Database,
+    binding: ExecutionJournalBinding,
 }
 
 impl sealed::Sealed for RedbExecutionJournal {}
@@ -377,7 +498,12 @@ impl RedbExecutionJournal {
     /// This is an explicit initialization operation, never a fallback after
     /// [`Self::open`] fails. The embedding process owns secure path selection,
     /// permissions, directory durability, and wallet/journal lifecycle pairing.
-    pub fn create(path: impl AsRef<Path>) -> Result<Self, ExecutionJournalError> {
+    pub fn create(
+        path: impl AsRef<Path>,
+        binding: ExecutionJournalBinding,
+    ) -> Result<Self, ExecutionJournalError> {
+        binding.validate()?;
+        let encoded_binding = encode_binding(&binding)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -385,10 +511,16 @@ impl RedbExecutionJournal {
             .open(path)
             .map_err(DatabaseError::from)?;
         let database = Database::builder().create_file(file)?;
-        let journal = Self { database };
+        let journal = Self { database, binding };
         let mut write = journal.database.begin_write()?;
         write.set_durability(Durability::Immediate)?;
-        write.open_table(EXECUTIONS)?;
+        {
+            let mut metadata = write.open_table(METADATA)?;
+            metadata.insert(BINDING_METADATA_KEY, encoded_binding.as_slice())?;
+        }
+        {
+            let _executions = write.open_table(EXECUTIONS)?;
+        }
         write.commit()?;
         Ok(journal)
     }
@@ -397,16 +529,35 @@ impl RedbExecutionJournal {
     /// initializing a missing table.
     ///
     /// redb may repair an unclean existing database while opening it. The
-    /// embedding process remains responsible for detecting stale or replaced
-    /// state and for pairing this journal with the correct wallet generation.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, ExecutionJournalError> {
+    /// persisted binding must exactly equal `expected_binding`; opening a valid
+    /// but unrelated empty journal therefore fails closed.
+    ///
+    /// The binding identifies a state generation; it is not a monotonic
+    /// freshness proof. An older snapshot of this same bound journal still
+    /// matches. The embedding process must therefore coordinate wallet and
+    /// journal backup/restore and provide any required rollback protection.
+    pub fn open(
+        path: impl AsRef<Path>,
+        expected_binding: ExecutionJournalBinding,
+    ) -> Result<Self, ExecutionJournalError> {
+        expected_binding.validate()?;
         let database = Database::open(path)?;
-        let journal = Self { database };
-        {
-            let read = journal.database.begin_read()?;
+        let binding = {
+            let read = database.begin_read()?;
             let _executions = read.open_table(EXECUTIONS)?;
-        }
-        Ok(journal)
+            let metadata = read.open_table(METADATA).map_err(|error| match error {
+                TableError::TableDoesNotExist(name) if name == METADATA.name() => {
+                    ExecutionJournalError::MissingBindingMetadata
+                }
+                other => ExecutionJournalError::Table(other),
+            })?;
+            let Some(encoded) = metadata.get(BINDING_METADATA_KEY)? else {
+                return Err(ExecutionJournalError::MissingBindingMetadata);
+            };
+            decode_binding(encoded.value())?
+        };
+        validate_expected_binding(binding, expected_binding)?;
+        Ok(Self { database, binding })
     }
 
     #[cfg(test)]
@@ -429,11 +580,16 @@ impl RedbExecutionJournal {
 }
 
 impl ExecutionJournal for RedbExecutionJournal {
+    fn binding(&self) -> ExecutionJournalBinding {
+        self.binding
+    }
+
     fn arm(
         &self,
         quote: &QuoteRecoveryRecord,
         attempt: &ExecutionAttempt,
     ) -> Result<JournaledExecution, ExecutionJournalError> {
+        validate_execution_binding(self.binding, attempt.binding())?;
         let candidate = ExecutionJournalRecord::armed(quote.clone(), attempt.to_record())?;
         let validated = JournaledExecution::from_record(candidate.clone())?;
         let key = validated.key().to_bytes();
@@ -472,6 +628,7 @@ impl ExecutionJournal for RedbExecutionJournal {
         if record.key() != key {
             return Err(ExecutionJournalError::KeyMismatch);
         }
+        validate_execution_binding(self.binding, record.attempt().binding())?;
         Ok(Some(record))
     }
 
@@ -492,6 +649,7 @@ impl ExecutionJournal for RedbExecutionJournal {
             if key.value() != record.key().to_bytes() {
                 return Err(ExecutionJournalError::KeyMismatch);
             }
+            validate_execution_binding(self.binding, record.attempt().binding())?;
             if after.is_some_and(|after| record.key() <= after) {
                 continue;
             }
@@ -523,6 +681,7 @@ impl ExecutionJournal for RedbExecutionJournal {
             if current.key() != key {
                 return Err(ExecutionJournalError::KeyMismatch);
             }
+            validate_execution_binding(self.binding, current.attempt().binding())?;
             if authenticated.journal_key() != key
                 || authenticated.attempt_digest() != current.attempt().digest()
             {
@@ -812,6 +971,55 @@ fn decode_record(bytes: &[u8]) -> Result<ExecutionJournalRecord, ExecutionJourna
     postcard::from_bytes(bytes).map_err(ExecutionJournalError::Encoding)
 }
 
+fn encode_binding(binding: &ExecutionJournalBinding) -> Result<Vec<u8>, ExecutionJournalError> {
+    postcard::to_allocvec(binding).map_err(ExecutionJournalError::BindingEncoding)
+}
+
+fn decode_binding(bytes: &[u8]) -> Result<ExecutionJournalBinding, ExecutionJournalError> {
+    let binding: ExecutionJournalBinding =
+        postcard::from_bytes(bytes).map_err(ExecutionJournalError::BindingEncoding)?;
+    binding.validate()?;
+    Ok(binding)
+}
+
+fn validate_expected_binding(
+    actual: ExecutionJournalBinding,
+    expected: ExecutionJournalBinding,
+) -> Result<(), ExecutionJournalError> {
+    if actual.bundle_id != expected.bundle_id {
+        return Err(ExecutionJournalError::BundleIdMismatch);
+    }
+    if actual.wallet_instance_id != expected.wallet_instance_id {
+        return Err(ExecutionJournalError::WalletInstanceIdMismatch);
+    }
+    if actual.client_endpoint != expected.client_endpoint {
+        return Err(ExecutionJournalError::ClientEndpointMismatch);
+    }
+    if actual.chain != expected.chain {
+        return Err(ExecutionJournalError::ChainIdentityMismatch);
+    }
+    if actual.policy_asset != expected.policy_asset {
+        return Err(ExecutionJournalError::PolicyAssetMismatch);
+    }
+    Ok(())
+}
+
+fn validate_execution_binding(
+    journal: ExecutionJournalBinding,
+    execution: &ExecutionBinding,
+) -> Result<(), ExecutionJournalError> {
+    if execution.client_endpoint().to_bytes() != *journal.client_endpoint.as_bytes() {
+        return Err(ExecutionJournalError::AttemptClientEndpointMismatch);
+    }
+    if execution.chain() != journal.chain {
+        return Err(ExecutionJournalError::AttemptChainIdentityMismatch);
+    }
+    if execution.policy_asset() != journal.policy_asset {
+        return Err(ExecutionJournalError::AttemptPolicyAssetMismatch);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum ExecutionJournalRecordError {
     #[error("unsupported execution-journal record version {actual}")]
@@ -852,6 +1060,26 @@ pub enum ExecutionJournalRecordError {
 
 #[derive(Debug, Error)]
 pub enum ExecutionJournalError {
+    #[error("execution-journal binding is invalid: {0}")]
+    InvalidBinding(#[from] ExecutionJournalBindingError),
+    #[error("execution-journal binding metadata is missing")]
+    MissingBindingMetadata,
+    #[error("execution-journal bundle ID differs from the expected state bundle")]
+    BundleIdMismatch,
+    #[error("execution-journal wallet instance ID differs from the expected wallet")]
+    WalletInstanceIdMismatch,
+    #[error("execution-journal client endpoint differs from the expected client")]
+    ClientEndpointMismatch,
+    #[error("execution-journal chain identity differs from the expected chain")]
+    ChainIdentityMismatch,
+    #[error("execution-journal policy asset differs from the expected policy asset")]
+    PolicyAssetMismatch,
+    #[error("execution attempt client endpoint differs from the journal binding")]
+    AttemptClientEndpointMismatch,
+    #[error("execution attempt chain identity differs from the journal binding")]
+    AttemptChainIdentityMismatch,
+    #[error("execution attempt policy asset differs from the journal binding")]
+    AttemptPolicyAssetMismatch,
     #[error("execution-journal record is invalid: {0}")]
     InvalidRecord(#[from] ExecutionJournalRecordError),
     #[error("a different attempt is already armed for this reservation")]
@@ -870,6 +1098,8 @@ pub enum ExecutionJournalError {
     InvalidPageSize { limit: usize },
     #[error("execution-journal encoding failed: {0}")]
     Encoding(postcard::Error),
+    #[error("execution-journal binding encoding failed: {0}")]
+    BindingEncoding(postcard::Error),
     #[error("redb database error: {0}")]
     Database(#[from] DatabaseError),
     #[error("redb transaction error: {0}")]
@@ -890,9 +1120,24 @@ mod tests {
 
     use super::*;
     use deadcat_rfq_rpc::{ReleaseReasonDto, SettlementPset};
+    use deadcat_types::LiquidNetwork;
     use elements::hashes::Hash as _;
     use elements::pset::PartiallySignedTransaction;
-    use redb::TableHandle as _;
+    use iroh::SecretKey;
+
+    fn binding() -> ExecutionJournalBinding {
+        ExecutionJournalBinding::new(
+            FixedBytes32::new([0x31; 32]),
+            FixedBytes32::new([0x32; 32]),
+            SecretKey::from_bytes(&[0x33; 32]).public(),
+            ChainIdentity {
+                network: LiquidNetwork::ElementsRegtest,
+                genesis_hash: elements::BlockHash::from_byte_array([0x34; 32]),
+            },
+            AssetId::from_slice(&[0x35; 32]).expect("fixture policy asset"),
+        )
+        .expect("valid execution-journal binding")
+    }
 
     fn status(state: ReservationStateDto) -> ReservationStatusDto {
         ReservationStatusDto {
@@ -955,23 +1200,29 @@ mod tests {
     fn journal_create_is_no_clobber_and_open_requires_an_existing_journal() {
         let directory = tempfile::tempdir().expect("journal directory");
         let path = directory.path().join("executions.redb");
+        let binding = binding();
 
-        assert_database_io_kind(RedbExecutionJournal::open(&path), ErrorKind::NotFound);
+        assert_database_io_kind(
+            RedbExecutionJournal::open(&path, binding),
+            ErrorKind::NotFound,
+        );
         assert!(!path.exists(), "open must not create a missing journal");
 
-        let journal = RedbExecutionJournal::create(&path).expect("create new journal");
+        let journal = RedbExecutionJournal::create(&path, binding).expect("create new journal");
         assert!(path.exists());
+        assert_eq!(journal.binding(), binding);
         assert_database_io_kind(
-            RedbExecutionJournal::create(&path),
+            RedbExecutionJournal::create(&path, binding),
             ErrorKind::AlreadyExists,
         );
         drop(journal);
 
         assert_database_io_kind(
-            RedbExecutionJournal::create(&path),
+            RedbExecutionJournal::create(&path, binding),
             ErrorKind::AlreadyExists,
         );
-        let reopened = RedbExecutionJournal::open(&path).expect("open existing journal");
+        let reopened = RedbExecutionJournal::open(&path, binding).expect("open existing journal");
+        assert_eq!(reopened.binding(), binding);
         assert!(
             reopened
                 .list_after(None, 1)
@@ -981,18 +1232,182 @@ mod tests {
     }
 
     #[test]
+    fn journal_binding_rejects_zero_bundle_and_wallet_instance_ids() {
+        let valid = binding();
+        assert_eq!(valid.version(), EXECUTION_JOURNAL_BINDING_VERSION);
+        assert_eq!(valid.bundle_id(), FixedBytes32::new([0x31; 32]));
+        assert_eq!(valid.wallet_instance_id(), FixedBytes32::new([0x32; 32]));
+        assert_eq!(
+            valid.client_endpoint(),
+            SecretKey::from_bytes(&[0x33; 32]).public()
+        );
+        assert_eq!(valid.chain().network, LiquidNetwork::ElementsRegtest);
+        assert_eq!(
+            valid.policy_asset(),
+            AssetId::from_slice(&[0x35; 32]).expect("fixture policy asset")
+        );
+
+        assert!(matches!(
+            ExecutionJournalBinding::new(
+                FixedBytes32::new([0; 32]),
+                valid.wallet_instance_id(),
+                valid.client_endpoint(),
+                valid.chain(),
+                valid.policy_asset(),
+            ),
+            Err(ExecutionJournalBindingError::ZeroBundleId)
+        ));
+        assert!(matches!(
+            ExecutionJournalBinding::new(
+                valid.bundle_id(),
+                FixedBytes32::new([0; 32]),
+                valid.client_endpoint(),
+                valid.chain(),
+                valid.policy_asset(),
+            ),
+            Err(ExecutionJournalBindingError::ZeroWalletInstanceId)
+        ));
+    }
+
+    #[test]
+    fn open_rejects_a_journal_missing_binding_metadata_without_mutating_it() {
+        let directory = tempfile::tempdir().expect("journal directory");
+        let path = directory.path().join("legacy.redb");
+        let database = Database::create(&path).expect("create legacy journal database");
+        let write = database.begin_write().expect("begin legacy journal write");
+        {
+            let _executions = write
+                .open_table(EXECUTIONS)
+                .expect("create legacy executions table");
+        }
+        write.commit().expect("commit legacy journal");
+        drop(database);
+
+        assert!(matches!(
+            RedbExecutionJournal::open(&path, binding()),
+            Err(ExecutionJournalError::MissingBindingMetadata)
+        ));
+
+        let database = Database::open(&path).expect("reopen legacy journal database");
+        let read = database.begin_read().expect("read legacy journal database");
+        let tables = read
+            .list_tables()
+            .expect("list legacy journal tables")
+            .map(|table| table.name().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(tables, [EXECUTIONS.name()]);
+    }
+
+    #[test]
+    fn open_rejects_an_empty_journal_from_another_state_bundle() {
+        let directory = tempfile::tempdir().expect("journal directory");
+        let path = directory.path().join("swapped.redb");
+        let expected = binding();
+        let swapped = ExecutionJournalBinding::new(
+            FixedBytes32::new([0x41; 32]),
+            expected.wallet_instance_id(),
+            expected.client_endpoint(),
+            expected.chain(),
+            expected.policy_asset(),
+        )
+        .expect("valid swapped binding");
+        drop(RedbExecutionJournal::create(&path, swapped).expect("create empty swapped journal"));
+
+        assert!(matches!(
+            RedbExecutionJournal::open(&path, expected),
+            Err(ExecutionJournalError::BundleIdMismatch)
+        ));
+    }
+
+    #[test]
+    fn open_rejects_each_binding_field_mismatch_independently() {
+        let directory = tempfile::tempdir().expect("journal directory");
+        let path = directory.path().join("executions.redb");
+        let actual = binding();
+        drop(RedbExecutionJournal::create(&path, actual).expect("create bound journal"));
+
+        let wrong_bundle = ExecutionJournalBinding::new(
+            FixedBytes32::new([0x41; 32]),
+            actual.wallet_instance_id(),
+            actual.client_endpoint(),
+            actual.chain(),
+            actual.policy_asset(),
+        )
+        .expect("wrong bundle binding");
+        assert!(matches!(
+            RedbExecutionJournal::open(&path, wrong_bundle),
+            Err(ExecutionJournalError::BundleIdMismatch)
+        ));
+
+        let wrong_wallet = ExecutionJournalBinding::new(
+            actual.bundle_id(),
+            FixedBytes32::new([0x42; 32]),
+            actual.client_endpoint(),
+            actual.chain(),
+            actual.policy_asset(),
+        )
+        .expect("wrong wallet binding");
+        assert!(matches!(
+            RedbExecutionJournal::open(&path, wrong_wallet),
+            Err(ExecutionJournalError::WalletInstanceIdMismatch)
+        ));
+
+        let wrong_client = ExecutionJournalBinding::new(
+            actual.bundle_id(),
+            actual.wallet_instance_id(),
+            SecretKey::from_bytes(&[0x43; 32]).public(),
+            actual.chain(),
+            actual.policy_asset(),
+        )
+        .expect("wrong client binding");
+        assert!(matches!(
+            RedbExecutionJournal::open(&path, wrong_client),
+            Err(ExecutionJournalError::ClientEndpointMismatch)
+        ));
+
+        let wrong_chain = ExecutionJournalBinding::new(
+            actual.bundle_id(),
+            actual.wallet_instance_id(),
+            actual.client_endpoint(),
+            ChainIdentity {
+                network: LiquidNetwork::LiquidTestnet,
+                ..actual.chain()
+            },
+            actual.policy_asset(),
+        )
+        .expect("wrong chain binding");
+        assert!(matches!(
+            RedbExecutionJournal::open(&path, wrong_chain),
+            Err(ExecutionJournalError::ChainIdentityMismatch)
+        ));
+
+        let wrong_policy = ExecutionJournalBinding::new(
+            actual.bundle_id(),
+            actual.wallet_instance_id(),
+            actual.client_endpoint(),
+            actual.chain(),
+            AssetId::from_slice(&[0x44; 32]).expect("wrong policy asset"),
+        )
+        .expect("wrong policy binding");
+        assert!(matches!(
+            RedbExecutionJournal::open(&path, wrong_policy),
+            Err(ExecutionJournalError::PolicyAssetMismatch)
+        ));
+    }
+
+    #[test]
     fn open_rejects_an_existing_non_journal_database_without_mutating_it() {
         let directory = tempfile::tempdir().expect("journal directory");
         let path = directory.path().join("not-a-journal.redb");
         drop(Database::create(&path).expect("create unrelated redb database"));
 
         assert!(matches!(
-            RedbExecutionJournal::open(&path),
+            RedbExecutionJournal::open(&path, binding()),
             Err(ExecutionJournalError::Table(TableError::TableDoesNotExist(name)))
                 if name == EXECUTIONS.name()
         ));
         assert_database_io_kind(
-            RedbExecutionJournal::create(&path),
+            RedbExecutionJournal::create(&path, binding()),
             ErrorKind::AlreadyExists,
         );
 
@@ -1013,9 +1428,9 @@ mod tests {
         let path = directory.path().join("replaced.redb");
         drop(std::fs::File::create(&path).expect("create empty replacement"));
 
-        assert!(RedbExecutionJournal::open(&path).is_err());
+        assert!(RedbExecutionJournal::open(&path, binding()).is_err());
         assert_database_io_kind(
-            RedbExecutionJournal::create(&path),
+            RedbExecutionJournal::create(&path, binding()),
             ErrorKind::AlreadyExists,
         );
         assert_eq!(
