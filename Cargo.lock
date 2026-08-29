@@ -1161,6 +1161,8 @@ dependencies = [
  "async-trait",
  "deadcat-client",
  "deadcat-contracts",
+ "deadcat-elements-core",
+ "deadcat-iroh",
  "deadcat-rfq-client",
  "deadcat-rfq-iroh",
  "deadcat-rfq-rpc",

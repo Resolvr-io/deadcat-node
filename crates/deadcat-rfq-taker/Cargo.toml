@@ -11,18 +11,20 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 deadcat-client.workspace = true
+deadcat-elements-core.workspace = true
+deadcat-iroh.workspace = true
+deadcat-rpc.workspace = true
 deadcat-rfq-client.workspace = true
 deadcat-rfq-rpc.workspace = true
 deadcat-rfq-wallet.workspace = true
+deadcat-types.workspace = true
 elements.workspace = true
 rand.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 deadcat-contracts.workspace = true
 deadcat-rfq-iroh.workspace = true
-deadcat-rpc.workspace = true
-deadcat-types.workspace = true
 iroh.workspace = true
 tempfile.workspace = true
-tokio.workspace = true

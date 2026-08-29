@@ -499,6 +499,63 @@ impl<R: RngCore + CryptoRng + Send> PersistentRfqWallet<R> {
         Ok(utxo)
     }
 
+    /// Authenticate one previously observed catalog and recover every
+    /// chain-discovered output from that exact wallet view.
+    ///
+    /// The catalog comparison, membership checks, duplicate-outpoint check,
+    /// and output recovery all run under one wallet operation lock. This lets
+    /// an external scanner take a catalog snapshot, perform its bounded chain
+    /// query, and then fail closed if any destination was issued before the
+    /// results were recovered. A snapshot from another wallet generation is
+    /// rejected even when it has the same revision and locator count because
+    /// its wallet-authenticated checkpoint differs.
+    ///
+    /// Multiple outputs may legitimately use the same locator, but an
+    /// outpoint may appear only once in a recovered inventory.
+    pub fn recover_taker_inventory(
+        &self,
+        catalog: &WalletCatalogSnapshot,
+        outputs: Vec<(WalletKeyLocator, OutPoint, TxOut)>,
+    ) -> Result<Vec<TakerWalletUtxo>, PersistentWalletError> {
+        let _operation_guard = self.lock_operations()?;
+        self.ensure_healthy()?;
+        let state = read_and_validate_state(&self.database, &self.wallet, self.identity)?;
+        let current_locators = state
+            .entries
+            .iter()
+            .map(|entry| entry.locator)
+            .collect::<Vec<_>>();
+        if catalog.revision != state.revision
+            || !bool::from(catalog.checkpoint.ct_eq(&state.checkpoint))
+            || catalog.locators != current_locators
+        {
+            return Err(PersistentWalletError::TakerCatalogSnapshotMismatch);
+        }
+
+        let cataloged = current_locators.into_iter().collect::<BTreeSet<_>>();
+        let mut outpoints = BTreeSet::new();
+        for (locator, outpoint, _) in &outputs {
+            if !cataloged.contains(locator) {
+                return Err(PersistentWalletError::TakerLocatorNotCataloged);
+            }
+            if !outpoints.insert(*outpoint) {
+                return Err(PersistentWalletError::DuplicateTakerInventoryOutpoint(
+                    *outpoint,
+                ));
+            }
+        }
+
+        outputs
+            .into_iter()
+            .map(|(locator, outpoint, txout)| {
+                self.wallet
+                    .recover_owned_output(locator, outpoint, txout)
+                    .map(|owned| TakerWalletUtxo::from_owned(&owned))
+                    .map_err(PersistentWalletError::from)
+            })
+            .collect()
+    }
+
     /// Issue a durable destination for an RFQ taker's received asset.
     pub fn fresh_taker_receive_destination(
         &self,
@@ -1693,6 +1750,10 @@ pub enum PersistentWalletError {
     MissingTakerInternalKey(usize),
     #[error("taker wallet locator is authenticated but absent from the durable catalog")]
     TakerLocatorNotCataloged,
+    #[error("taker inventory catalog snapshot is stale or belongs to another wallet")]
+    TakerCatalogSnapshotMismatch,
+    #[error("taker inventory contains duplicate outpoint {0}")]
+    DuplicateTakerInventoryOutpoint(OutPoint),
     #[error("taker wallet job does not exactly match its funded route and layout")]
     TakerRouteBindingMismatch,
     #[error("taker wallet job does not exactly match its funded input bindings")]

@@ -265,6 +265,14 @@ impl OperationBudget {
         self.deadline.check()
     }
 
+    /// Return the remaining wall-clock budget.
+    ///
+    /// Cross-service adapters can use this value to cap caller-owned I/O so
+    /// that it remains inside the same deadline as the subsequent Core work.
+    pub fn remaining(&self) -> Result<Duration, ElementsCoreError> {
+        self.deadline.remaining()
+    }
+
     #[must_use]
     pub const fn operation(&self) -> CoreOperation {
         self.operation
@@ -650,7 +658,20 @@ impl ElementsCoreClient {
     /// Acquire the shared scan gate and deadline before wallet catalog work.
     pub fn begin_script_scan(&self) -> Result<ScriptScanOperation<'_>, ElementsCoreError> {
         let budget = self.begin_operation(CoreOperation::Scan)?;
-        let permit = self.inner.scan_gate.acquire(budget.deadline)?;
+        self.begin_script_scan_with_budget(budget)
+    }
+
+    /// Acquire the shared scan gate with a caller-started scan budget.
+    ///
+    /// Async adapters start this budget before waiting for their bounded
+    /// blocking-task permit. Moving it into this method ensures queueing,
+    /// wallet catalog work, and the Core scan all share one deadline.
+    pub fn begin_script_scan_with_budget(
+        &self,
+        budget: OperationBudget,
+    ) -> Result<ScriptScanOperation<'_>, ElementsCoreError> {
+        let deadline = self.validate_budget(&budget, CoreOperation::Scan)?;
+        let permit = self.inner.scan_gate.acquire(deadline)?;
         Ok(ScriptScanOperation {
             client: self,
             budget,

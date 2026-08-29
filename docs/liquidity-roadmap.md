@@ -780,12 +780,19 @@ terminal because that valid transaction may still be broadcast. Explicit
 no-clobber journal creation and open-existing recovery prevent a missing journal
 from being silently replaced during restart.
 
-The remaining production taker work is the concrete authoritative chain-backed
-inventory and settlement source, persisted process configuration and a runnable
-entrypoint that securely creates, opens, and pairs the wallet and journal as one
-process-state bundle, taker broadcast plus confirmation and reorganization
-monitoring, and live regtest coverage across real provider and taker process
-boundaries. The first facade remains a
+The first concrete taker source now performs wallet-authenticated inventory
+scans and combines a pinned node's materialized market view with independently
+authenticated Elements Core ancestry and mempool-aware prevouts. It requires
+the node market anchor to equal Core's exact stable tip; canonical ancestry
+alone is deliberately insufficient. This is explicitly a trusted-node profile:
+complete local history replay and an independent omission proof remain required
+before an arbitrary hosted node can be treated as untrusted.
+
+The remaining production taker work is persisted process configuration and a
+runnable entrypoint that securely creates, opens, and pairs the wallet and
+journal as one process-state bundle, taker broadcast plus confirmation and
+reorganization monitoring, and live regtest coverage across real provider and
+taker process boundaries. The first facade remains a
 one-provider profile; Simplicity covenant inputs and more than one interactive
 RFQ signer are later router/venue-verification work and are not accepted merely
 because they carry a witness. It accepts exactly one RFQ leg plus ordinary

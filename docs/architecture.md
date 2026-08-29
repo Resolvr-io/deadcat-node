@@ -4,8 +4,12 @@
 
 `deadcat-node` is a shared-safe binary-market chain index and evidence service.
 This repository is authoritative for the canonical SimplicityHL market
-implementation, but runtime clients do not trust a remote node with keys,
-wallet state, transaction construction, contract semantics, or venue selection.
+implementation. The long-term client boundary does not trust a remote node
+with keys, wallet state, transaction construction, contract semantics, or
+venue selection. The first concrete RFQ taker source is a narrower, explicitly
+named trusted-node profile: it trusts one pinned/self-hosted node for
+materialized market semantics while independently using Elements Core for the
+exact chain tip, ancestry, and mempool-aware UTXO state.
 
 Trading venues are separate systems. The initial direction is a noncustodial
 RFQ service; future AMM and DLOB venues can sit behind the same client-side
@@ -177,10 +181,16 @@ broadcast receive method-specific bounds and optional authorization.
 
 ## Security consequences
 
-A malicious hosted node cannot make the official client sign a transaction
-that violates locally reconstructed market semantics and spend intent. It can
-still omit data, show stale-but-valid state, censor relay, and learn query
-timing. Self-hosting and independent cross-checks reduce that residual trust.
+The complete-history client path can prevent a malicious hosted node from
+changing locally reconstructed market semantics, but that is not yet the
+profile used by the first RFQ taker source. Its exact-tip rule prevents an
+older canonical `Trading` snapshot from surviving a later resolution or
+expiry, and final whole-PSET validation still protects wallet spend intent.
+However, a malicious pinned node can fabricate or omit contract history and
+report structurally valid false market semantics at a real Core tip. Until the
+taker source performs complete evidence replay plus an independent omission
+proof, deployments must treat that node as trusted and preferably self-host it.
+The node can also censor responses and learn query timing.
 
 RFQ providers and future venues have a separate trust boundary: their quotes
 may expire or become unfillable, but settlement remains noncustodial and the

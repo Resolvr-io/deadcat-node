@@ -784,6 +784,9 @@ fn operation_budget_is_client_and_operation_bound() {
     let budget = first
         .begin_operation(CoreOperation::Anchor)
         .expect("budget");
+    let remaining = budget.remaining().expect("remaining budget");
+    assert!(!remaining.is_zero());
+    assert!(remaining <= DEFAULT_ANCHOR_TIMEOUT);
     assert!(matches!(
         second.validate_canonical_anchor_with_budget(&budget, tip(1)),
         Err(ElementsCoreError::ForeignOperationBudget)
@@ -818,6 +821,18 @@ fn scan_gate_and_deadline_start_before_caller_wallet_work() {
     thread::sleep(Duration::from_millis(20));
     assert!(matches!(
         operation.scan_unspent_scripts(&[]),
+        Err(ElementsCoreError::OperationTimedOut { operation: "scan" })
+    ));
+    // Release the scan gate so the next assertion can fail only because the
+    // caller-started budget expired, not because it timed out behind this scan.
+    drop(operation);
+
+    let budget = client
+        .begin_operation(CoreOperation::Scan)
+        .expect("caller-started scan budget");
+    thread::sleep(Duration::from_millis(20));
+    assert!(matches!(
+        client.begin_script_scan_with_budget(budget),
         Err(ElementsCoreError::OperationTimedOut { operation: "scan" })
     ));
 }

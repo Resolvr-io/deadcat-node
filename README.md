@@ -112,11 +112,19 @@ Pending handles remain discoverable after task cancellation or restart, and a
 wallet-wide singleton authority prevents two runtimes from creating independent
 input-lock maps over the same open wallet.
 
-A concrete authoritative taker inventory/settlement source, a securely paired
-wallet/journal process-state lifecycle and runnable taker entrypoint, canonical
-market-data pricing, taker broadcast/confirmation/reorg monitoring, a complete
-taker process-boundary gate, authenticated-owner rate limits, and HSM support
-remain future work. The provider now persists an exact relay outbox with every
+A concrete trusted-node taker source now combines wallet-authenticated
+inventory with independent Elements Core ancestry and mempool-aware prevouts.
+It accepts materialized market state only when the pinned node snapshot equals
+Core's exact stable tip, so an older canonical `Trading` view cannot cross the
+signing boundary after a later resolution or expiry. It still trusts that node
+not to fabricate or omit market history; complete local replay plus an omission
+proof remains required before arbitrary hosted nodes are untrusted.
+
+A securely paired wallet/journal process-state lifecycle and runnable taker
+entrypoint, canonical market-data pricing, taker
+broadcast/confirmation/reorg monitoring, a complete taker process-boundary
+gate, authenticated-owner rate limits, and HSM support remain future work. The
+provider now persists an exact relay outbox with every
 signed settlement and supervises status-first reconciliation, exact-byte
 broadcast, canonical confirmation, conflict, and reorganization observations.
 Its live liquidregtest gate crosses the shipped daemon, direct Iroh, Elements
