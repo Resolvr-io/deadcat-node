@@ -16,14 +16,23 @@
 #![forbid(unsafe_code)]
 
 mod fee;
+mod node;
 mod recovery;
 mod runtime;
 mod source;
 
+pub use deadcat_elements_core::{ElementsCoreAuth, ElementsCoreConfig};
 pub use fee::{FeePlanningError, plan_network_fee};
+pub use node::{IrohTakerNodeSource, TakerNodeSource, TakerNodeSourceError};
 pub use recovery::{FundingRecoveryError, FundingRecoverySnapshot, load_funding_recovery};
 pub use runtime::{
     ExactInRfqTrade, ExactOutRfqTrade, PostArmFailure, PreparedRfqTrade, ReservedRfqTrade,
     RfqExecutionHandle, RfqTakerConfig, RfqTakerError, RfqTakerRuntime, TakerClockError,
 };
-pub use source::TakerInventorySource;
+pub use source::{
+    DEFAULT_MAX_BLOCKING_TASKS, DEFAULT_MAX_SNAPSHOT_ATTEMPTS, DEFAULT_SNAPSHOT_RETRY_DELAY,
+    ElementsTakerSource as TrustedNodeTakerSource,
+    ElementsTakerSourceConfig as TrustedNodeTakerSourceConfig,
+    ElementsTakerSourceError as TrustedNodeTakerSourceError, TakerInventorySource,
+    TakerMarketSource,
+};

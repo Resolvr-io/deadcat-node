@@ -8,8 +8,10 @@ use std::thread;
 use deadcat_rfq_provider::{
     DestinationPurpose, DestinationSource as _, ProviderId, ProviderIdentity,
 };
+use elements::confidential::{Asset, AssetBlindingFactor, Nonce, Value, ValueBlindingFactor};
 use elements::hashes::Hash as _;
-use elements::{AssetId, BlockHash};
+use elements::secp256k1_zkp::{Secp256k1, rand::thread_rng};
+use elements::{AssetId, BlockHash, OutPoint, TxOut, TxOutSecrets, TxOutWitness, Txid};
 use rand::rngs::StdRng;
 use rand::{CryptoRng, Error as RandError, RngCore, SeedableRng as _};
 use sha2::{Digest as _, Sha256};
@@ -146,6 +148,38 @@ fn issue_settlement(
         .expect("issue settlement destination")
 }
 
+fn confidential_output(
+    destination: &ConfidentialDestination,
+    asset: AssetId,
+    amount: u64,
+) -> TxOut {
+    let explicit = TxOut {
+        asset: Asset::Explicit(asset),
+        value: Value::Explicit(amount),
+        nonce: Nonce::Null,
+        script_pubkey: destination.script_pubkey().clone(),
+        witness: TxOutWitness::default(),
+    };
+    explicit
+        .to_non_last_confidential(
+            &mut thread_rng(),
+            &Secp256k1::new(),
+            destination.blinding_public_key(),
+            &[TxOutSecrets::new(
+                asset,
+                AssetBlindingFactor::zero(),
+                amount,
+                ValueBlindingFactor::zero(),
+            )],
+        )
+        .expect("confidential output")
+        .0
+}
+
+fn outpoint(marker: u8) -> OutPoint {
+    OutPoint::new(Txid::from_byte_array([marker; 32]), 0)
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -241,6 +275,171 @@ fn create_issue_every_purpose_and_reopen_exact_catalog() {
             expected
         );
     }
+}
+
+#[test]
+fn batch_taker_recovery_authenticates_one_snapshot_and_preserves_output_order() {
+    let directory = TempDir::new().expect("tempdir");
+    let wallet = create_seeded(&directory.path().join("wallet.redb"), identity(0x21), 41);
+    let first = wallet
+        .fresh_inventory_destination()
+        .expect("first destination");
+    let second = wallet
+        .fresh_inventory_destination()
+        .expect("second destination");
+    let catalog = wallet.catalog_snapshot().expect("catalog snapshot");
+    let first_asset = AssetId::from_byte_array([0x31; 32]);
+    let second_asset = AssetId::from_byte_array([0x32; 32]);
+
+    let recovered = wallet
+        .recover_taker_inventory(
+            &catalog,
+            vec![
+                (
+                    first.wallet_locator(),
+                    outpoint(1),
+                    confidential_output(&first, first_asset, 11),
+                ),
+                (
+                    second.wallet_locator(),
+                    outpoint(2),
+                    confidential_output(&second, second_asset, 22),
+                ),
+                // Address reuse is not encouraged, but multiple UTXOs at one
+                // cataloged locator are distinct valid inventory entries.
+                (
+                    first.wallet_locator(),
+                    outpoint(3),
+                    confidential_output(&first, first_asset, 33),
+                ),
+            ],
+        )
+        .expect("batch recovery");
+
+    assert_eq!(
+        recovered
+            .iter()
+            .map(TakerWalletUtxo::outpoint)
+            .collect::<Vec<_>>(),
+        [outpoint(1), outpoint(2), outpoint(3)]
+    );
+    assert_eq!(
+        recovered
+            .iter()
+            .map(TakerWalletUtxo::asset)
+            .collect::<Vec<_>>(),
+        [first_asset, second_asset, first_asset]
+    );
+    assert_eq!(
+        recovered
+            .iter()
+            .map(TakerWalletUtxo::amount)
+            .collect::<Vec<_>>(),
+        [11, 22, 33]
+    );
+}
+
+#[test]
+fn batch_taker_recovery_rejects_stale_and_foreign_catalog_snapshots() {
+    let directory = TempDir::new().expect("tempdir");
+    let expected_identity = identity(0x22);
+    let first = create_seeded(&directory.path().join("first.redb"), expected_identity, 42);
+    let stale = first.catalog_snapshot().expect("stale snapshot");
+    let second = create_seeded(&directory.path().join("second.redb"), expected_identity, 43);
+    let foreign = second.catalog_snapshot().expect("foreign snapshot");
+    assert_eq!(foreign.revision(), stale.revision());
+    assert_eq!(foreign.locators(), stale.locators());
+    assert_ne!(foreign.checkpoint(), stale.checkpoint());
+    assert!(matches!(
+        first.recover_taker_inventory(&foreign, Vec::new()),
+        Err(PersistentWalletError::TakerCatalogSnapshotMismatch)
+    ));
+
+    first
+        .fresh_inventory_destination()
+        .expect("catalog advance");
+    assert!(matches!(
+        first.recover_taker_inventory(&stale, Vec::new()),
+        Err(PersistentWalletError::TakerCatalogSnapshotMismatch)
+    ));
+}
+
+#[test]
+fn batch_taker_recovery_rejects_uncataloged_locators_and_duplicate_outpoints() {
+    let directory = TempDir::new().expect("tempdir");
+    let expected_identity = identity(0x23);
+    let wallet = create_seeded(&directory.path().join("wallet.redb"), expected_identity, 44);
+    let destination = wallet
+        .fresh_inventory_destination()
+        .expect("cataloged destination");
+    let catalog = wallet.catalog_snapshot().expect("catalog snapshot");
+    let asset = AssetId::from_byte_array([0x41; 32]);
+    let duplicate = outpoint(4);
+    assert!(matches!(
+        wallet.recover_taker_inventory(
+            &catalog,
+            vec![
+                (
+                    destination.wallet_locator(),
+                    duplicate,
+                    confidential_output(&destination, asset, 41),
+                ),
+                (
+                    destination.wallet_locator(),
+                    duplicate,
+                    confidential_output(&destination, asset, 42),
+                ),
+            ],
+        ),
+        Err(PersistentWalletError::DuplicateTakerInventoryOutpoint(actual))
+            if actual == duplicate
+    ));
+
+    let foreign = create_seeded(
+        &directory.path().join("foreign.redb"),
+        expected_identity,
+        45,
+    )
+    .fresh_inventory_destination()
+    .expect("uncataloged destination");
+    assert!(matches!(
+        wallet.recover_taker_inventory(
+            &catalog,
+            vec![(
+                foreign.wallet_locator(),
+                outpoint(5),
+                confidential_output(&foreign, asset, 43),
+            )],
+        ),
+        Err(PersistentWalletError::TakerLocatorNotCataloged)
+    ));
+}
+
+#[test]
+fn batch_taker_recovery_rejects_output_owned_by_another_cataloged_locator() {
+    let directory = TempDir::new().expect("tempdir");
+    let wallet = create_seeded(&directory.path().join("wallet.redb"), identity(0x24), 46);
+    let claimed = wallet
+        .fresh_inventory_destination()
+        .expect("claimed destination");
+    let actual = wallet
+        .fresh_inventory_destination()
+        .expect("actual destination");
+    let catalog = wallet.catalog_snapshot().expect("catalog snapshot");
+
+    assert!(matches!(
+        wallet.recover_taker_inventory(
+            &catalog,
+            vec![(
+                claimed.wallet_locator(),
+                outpoint(6),
+                confidential_output(&actual, AssetId::from_byte_array([0x42; 32]), 44),
+            )],
+        ),
+        Err(PersistentWalletError::Wallet(
+            RfqWalletError::OutputScriptOrConfidentialityMismatch
+        ))
+    ));
 }
 
 #[test]
